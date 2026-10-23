@@ -30,7 +30,10 @@
 #                     记录里存的是当前 boot_id —— 下次重启后这份记录会自动失效，
 #                     于是「重启验证」必须重做。这是刻意的。
 #    --yes            跳过交互确认。
-#    --rollback       撤销本步的固化（disable 开机自启），不碰前两步的配置。
+#    --rollback       撤销本步的固化，不碰前两步的配置。依据 --apply 时记下的
+#                     「固化前 enable 状态」逐单元恢复：原本就 enabled 的保持原样，
+#                     只有本脚本新 enable 的才 disable。记录丢失时不做任何 disable
+#                     （盲关 ssh.socket 会让机器下次开机连 SSH 都没有）。
 #
 #  【典型用法】
 #    ./stage3.sh --port 2222 --user deploy              # 只检查
@@ -50,7 +53,9 @@ set -uo pipefail
 SELF="$(basename "$0")"
 SRC="$(cd "$(dirname "$0")" && pwd)"
 SNAP_ROOT="$SRC/snapshots"
-VERIFY_REC="$SRC/.stage3-verified"
+VERIFY_REC="$SRC/.stage3-verified"        # 验证通过记录（存 boot_id，换一次开机自动失效）
+PENDING_REC="$SRC/.stage3-pending"        # --apply 时记下的「重启前 boot_id」—— 验证的对照物
+FIXATION_PRE="$SRC/.stage3-fixation-pre"  # --apply 前的 enable 状态 —— 回滚的依据
 SSH_SOCKET_OVERRIDE=/etc/systemd/system/ssh.socket.d/override.conf
 FW_UNIT=/etc/systemd/system/ssh-firewall.service
 F2B_JAIL=/etc/fail2ban/jail.d/sshd.local
@@ -90,7 +95,7 @@ usage() {
   --apply           执行固化（enable 开机自启 + 生成快照 + 打印收尾清单）
   --verify          重启后验证模式（检查并记录，记录随下次重启失效）
   --yes             跳过交互确认
-  --rollback        撤销本步固化（disable 开机自启）
+  --rollback        按固化前状态撤销本步固化
   -h, --help        显示本帮助
 
 完整说明见本脚本头部注释。
@@ -101,13 +106,26 @@ USAGE
 
 PORT=""; OLD_PORT="22"; USERNAME=""; CONF=""
 APPLY=0; VERIFY_MODE=0; ASSUME_YES=0; DO_ROLLBACK=0
+# 「命令行是否显式给过这个键」。配置文件只补没给过的键 ——
+# 否则 `--old-port 22` 会被配置里的 OLD_PORT 悄悄覆盖。
+PORT_SET=0; OLD_PORT_SET=0; USER_SET=0
+
+# 选项缺值守卫：在**当前 shell**里退出。
+# 旧写法 `PORT="${2:-}"; shift 2` 在只写 `--port` 时 shift 失败、参数不变，
+# 循环永远退不出去（死循环）。这里遇到缺值立即报错。
+need_val() {  # need_val <选项名> <当前剩余参数个数>
+  (( $2 >= 2 )) && return 0
+  printf '参数 %s 缺少取值\n\n' "$1" >&2
+  usage >&2
+  exit 2
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --port)     PORT="${2:-}";      shift 2 ;;
-    --old-port) OLD_PORT="${2:-}";  shift 2 ;;
-    --user)     USERNAME="${2:-}";  shift 2 ;;
-    --conf)     CONF="${2:-}";      shift 2 ;;
+    --port)     need_val "$1" $#; PORT="$2";     PORT_SET=1;     shift 2 ;;
+    --old-port) need_val "$1" $#; OLD_PORT="$2"; OLD_PORT_SET=1; shift 2 ;;
+    --user)     need_val "$1" $#; USERNAME="$2"; USER_SET=1;     shift 2 ;;
+    --conf)     need_val "$1" $#; CONF="$2";                     shift 2 ;;
     --apply)    APPLY=1;       shift ;;
     --verify)   VERIFY_MODE=1; shift ;;
     --yes)      ASSUME_YES=1;  shift ;;
@@ -117,6 +135,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# 配置文件补默认值（命令行 > 配置文件 > 报错）
 if [[ -n "$CONF" ]]; then
   [[ -r "$CONF" ]] || die "配置文件不可读: $CONF"
   while IFS='=' read -r k v; do
@@ -124,22 +143,30 @@ if [[ -n "$CONF" ]]; then
     v="$(printf '%s' "$v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [[ -z "$k" || -z "$v" ]] && continue
     case "$k" in
-      PORT)     [[ -z "$PORT" ]]      && PORT="$v" ;;
-      OLD_PORT) [[ "$OLD_PORT" == "22" ]] && OLD_PORT="$v" ;;
-      USER)     [[ -z "$USERNAME" ]]  && USERNAME="$v" ;;
+      PORT)     (( PORT_SET ))     || PORT="$v" ;;
+      OLD_PORT) (( OLD_PORT_SET )) || OLD_PORT="$v" ;;
+      USER)     (( USER_SET ))     || USERNAME="$v" ;;
     esac
   done < "$CONF"
 fi
+
+# 端口合法性：只接受十进制 1–65535。
+# 注意 10# 强制十进制：不写它的话 "08" 会让 Bash 按八进制解析并直接报错退出。
+is_port() {
+  [[ "$1" =~ ^[0-9]{1,5}$ ]] || return 1
+  local n=$((10#$1))
+  (( n >= 1 && n <= 65535 ))
+}
 
 require_params() {
   local miss=0
   [[ -z "$PORT" ]]     && { fail "--port 未提供"; miss=1; }
   [[ -z "$USERNAME" ]] && { fail "--user 未提供"; miss=1; }
-  if [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT < 1 || PORT > 65535 )); then
-    fail "--port 非法: $PORT"; miss=1
+  if [[ -n "$PORT" ]] && ! is_port "$PORT"; then
+    fail "--port 非法: $PORT（应为 1–65535 的端口号）"; miss=1
   fi
-  if [[ "$OLD_PORT" != "none" ]] && ! [[ "$OLD_PORT" =~ ^[0-9]+$ ]]; then
-    fail "--old-port 非法: $OLD_PORT（应为端口号或 none）"; miss=1
+  if [[ "$OLD_PORT" != "none" ]] && ! is_port "$OLD_PORT"; then
+    fail "--old-port 非法: $OLD_PORT（应为 1–65535 的端口号，或 none）"; miss=1
   fi
   if (( miss )); then
     printf '\n'
@@ -175,13 +202,53 @@ require_root() {
   die "请用 sudo 运行，例如： sudo bash $0 ..."
 }
 
+# 取当前会话的来源 IP；sudo 的 env_reset 会清掉 SSH_CLIENT，故沿父进程链找。
+# （第三步也要它：Match Address 的生效值只有在给定来源地址时才读得准。）
+find_ssh_client() {
+  local v p
+  if [[ -n "${SSH_CLIENT:-}" ]]; then printf '%s' "${SSH_CLIENT%% *}"; return 0; fi
+  p=$PPID
+  while [[ "$p" -gt 1 ]]; do
+    if [[ -r "/proc/$p/environ" ]]; then
+      v="$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | sed -n 's/^SSH_CLIENT=//p' | head -1)"
+      if [[ -n "$v" ]]; then printf '%s' "${v%% *}"; return 0; fi
+    fi
+    p="$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)" || return 1
+    [[ -z "$p" || "$p" -le 1 ]] && return 1
+  done
+  return 1
+}
+
+# 当前会话来源；取不到时返回一个可行的默认上下文地址
+client_addr() { find_ssh_client 2>/dev/null || printf '0.0.0.0'; }
+
+# 读 sshd 的「生效值」—— 带连接上下文。
+# 不带 -C 的 `sshd -T` 只给出默认上下文；主配置里后来若出现
+# `Match Address <远程网段>` / `Match User` 之类的分支，password / root 的放行
+# 会藏在那里，而普通的 `sshd -T` 看不到。这里用真实来源 IP 构造上下文去读。
+# 取不到时退回不带 -C 的读法。
+sshd_eff() {  # sshd_eff <key> <user> [addr]
+  local key="$1" u="$2" addr="${3:-0.0.0.0}" v=""
+  v="$(sshd -T -C "user=$u,host=localhost,addr=$addr" 2>/dev/null \
+       | awk -v k="$key" '$1==k{print $2; exit}')" || true
+  if [[ -z "$v" ]]; then
+    v="$(sshd -T 2>/dev/null | awk -v k="$key" '$1==k{print $2; exit}')" || true
+  fi
+  printf '%s' "$v"
+}
+
 detect_stage() {
-  local fw_ok=0 nft_ok=0 auth_ok=0 legacy=0
+  local fw_ok=0 nft_ok=0 auth_ok=0 legacy=0 ip
   systemctl is-active --quiet ssh-firewall.service 2>/dev/null && fw_ok=1
   nft list table inet "$NFT_TABLE" >/dev/null 2>&1 && nft_ok=1
-  if sshd -T 2>/dev/null | grep -qi '^permitrootlogin no' \
-     && sshd -T 2>/dev/null | grep -qi '^passwordauthentication no'; then auth_ok=1; fi
-  ss -tlnH 2>/dev/null | grep -qE ':22\b' && legacy=1
+  ip="$(find_ssh_client 2>/dev/null || true)"; [[ -n "$ip" ]] || ip="0.0.0.0"
+  if [[ "$(sshd_eff permitrootlogin root "$ip")" == "no" ]] \
+     && [[ "$(sshd_eff passwordauthentication "${USERNAME:-root}" "$ip")" == "no" ]]; then auth_ok=1; fi
+  # 旧端口不能写死 22：自定义旧端口仍开放时会误判 S2；
+  # 新端口恰好是 22 时又会永远判成 S1（见 --old-port 的语义）。
+  if [[ -n "${OLD_PORT:-}" && "$OLD_PORT" != "none" && "$OLD_PORT" != "${PORT:-}" ]]; then
+    port_listening "$OLD_PORT" && legacy=1
+  fi
 
   if (( !fw_ok || !nft_ok )); then printf 'S0'; return; fi
   if (( !auth_ok || legacy ));    then printf 'S1'; return; fi
@@ -241,11 +308,16 @@ run_checks() {
     c_warn "有单元尚未设开机自启 —— 本步的 --apply 会补上" "重启后可能回到未加固状态"
   fi
 
-  if sshd -T 2>/dev/null | grep -qi '^permitrootlogin no' \
-     && sshd -T 2>/dev/null | grep -qi '^passwordauthentication no'; then
-    c_ok "认证策略仍处于收口状态（前两步成果在位）"
+  local a_root a_pass a_kbd addr
+  addr="$(client_addr)"
+  a_root="$(sshd_eff permitrootlogin root "$addr")"
+  a_pass="$(sshd_eff passwordauthentication "$USERNAME" "$addr")"
+  a_kbd="$(sshd_eff kbdinteractiveauthentication "$USERNAME" "$addr")"
+  if [[ "$a_root" == "no" && "$a_pass" == "no" && "$a_kbd" == "no" ]]; then
+    c_ok "认证策略仍收口（root 直连关 / 密码关 / KbdInteractive 关）"
   else
-    c_fail "认证策略已回退 —— 前两步成果不在了" "请重跑 stage2.sh"
+    c_fail "认证策略有回退（root=${a_root:-?} password=${a_pass:-?} kbd=${a_kbd:-?}）" \
+           "请重跑 stage2.sh。注意 kbd=yes 时密码可经 PAM 绕过 passwordauthentication no"
   fi
 
   # ── 运行时事实（现在在听什么）与配置层事实（重启后还会不会听）是两件事。
@@ -375,14 +447,40 @@ snapshot() {
 
 do_apply() {
   sub "A · 固化开机自启"
-  local u
+  local u bad=0 st
+  # 先记下「改动前每个单元本来是不是自启」——回滚要靠它。
+  # 否则 --rollback 会把原本就 enable 的 ssh.socket 一起 disable，
+  # 机器下次重启就再也没有 SSH；即使本步其实没新增任何设置也会中招。
+  # 已有记录时**不覆盖**：重复 --apply 时若覆盖，会把第一次固化前的真实
+  # 状态冲成「已 enabled」，之后回滚就再也撤不掉第一次的新增自启了。
+  if [[ -f "$FIXATION_PRE" ]]; then
+    skip "沿用已有固化前状态记录（不覆盖） -> $FIXATION_PRE"
+  else
+    : > "$FIXATION_PRE" || die "无法写入 $FIXATION_PRE —— 没有它就无法安全回滚，中止"
+    for u in "${ENABLE_UNITS[@]}"; do
+      st="$(systemctl is-enabled "$u" 2>/dev/null || true)"
+      printf '%s=%s\n' "$u" "${st:-unknown}" >> "$FIXATION_PRE"
+    done
+    act "已记录固化前状态 -> $FIXATION_PRE"
+  fi
+  inf "固化前：$(tr '\n' ' ' < "$FIXATION_PRE")"
+
   for u in "${ENABLE_UNITS[@]}"; do
     if systemctl enable "$u" >/dev/null 2>&1; then
       ok "enable $u"
     else
-      fail "enable $u 失败"
+      fail "enable $u 失败"; bad=1
     fi
   done
+  (( bad == 0 )) || die "有单元 enable 失败 —— 开机自启没建立起来，本步不算完成（未生成快照）"
+
+  # 记下固化时是哪一次开机。--verify 必须看到 boot_id 变了才算「重启验证」——
+  # 否则在同一次开机里跑一遍 --verify 就会标成 S3，而它什么都没证明。
+  if printf '%s' "$(boot_id)" > "$PENDING_REC" 2>/dev/null; then
+    ok "已记录重启前基线 -> $PENDING_REC"
+  else
+    die "无法写入 $PENDING_REC —— 没有对照物就无法证明重启，中止"
+  fi
 
   sub "B · 基线快照"
   local d
@@ -411,11 +509,12 @@ do_apply() {
    └─ 4. 回来验证并记录
          ./stage3.sh --port <端口> --user <账户> --verify
 
-   验证会检查这四件事：
+   验证会先核对 boot_id 确实变过（同一次开机内不算重启验证），再检查：
      · nft 白名单是否**自动加载**（开机加载器 + 30 次重试是否奏效）
+     · nft 是否含末尾兜底 drop（只有 counter accept 不算）
      · ssh.socket 是否正常启动、端口是否可连
      · 旧端口是否仍然关闭
-     · 认证策略是否仍然收口
+     · 认证策略是否仍然收口（root / password / KbdInteractive 三项）
    通过后写入 .stage3-verified（存当前 boot_id，下次重启后自动失效）。
 
 CHECKLIST
@@ -423,19 +522,25 @@ CHECKLIST
 
 do_verify() {
   sub "重启后验证"
-  local bad=0
+  local bad=0 pending=""
 
-  if [[ -f "$VERIFY_REC" ]]; then
-    local prev; prev="$(cat "$VERIFY_REC" 2>/dev/null)"
-    if [[ "$prev" == "$(boot_id)" ]]; then
-      warn "这份记录就是当前这次开机的 —— 没有检测到新的重启"
-      note "如果你确实刚重启过，说明记录被误判；否则请先完成重启再来"
-    else
-      ok "检测到新的开机（boot_id 已变化）—— 本次是真实的重启验证"
-    fi
-  else
-    ok "首次验证（此前没有记录）"
+  # ── 先证明「确实重启过」。没有这一步，--apply 之后原地跑一次 --verify
+  #    就能把状态标成 S3，「重启验证」四个字就名不副实。
+  if [[ -f "$PENDING_REC" ]]; then
+    pending="$(cat "$PENDING_REC" 2>/dev/null)"
   fi
+  if [[ -z "$pending" ]]; then
+    fail "找不到 --apply 留下的重启基线（$PENDING_REC）"
+    note "没有对照物就无法证明本次开机跨过了一次重启。"
+    note "请先执行 --apply，再重启，最后回来 --verify"
+    return 1
+  fi
+  if [[ "$pending" == "$(boot_id)" ]]; then
+    fail "仍是同一次开机（boot_id 未变）—— 这次不算重启验证"
+    note "请先重启：sudo systemctl reboot；回来后重跑 --verify"
+    return 1
+  fi
+  ok "检测到新的开机（boot_id 已变化）—— 本次是真实的重启验证"
 
   # 1) 白名单是否自动加载 —— 这是重启验证的核心
   if systemctl is-active --quiet ssh-firewall.service; then
@@ -444,10 +549,12 @@ do_verify() {
     fail "ssh-firewall 未启动 —— 开机加载失败"; bad=1
   fi
   if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
-    if nft list table inet "$NFT_TABLE" 2>/dev/null | grep -q 'counter'; then
+    # 只匹配 'counter' 的话，一张只有 `counter accept` 的表也能过 ——
+    # 那意味着没有任何兜底拒绝，白名单形同虚设。
+    if nft list table inet "$NFT_TABLE" 2>/dev/null | grep -qE 'counter.*[[:space:]]drop'; then
       ok "nft 表已自动加载且含兜底 drop"
     else
-      fail "nft 表在，但缺兜底 drop"; bad=1
+      fail "nft 表在，但缺兜底 drop（只有 counter accept 不算）"; bad=1
     fi
   else
     fail "nft 表未加载 —— 此时 ssh.socket 本应不启动，请检查失败方向是否被破坏"; bad=1
@@ -475,11 +582,15 @@ do_verify() {
                                || ok "旧端口 $OLD_PORT 仍然关闭"
   fi
 
-  # 4) 认证策略没有回退
-  sshd -T 2>/dev/null | grep -qi '^permitrootlogin no' \
-    && ok "permitrootlogin no 保持" || { fail "permitrootlogin 已回退"; bad=1; }
-  sshd -T 2>/dev/null | grep -qi '^passwordauthentication no' \
-    && ok "passwordauthentication no 保持" || { fail "passwordauthentication 已回退"; bad=1; }
+  # 4) 认证策略没有回退（带连接上下文读，Match 分支里的放行也逃不掉）
+  local addr v_root v_pass v_kbd
+  addr="$(client_addr)"
+  v_root="$(sshd_eff permitrootlogin root "$addr")"
+  v_pass="$(sshd_eff passwordauthentication "$USERNAME" "$addr")"
+  v_kbd="$(sshd_eff kbdinteractiveauthentication "$USERNAME" "$addr")"
+  [[ "$v_root" == "no" ]] && ok "permitrootlogin no 保持" || { fail "permitrootlogin=${v_root:-读不到} 已回退"; bad=1; }
+  [[ "$v_pass" == "no" ]] && ok "passwordauthentication no 保持" || { fail "passwordauthentication=${v_pass:-读不到} 已回退"; bad=1; }
+  [[ "$v_kbd"  == "no" ]] && ok "kbdinteractiveauthentication no 保持" || { fail "kbdinteractiveauthentication=${v_kbd:-读不到} —— 密码可经 PAM 绕过"; bad=1; }
 
   if (( bad == 0 )); then
     local d="$SNAP_ROOT/verify-$(date +%Y%m%d-%H%M%S)"
@@ -501,13 +612,41 @@ do_verify() {
 
 do_rollback_fixation() {
   hdr "回滚 · 撤销本步固化"
-  local u
-  for u in "${ENABLE_UNITS[@]}"; do
-    if systemctl disable "$u" >/dev/null 2>&1; then act "disable $u"; else skip "$u 本就未 enable"; fi
-  done
-  rm -f "$VERIFY_REC" && act "已删除验证记录 $VERIFY_REC"
+  local u st state
+  if [[ ! -f "$FIXATION_PRE" ]]; then
+    warn "找不到固化前的状态记录: $FIXATION_PRE"
+    note "没有它就无法区分「本步新开的自启」和「原本就有的自启」。"
+    note "为避免把原本就有的开机自启误关掉（那会让机器下次重启就没有 SSH），"
+    note "本次**不做任何 disable**。"
+    rm -f "$VERIFY_REC" "$PENDING_REC" 2>/dev/null || true
+    return 0
+  fi
+
+  while IFS='=' read -r u st; do
+    [[ -z "$u" ]] && continue
+    state="$(systemctl is-enabled "$u" 2>/dev/null || true)"
+    if [[ "$st" == "enabled" ]]; then
+      # 改动前就是开机自启 —— 保持不变或恢复回去，绝不 disable
+      if [[ "$state" == "enabled" ]]; then
+        skip "$u 改动前就是 enabled —— 保持不变"
+      elif systemctl enable "$u" >/dev/null 2>&1; then
+        act "恢复 $u 为 enabled（改动前就是自启）"
+      else
+        fail "恢复 $u 失败"
+      fi
+    else
+      if systemctl disable "$u" >/dev/null 2>&1; then
+        act "disable $u（改动前是 ${st:-unknown}）"
+      else
+        skip "$u 未能 disable（当前 ${state:-unknown}）"
+      fi
+    fi
+  done < "$FIXATION_PRE"
+
+  rm -f "$VERIFY_REC" "$PENDING_REC" 2>/dev/null || true
+  act "已删除验证记录与重启基线"
   printf '\n'
-  ok "固化已撤销。注意：只是取消开机自启，**没有**回退前两步的配置。"
+  ok "固化已撤销。注意：只是取消**本步新增**的开机自启，没有回退前两步的配置。"
   inf "若要把配置本身也退回去，请依次执行 stage2.sh --rollback、stage1.sh --rollback"
 }
 
@@ -594,10 +733,14 @@ print_dry_run_table
 
 if (( ! APPLY )); then
   print_plan
-  conclude || true
-  printf '\n   %s这是只读检查（默认行为）。加 --apply 才会真正执行。%s\n' "$C_B" "$C_RST"
-  printf '   %s执行完 --apply 后，按输出的「重启验证清单」操作，再跑 --verify。%s\n\n' "$C_DIM" "$C_RST"
-  exit 0
+  # 只读检查的退出码要反映检查结论：有 FAIL 就不能返回 0。
+  if conclude; then
+    printf '\n   %s这是只读检查（默认行为）。加 --apply 才会真正执行。%s\n' "$C_B" "$C_RST"
+    printf '   %s执行完 --apply 后，按输出的「重启验证清单」操作，再跑 --verify。%s\n\n' "$C_DIM" "$C_RST"
+    exit 0
+  fi
+  printf '\n   %s只读检查未全过 —— 先修好上面标 ✗ 的项。%s\n\n' "$C_FAIL" "$C_RST"
+  exit 1
 fi
 
 conclude || { printf '\n   未做任何修改。\n\n'; exit 1; }
@@ -613,4 +756,5 @@ do_apply
 print_final_checklist
 printf '\n   %s✅ 第三步的固化部分完成。%s\n' "$C_OK" "$C_RST"
 printf '   重启验证尚未进行 —— 请按上面的清单操作，回来跑：\n'
-printf '     %s --port %s --user %s --verify\n\n' "$SRC/$SELF" "$PORT" "$USERNAME"
+printf '     %s --port %s --user %s --verify\n' "$SRC/$SELF" "$PORT" "$USERNAME"
+printf '   %s--verify 会比对 boot_id：本次开机内跑不算数，必须真的重启过。%s\n\n' "$C_DIM" "$C_RST"

@@ -132,12 +132,18 @@
 
 **落地分三处**：
 
-1. **stage2 的活跃会话硬闸门**
+1. **stage2 的活跃会话硬闸门 —— 两条都必须满足**
    ```
-   ss -tnH state established '( sport = :PORT )' | wc -l  > 0
+   ss -tnH state established '( sport = :PORT )' | wc -l  > 0          # 有连接
+   journalctl -b -u ssh | grep "Accepted publickey for <账户> from"    # 且真的认证成功过
    ```
-   不满足就拒绝执行。也就是说：你必须已经开着一条走**新端口**的会话，
-   才能关旧端口。关完旧端口如果新端口有问题，那条已建立的会话还在。
+   第一条只证明「端口上有 TCP 连接」——**未认证的连接（扫描器、`nc`）也是
+   established**。第二条从服务端日志取证，证明该账户的公钥**确实被 sshd 接受过**：
+   「公钥文件里有可解析的串」不等于「sshd 会接受它」（属主、权限、`Match` 都可能拒绝）。
+   两条都不满足就拒绝执行。关完旧端口如果新端口有问题，那条已认证的会话还在。
+
+   注意 `pts` 会话数量只能参考：`who` 不显示会话走的是哪个端口，
+   它可能来自即将被关掉的旧端口。
 
 2. **stage3 的控制台救援检查**
    脚本检测云厂商控制台通道（`AuthorizedKeysCommand` 指向控制台脚本）是否存在，
@@ -233,6 +239,15 @@ ssh -v -p PORT -o PreferredAuthentications=password -o PubkeyAuthentication=no \
   危险之处在于它是**反着**误导人：可能让人以为加固丢了，去做多余的操作。
   修法：在任何探测之前先加**权限闸门**（`require_root`），明确区分
   「读不到」和「确实没有」—— 宁可明确拒绝，也不要给出错误的状态判断。
+- **`sshd -T` 不带 `-C` 只看得到默认上下文**：主配置里若后来出现
+  `Match Address <远程网段>` / `Match User` 分支，`PasswordAuthentication yes`
+  之类的放行会藏在那里 —— 普通 `sshd -T` 读到的是「默认值」，于是验证会误报通过。
+  必须用 `sshd -T -C user=<账户>,host=...,addr=<来源IP>` 读**连接上下文**下的生效值。
+- **「规则里含 counter」不等于「有兜底 drop」**：`grep -q counter` 在一张只有
+  `counter accept` 的表上也会通过，而那意味着**没有默认拒绝**。
+  必须匹配末尾的 drop 规则（`grep -E 'counter.*[[:space:]]drop'`）。
+- **`nft -f` 是「加载」不是「替换」**：直接加载备份文件，旧规则会和新规则并存。
+  恢复规则必须先 `nft delete table` 再 `nft -f`。
 - **CR 污染**：见原则 5。
 
 ### 原则 9 · 幂等 + 可回滚；备份失败必须中止
@@ -355,14 +370,15 @@ table inet sshguard {
 | 约定 | 说明 |
 |---|---|
 | **默认只读** | 不加 `--apply` 就只检查不动手。默认行为是最安全的行为。 |
+| **只读无副作用** | 只读模式**不创建任何目录/文件**（包括 `backups/`），并且**退出码反映检查结论**：有 ✗ 就返回非 0。 |
 | **无 lib.sh** | 三个脚本各自完整自包含。共享框架代码在每份里都有一份。**刻意重复**，换取「单个文件拷过去就能跑」。 |
 | **注释即手册** | 头部注释涵盖：做什么 / 何时能跑 / 参数含义 / 执行顺序 / 失败方向 / 典型用法。 |
-| **参数化** | 不猜端口、不猜账户。缺参数就报错，不给默认值。 |
+| **参数化** | 不猜端口、不猜账户。缺参数就报错，不给默认值；`--port` 后面不跟值会**立即**报错，不会空转。 |
 | **阶段门** | 自动识别 S0~S3，拒绝倒退。 |
 | **检查/操作分离** | 先跑完所有检查并打印「预期状态 vs 当前状态」表，再决定是否动手。 |
-| **备份失败即中止** | 见原则 9。 |
-| **`--conf` 支持** | 从文件读默认值，优先级：命令行 > 配置文件 > 报错。 |
-| **阶段3 无备份逻辑** | 它不改配置文件，只 `enable` + 采集快照。撤销方式是 `systemctl disable`。 |
+| **备份失败即中止** | 见原则 9。备份目录按阶段命名（`backups/stage1-<时间戳>` / `stage2-<时间戳>`），回滚只认本阶段的。 |
+| **`--conf` 支持** | 从文件读默认值，优先级：**命令行 > 配置文件 > 报错**。命令行显式给过的键，配置文件不再覆盖（包括 `--allow`）。 |
+| **阶段3 无备份逻辑** | 它不改配置文件，只 `enable` + 采集快照。撤销方式是恢复 `--apply` 前记录的 enable 状态。 |
 
 ---
 
@@ -419,20 +435,34 @@ table inet sshguard {
 
 **什么时候能跑**：S1（通道已建），或 S2（幂等重跑）。S0 先跑 stage1；S3 拒绝执行。
 
-#### 两道特别的机关
+#### 三道特别的机关
 
-**① 活跃会话硬闸门**（唯一一道「不满足就绝不往下走」的闸门）
+**① 硬闸门：有连接 ≠ 认证成功**（唯一一道「不满足就绝不往下走」的闸门）
 
 ```bash
-ss -tnH state established '( sport = :PORT )' | wc -l   # 必须 > 0
+# 必要条件：新端口上有 TCP 连接
+ss -tnH state established '( sport = :PORT )' | wc -l          # 必须 > 0
+# 证据：服务端日志里该账户真的用公钥登录成功过（本次开机内）
+journalctl -b -u ssh | grep "Accepted publickey for <账户> from"
 ```
 
-不满足就拒绝，并提示：*请先另开终端 `ssh -p <端口> <账户>@<地址>`，保持该会话不断，再重跑*。
+两条都满足才继续。第一条单独不够 —— **未认证的连接也是 established**
+（扫描器、`nc` 都能让它为真）；而且 `who` 里的 `pts` 会话不显示端口，
+可能是即将被关掉的旧端口上的会话。第二条从**服务端行为**取证：
+公钥文件里有可解析的串 ≠ sshd 会接受它（属主、权限、`Match` 都可能拒绝）。
+
+不满足就提示：*请先用新端口以该账户登录一次，并保持该会话不断，再重跑*。
 
 **② 探针自校准**
 
 关密码认证**之前**先跑认证方式探测，先证明探针能看到旧状态（见原则 5）。
 取到空值 = FAIL，而不是「已经收口了」。
+
+**③ 来源自检**
+
+更换白名单时，若**当前会话来源不在新白名单内**，现有连接只靠
+`ct state established` 规则暂时活着 —— 一断开就再也连不上。
+脚本会取出当前来源 IP 并对照新白名单，不在其中就判 FAIL。
 
 #### 参数
 
@@ -476,25 +506,39 @@ ss -tnH state established '( sport = :PORT )' | wc -l   # 必须 > 0
 | 模式 | 触发 | 做什么 |
 |---|---|---|
 | **检查**（默认） | 无参数 | 只读。打印「预期状态 vs 当前状态」表 |
-| **固化** | `--apply` | `enable` 开机自启 + 生成快照到 `snapshots/<时间戳>/` + 打印重启清单和收尾清单 |
-| **重启后验证** | `--verify` | 检查重启后状态，通过则写入 `.stage3-verified` |
+| **固化** | `--apply` | `enable` 开机自启 + 记录固化前状态 + 记录重启前 `boot_id` + 生成快照到 `snapshots/<时间戳>/` + 打印重启清单和收尾清单 |
+| **重启后验证** | `--verify` | **先证明真的重启过**，再检查重启后状态；通过才写入 `.stage3-verified` |
 
-#### `--verify` 的验证记录机制
+#### `--verify` 的验证记录机制：先证明「重启过」
 
-验证通过后，脚本把 **当前 `boot_id`**（`/proc/sys/kernel/random/boot_id`）写进
-`$SRC/.stage3-verified`。
+`--apply` 时脚本把**当时的 `boot_id`** 写进 `$SRC/.stage3-pending`。
+`--verify` 先比对这两个值：
 
+| 情况 | 结果 |
+|---|---|
+| 没有 `.stage3-pending` | **FAIL** —— 没有对照物，无法证明跨过重启 |
+| `pending` == 当前 `boot_id` | **FAIL** —— 仍是同一次开机，不算重启验证 |
+| `pending` != 当前 `boot_id` | 继续做后面的检查 |
+
+通过后，脚本把 **当前 `boot_id`** 写进 `$SRC/.stage3-verified`。
 **下次重启后 `boot_id` 变化，这份记录自动失效** ⇒ 阶段回到 S2，
 「重启验证」必须重做。这是刻意的 —— 一次验证只对一次开机有效。
 
-#### `--verify` 检查的六件事
+（早期版本只对「同一次开机」打印一句警告却照样通过并写记录，
+等于 `--apply` 之后原地跑一次 `--verify` 就能把状态标成 S3 —— 现已改为硬失败。）
 
+#### `--verify` 检查的内容
+
+0. **`boot_id` 确实变过**（见上表）← 前提
 1. `ssh-firewall.service` 是否**自动启动**（开机加载器 + 30 次重试是否奏效）← **核心**
-2. nft 表是否自动加载且含兜底 drop
+2. nft 表是否自动加载且**末尾有兜底 drop**（只有 `counter accept` 不算）
 3. `ssh.socket` 是否 active、端口是否在监听、本机回环能否连通
 4. 旧端口是否仍然关闭
-5. 认证策略（`permitrootlogin no` / `passwordauthentication no`）是否仍收口
+5. 认证策略是否仍收口：`permitrootlogin no` / `passwordauthentication no` /
+   `kbdinteractiveauthentication no`（后者不关，密码可经 PAM 绕过）
 6. `ssh-firewall.service` 是否已设开机自启
+
+认证项用 `sshd -T -C` 按**真实连接上下文**读取，`Match Address` 分支里的放行躲不掉。
 
 #### 检查模式还包含：配置层漂移检测
 
@@ -521,7 +565,7 @@ cfg_ports="$(sshd -T | awk '$1=="port"{print $2}' | sort -u)"
 | `--apply` | | 关 | 执行固化 |
 | `--verify` | | 关 | 重启后验证模式 |
 | `--yes` | | 关 | 跳过交互确认 |
-| `--rollback` | | — | 撤销本步固化（`disable` 开机自启），**不碰前两步的配置** |
+| `--rollback` | | — | 按 `--apply` 记录的**固化前状态**恢复自启：原本 enabled 的单元保持/恢复，原本没有自启的才 disable。找不到记录时**不做任何 disable**。**不碰前两步的配置** |
 
 #### 用法
 
@@ -657,7 +701,8 @@ tcp dport { <端口> } counter packets 0 bytes 0 drop
         ★ 用新端口、新账户、从白名单网段真的登录一次 ←── 不可跳过
 
 第二步  ./stage2.sh --port <新端口> --user <账户>                        # 只读检查
-        ★ 另开一个终端保持新端口会话不断 ←── 硬闸门
+        ★ 用新端口以该账户登录，并让会话一直开着 ←── 硬闸门（两条都要满足：
+          终端里有活连接，且日志里能看到这次公钥登录成功）
         ./stage2.sh --port <新端口> --user <账户> --apply
 
 第三步  ./stage3.sh --port <新端口> --user <账户>                        # 只读检查
@@ -702,9 +747,17 @@ tcp dport { <端口> } counter packets 0 bytes 0 drop
 
 | 路径 | 内容 |
 |---|---|
-| `$SRC/backups/<时间戳>/` | 每次 `--apply` 的配置备份 + `MANIFEST` 清单 |
+| `$SRC/backups/stage1-<时间戳>/` | stage1 每次 `--apply` 的配置备份 + `MANIFEST` 清单 |
+| `$SRC/backups/stage2-<时间戳>/` | stage2 每次 `--apply` 的配置备份 + `MANIFEST` 清单 |
+| `$SRC/backups/<阶段>-<时间戳>/ROLLED_BACK` | 回滚完成的标记。回滚只挑**本阶段**、且**没有该标记**的最新备份 —— 防止拿着 step1 的备份去撤 step2 的改动 |
 | `$SRC/snapshots/<时间戳>/` | 基线快照：`sshd-T.txt`、`nft-sshguard.txt`、`listen.txt`、`socket-listen.txt`、`services.txt`、`dropins.txt`、`META.txt` |
-| `$SRC/.stage3-verified` | 重启验证记录（存 `boot_id`，下次重启后自动失效） |
+| `$SRC/.stage3-pending` | `stage3 --apply` 时记下的 `boot_id`（重启前基线） |
+| `$SRC/.stage3-verified` | 重启验证记录（存重启后的 `boot_id`，下次重启后自动失效） |
+| `$SRC/.stage3-fixation-pre` | `stage3 --apply` 前各单元的 enable 状态，供 `--rollback` 精确还原 |
+
+**`.stage3-pending` 与 `.stage3-verified` 是一对**：`--verify` 必须看见 pending 且
+当前 `boot_id` **与它不同**，才承认「确实重启过」。缺 pending 就直接判失败 ——
+否则「apply 完原地 verify」会被误记成 S3（这原本是个真漏洞）。
 
 ### 9.2 被管理的系统文件
 

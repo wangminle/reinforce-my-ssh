@@ -25,12 +25,21 @@
 #    --conf <file>    可选。从文件读默认值（每行 KEY=VALUE，# 开头为注释）。
 #    --apply          实际执行。**不加这个参数时脚本只读不改**（默认行为）。
 #    --yes            跳过交互确认（用于无人值守）。
-#    --rollback       按最近一次备份还原。
+#    --rollback       按**本阶段**最近一次未回滚的备份还原（不碰别阶段的备份）。
 #
 #  【为什么有一道「活跃会话」闸门】
 #    关掉旧端口之后，如果新端口有问题，你就没有第二条路进来了。
-#    所以本脚本强制要求：必须已有一条走**新端口**的活跃连接，否则拒绝执行。
+#    所以本脚本强制要求两件事同时成立，否则拒绝执行：
+#      ① 已有一条走**新端口**的活跃连接（TCP 层面确实通了）
+#      ② sshd 日志里能看到**本账户在本次开机内**被 Accepted（公钥真的验过了）
+#    只看 ① 不够 —— 一条连到端口却卡在认证前的 TCP 连接也算「活跃」，
+#    而且它可能走的是旧端口。只有服务端日志能证明「我的钥匙真的能开门」。
 #    这是整个方案里唯一一道「不满足就绝不往下走」的硬闸门。
+#
+#  【为什么换白名单之前先自检来源】
+#    改白名单最危险的形态是：新规则里没有你自己的来源，改完当场失联。
+#    所以重写 nft 规则之前，脚本先解析你**当前这条 SSH 会话**的客户端地址，
+#    逐个网段核对它是否被包含；不包含就拒绝执行。
 #
 #  【为什么验证要「自校准」】
 #    黑盒探针（本机回环发起连接，读服务端宣告的认证方式）必须先证明它
@@ -97,7 +106,7 @@ usage() {
   --conf <file>     从文件读默认值（KEY=VALUE 每行一个）
   --apply           实际执行（不加则只检查，脚本只读不改）
   --yes             跳过交互确认
-  --rollback        按最近一次备份还原
+  --rollback        按本阶段最近一次未回滚的备份还原
   -h, --help        显示本帮助
 
 完整说明见本脚本头部注释。
@@ -108,14 +117,28 @@ USAGE
 
 PORT=""; OLD_PORT="22"; USERNAME=""; CONF=""; ALLOWS=()
 APPLY=0; ASSUME_YES=0; DO_ROLLBACK=0
+# 「命令行是否显式给过这个键」。配置文件只补没给过的键 ——
+# 否则 `--old-port 22` 会被配置里的 OLD_PORT 悄悄覆盖，
+# 配置里的宽泛 ALLOW 也会追加进用户本想替换掉的白名单。
+PORT_SET=0; OLD_PORT_SET=0; USER_SET=0; ALLOW_SET=0
+
+# 选项缺值守卫：在**当前 shell**里退出。
+# 旧写法 `PORT="${2:-}"; shift 2` 在只写 `--port` 时 shift 失败、参数不变，
+# 循环永远退不出去（死循环）。这里遇到缺值立即报错。
+need_val() {  # need_val <选项名> <当前剩余参数个数>
+  (( $2 >= 2 )) && return 0
+  printf '参数 %s 缺少取值\n\n' "$1" >&2
+  usage >&2
+  exit 2
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --port)     PORT="${2:-}";      shift 2 ;;
-    --old-port) OLD_PORT="${2:-}";  shift 2 ;;
-    --user)     USERNAME="${2:-}";  shift 2 ;;
-    --allow)    ALLOWS+=("${2:-}"); shift 2 ;;
-    --conf)     CONF="${2:-}";      shift 2 ;;
+    --port)     need_val "$1" $#; PORT="$2";      PORT_SET=1;     shift 2 ;;
+    --old-port) need_val "$1" $#; OLD_PORT="$2";  OLD_PORT_SET=1; shift 2 ;;
+    --user)     need_val "$1" $#; USERNAME="$2";  USER_SET=1;     shift 2 ;;
+    --allow)    need_val "$1" $#; ALLOWS+=("$2"); ALLOW_SET=1;    shift 2 ;;
+    --conf)     need_val "$1" $#; CONF="$2";                      shift 2 ;;
     --apply)    APPLY=1;      shift ;;
     --yes)      ASSUME_YES=1; shift ;;
     --rollback) DO_ROLLBACK=1; shift ;;
@@ -124,6 +147,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# 配置文件补默认值（命令行 > 配置文件 > 报错）
 if [[ -n "$CONF" ]]; then
   [[ -r "$CONF" ]] || die "配置文件不可读: $CONF"
   while IFS='=' read -r k v; do
@@ -131,23 +155,31 @@ if [[ -n "$CONF" ]]; then
     v="$(printf '%s' "$v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [[ -z "$k" || -z "$v" ]] && continue
     case "$k" in
-      PORT)     [[ -z "$PORT" ]]      && PORT="$v" ;;
-      OLD_PORT) [[ "$OLD_PORT" == "22" ]] && OLD_PORT="$v" ;;
-      USER)     [[ -z "$USERNAME" ]]  && USERNAME="$v" ;;
-      ALLOW)    ALLOWS+=("$v") ;;
+      PORT)     (( PORT_SET ))     || PORT="$v" ;;
+      OLD_PORT) (( OLD_PORT_SET )) || OLD_PORT="$v" ;;
+      USER)     (( USER_SET ))     || USERNAME="$v" ;;
+      ALLOW)    (( ALLOW_SET ))    || ALLOWS+=("$v") ;;
     esac
   done < "$CONF"
 fi
+
+# 端口合法性：只接受十进制 1–65535。
+# 注意 10# 强制十进制：不写它的话 "08" 会让 Bash 按八进制解析并直接报错退出。
+is_port() {
+  [[ "$1" =~ ^[0-9]{1,5}$ ]] || return 1
+  local n=$((10#$1))
+  (( n >= 1 && n <= 65535 ))
+}
 
 require_params() {
   local miss=0
   [[ -z "$PORT" ]]     && { fail "--port 未提供"; miss=1; }
   [[ -z "$USERNAME" ]] && { fail "--user 未提供"; miss=1; }
-  if [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT < 1 || PORT > 65535 )); then
-    fail "--port 非法: $PORT"; miss=1
+  if [[ -n "$PORT" ]] && ! is_port "$PORT"; then
+    fail "--port 非法: $PORT（应为 1–65535 的端口号）"; miss=1
   fi
-  if [[ "$OLD_PORT" != "none" ]] && ! [[ "$OLD_PORT" =~ ^[0-9]+$ ]]; then
-    fail "--old-port 非法: $OLD_PORT（应为端口号或 none）"; miss=1
+  if [[ "$OLD_PORT" != "none" ]] && ! is_port "$OLD_PORT"; then
+    fail "--old-port 非法: $OLD_PORT（应为 1–65535 的端口号，或 none）"; miss=1
   fi
   if [[ "$OLD_PORT" != "none" && "$OLD_PORT" == "$PORT" ]]; then
     fail "--old-port 与 --port 相同（$PORT）"; miss=1
@@ -161,10 +193,11 @@ require_params() {
 # ─────────────────────── 共享框架 · 3. 备份与回滚 ───────────────────────
 
 TS=""; MANIFEST=""
+STAGE_TAG="stage2"    # 备份目录带上阶段标签：两步共用 backups/，靠它区分归属
 
 backup_begin() {
   TS="$(date +%Y%m%d-%H%M%S)"
-  MANIFEST="$BACKUP_ROOT/$TS"
+  MANIFEST="$BACKUP_ROOT/$STAGE_TAG-$TS"
   if ! mkdir -p "$MANIFEST" 2>/dev/null; then
     die "无法创建备份目录 $MANIFEST —— 备份失败必须中止，不能「没备成也接着改」"
   fi
@@ -188,13 +221,20 @@ backup_file() {
 
 newest_manifest_dir() {
   local d
-  d="$(ls -1dt "$BACKUP_ROOT"/*/ 2>/dev/null | head -1)"
-  [[ -n "$d" ]] || return 1
-  printf '%s' "${d%/}"
+  # 只认本阶段的备份：两步共用 backups/ 时，「取最新一个」可能取到另一阶段的，
+  # 回滚就会恢复到错误的状态。已回滚过的目录（ROLLED_BACK 标记）跳过，
+  # 避免同一次改动被重复回滚。
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    [[ -f "$d/ROLLED_BACK" ]] && { skip "跳过已回滚的备份: ${d%/}"; continue; }
+    printf '%s' "${d%/}"
+    return 0
+  done < <(ls -1dt "$BACKUP_ROOT/$STAGE_TAG"-*/ 2>/dev/null)
+  return 1
 }
 
 do_rollback() {
-  local d="$1" kind orig base
+  local d="$1" kind orig base nb=""
   [[ -f "$d/MANIFEST" ]] || die "备份目录里没有 MANIFEST: $d"
   hdr "回滚 · 依据 $d/MANIFEST"
   while read -r kind orig base; do
@@ -205,15 +245,32 @@ do_rollback() {
       if [[ -e "$orig" ]]; then rm -f "$orig" && act "删除 $orig（原本不存在）"; else skip "$orig 本就不存在"; fi
     fi
   done < "$d/MANIFEST"
+
+  # nft 表是内核态，不在 MANIFEST 里，只能从备份的规则文件恢复。
+  # 备份名由路径 tr '/' '_' 得来 —— 首字符也是 '_'，此前这里少写了下划线，
+  # 于是永远匹配不到备份（`ls` 报错被 2>/dev/null 吞掉，旧端口恢复后
+  # 内核规则仍只保护新端口）。
+  # 另外 `nft -f` 是「加载」不是「替换」：必须先删旧表，否则新旧规则并存。
+  nb="$d/$(printf '%s' "$NFT_RULES" | tr '/' '_')"
+  [[ -f "$nb" ]] || nb=""
   if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
-    # nft 表内容不在 MANIFEST 里（它是内核态），从备份的规则文件重载
-    local nb; nb="$(ls -1 "$d"/etc_nftables.d_ssh-allowlist.nft 2>/dev/null | head -1)"
-    if [[ -n "$nb" ]] && nft -f "$nb" 2>/dev/null; then
-      act "已按备份重载 nft 规则"
-    fi
+    nft delete table inet "$NFT_TABLE" 2>/dev/null || true
   fi
+  if [[ -n "$nb" ]] && nft -f "$nb" 2>/dev/null; then
+    act "已按备份恢复 nft 规则: $nb"
+  elif [[ -n "$nb" ]]; then
+    fail "nft 备份重载失败: $nb"
+  else
+    act "nft 表已删除（备份里没有规则文件）"
+  fi
+
   systemctl daemon-reload 2>/dev/null || true
   systemctl restart ssh.socket 2>/dev/null || true
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    fail2ban-client reload >/dev/null 2>&1 || true
+  fi
+
+  : > "$d/ROLLED_BACK" 2>/dev/null || true
   printf '\n'
   ok "回滚完成"
   inf "当前监听："
@@ -240,13 +297,33 @@ require_root() {
   die "请用 sudo 运行，例如： sudo bash $0 ..."
 }
 
+# 读 sshd 的「生效值」—— 带连接上下文。
+# 不带 -C 的 `sshd -T` 只给出默认上下文；主配置里后来若出现
+# `Match Address <远程网段>` / `Match User` 之类的分支，password / root 的放行
+# 会藏在那里，而普通的 `sshd -T` 看不到。这里用真实来源 IP 构造上下文去读。
+# 取不到时退回不带 -C 的读法。
+sshd_eff() {  # sshd_eff <key> <user> [addr]
+  local key="$1" u="$2" addr="${3:-0.0.0.0}" v=""
+  v="$(sshd -T -C "user=$u,host=localhost,addr=$addr" 2>/dev/null \
+       | awk -v k="$key" '$1==k{print $2; exit}')" || true
+  if [[ -z "$v" ]]; then
+    v="$(sshd -T 2>/dev/null | awk -v k="$key" '$1==k{print $2; exit}')" || true
+  fi
+  printf '%s' "$v"
+}
+
 detect_stage() {
-  local fw_ok=0 nft_ok=0 auth_ok=0 legacy=0
+  local fw_ok=0 nft_ok=0 auth_ok=0 legacy=0 ip
   systemctl is-active --quiet ssh-firewall.service 2>/dev/null && fw_ok=1
   nft list table inet "$NFT_TABLE" >/dev/null 2>&1 && nft_ok=1
-  if sshd -T 2>/dev/null | grep -qi '^permitrootlogin no' \
-     && sshd -T 2>/dev/null | grep -qi '^passwordauthentication no'; then auth_ok=1; fi
-  ss -tlnH 2>/dev/null | grep -qE ':22\b' && legacy=1
+  ip="$(find_ssh_client 2>/dev/null || true)"; [[ -n "$ip" ]] || ip="0.0.0.0"
+  if [[ "$(sshd_eff permitrootlogin root "$ip")" == "no" ]] \
+     && [[ "$(sshd_eff passwordauthentication "${USERNAME:-root}" "$ip")" == "no" ]]; then auth_ok=1; fi
+  # 旧端口不能写死 22：自定义旧端口仍开放时会误判 S2；
+  # 新端口恰好是 22 时又会永远判成 S1（见 --old-port 的语义）。
+  if [[ -n "${OLD_PORT:-}" && "$OLD_PORT" != "none" && "$OLD_PORT" != "${PORT:-}" ]]; then
+    port_listening "$OLD_PORT" && legacy=1
+  fi
 
   if (( !fw_ok || !nft_ok )); then printf 'S0'; return; fi
   if (( !auth_ok || legacy ));    then printf 'S1'; return; fi
@@ -272,6 +349,28 @@ find_ssh_client() {
     [[ -z "$p" || "$p" -le 1 ]] && return 1
   done
   return 1
+}
+
+# 当前会话来源；取不到时返回一个可行的默认上下文地址
+client_addr() { find_ssh_client 2>/dev/null || printf '0.0.0.0'; }
+
+# 本次开机内，sshd 是否真的接受过该账户的公钥登录。
+# 「公钥能解析」只说明文件里有串可解析的文本；sshd 是否接受还要看
+# 属主/权限/Match 策略。服务端日志里的 `Accepted ... for <user>` 是唯一
+# 从行为层面取到的证据 —— 关掉密码认证前，这条证据必须存在。
+key_login_evidence() {
+  local logs=""
+  if command -v journalctl >/dev/null 2>&1; then
+    logs="$(journalctl -b -u ssh -u sshd --no-pager 2>/dev/null)"
+  fi
+  if [[ -z "$logs" && -r /var/log/auth.log ]]; then
+    logs="$(cat /var/log/auth.log 2>/dev/null)"
+  fi
+  # 只认 `Accepted publickey`。
+  # 不能把 `keyboard-interactive/pam` 也算进来 —— 那个方法可能就是密码经 PAM
+  # 通过的记录，拿它当「公钥已验证」的证据，等于在关密码之前自欺。
+  printf '%s\n' "$logs" \
+    | grep -E "Accepted publickey for ${USERNAME} from " | tail -1
 }
 
 ip_in_cidrs() {
@@ -331,22 +430,28 @@ run_checks() {
     c_fail "不是以 root 运行" "脚本内部直接调 nft/sshd/systemctl，不会自己 sudo；请用 sudo 运行"
   fi
 
-  # 2. 硬闸门：必须已有一条走新端口的活跃连接
-  local alive pts
+  # 2. 硬闸门
+  #    只看 TCP established 不够：未认证的连接（扫描器、nc）也是 established。
+  #    只看 pts 数量也不够：那可能是走旧端口的会话。
+  #    真正要证明的是「$USERNAME 用公钥、经新端口、被 sshd 接受过」——
+  #    前两项只是必要条件，日志里的 Accepted 记录才是证据。
+  local alive cred pts
   alive="$(ss -tnH state established '( sport = :'"$PORT"' )' 2>/dev/null | wc -l)"
-  pts="$(who 2>/dev/null | grep -c 'pts/' || true)"
   if (( alive > 0 )); then
     c_ok "端口 $PORT 上有 $alive 条活跃连接"
-    if (( pts > 0 )); then
-      c_ok "存在 $pts 个交互式会话（pts）—— 关旧端口后仍有路可回"
-    else
-      c_warn "没有交互式会话（pts），只有命令式连接" \
-             "命令式连接随命令结束即断；建议先另开一个终端登进来再执行"
-    fi
   else
     c_fail "端口 $PORT 上没有任何活跃连接" \
            "关掉旧端口后若出问题就没有回头路。请先另开终端：ssh -p $PORT $USERNAME@<地址>，保持该会话不断，再重跑"
   fi
+  if cred="$(key_login_evidence)"; then
+    c_ok "本次开机有 $USERNAME 的公钥登录成功记录（密钥确实被 sshd 接受过）"
+    inf "  $cred"
+  else
+    c_fail "本次开机找不到 $USERNAME 的公钥登录成功记录" \
+           "公钥可解析 ≠ sshd 会接受（属主/权限/Match 都可能拒绝）。请先用新端口以该账户登录一次，再跑本步"
+  fi
+  pts="$(who 2>/dev/null | awk -v u="$USERNAME" '$1==u && $2 ~ /^pts/ {c++} END{print c+0}')"
+  (( pts > 0 )) && inf "另有 $pts 个 $USERNAME 的交互式会话（仅供参考 —— 无法区分它们走的是新端口还是旧端口）"
 
   # 3. 管理账户
   if id "$USERNAME" >/dev/null 2>&1; then
@@ -373,21 +478,21 @@ run_checks() {
   fi
 
   # 4. 公钥认证必须可用（否则关密码 = 自锁）
-  local pub
-  pub="$(sshd -T 2>/dev/null | awk '$1=="pubkeyauthentication"{print $2; exit}')"
+  local pub kbd addr
+  addr="$(client_addr)"
+  pub="$(sshd_eff pubkeyauthentication "$USERNAME" "$addr")"
   if [[ "$pub" == "yes" ]]; then
     c_ok "PubkeyAuthentication=yes（关掉密码后仍能进来）"
   else
-    c_fail "PubkeyAuthentication=$pub —— 关掉密码会自锁" "先把它改回 yes"
+    c_fail "PubkeyAuthentication=${pub:-读不到} —— 关掉密码会自锁" "先把它改回 yes"
   fi
 
   # 5. KbdInteractive 必须关 —— 否则密码可经 PAM 绕过后面的改动
-  local kbd
-  kbd="$(sshd -T 2>/dev/null | awk '$1=="kbdinteractiveauthentication"{print $2; exit}')"
+  kbd="$(sshd_eff kbdinteractiveauthentication "$USERNAME" "$addr")"
   if [[ "$kbd" == "no" ]]; then
     c_ok "KbdInteractiveAuthentication=no（无 PAM 密码旁路）"
   else
-    c_fail "KbdInteractiveAuthentication=$kbd —— 密码仍可经 PAM 登录，本步改动会无效" \
+    c_fail "KbdInteractiveAuthentication=${kbd:-读不到} —— 密码仍可经 PAM 登录，本步改动会无效" \
            "先把它设为 no（这是 PasswordAuthentication no 能否真正生效的前提）"
   fi
 
@@ -398,11 +503,17 @@ run_checks() {
     c_warn "未发现云厂商控制台通道" "请确认 VNC / 控制台救援可用，且其登录名不是 root"
   fi
 
-  # 7. 备份可写
-  if mkdir -p "$BACKUP_ROOT" 2>/dev/null && [[ -w "$BACKUP_ROOT" ]]; then
-    c_ok "备份目录可写: $BACKUP_ROOT"
+  # 7. 备份可写 —— 只读模式不能有副作用：目录不存在时只测父目录，不创建它
+  if [[ -d "$BACKUP_ROOT" ]]; then
+    if [[ -w "$BACKUP_ROOT" ]]; then
+      c_ok "备份目录可写: $BACKUP_ROOT"
+    else
+      c_fail "备份目录不可写: $BACKUP_ROOT" "备份失败必须中止"
+    fi
+  elif [[ -w "$SRC" ]]; then
+    c_ok "备份目录尚不存在，$SRC 可写 —— --apply 时会创建"
   else
-    c_fail "备份目录不可写: $BACKUP_ROOT" "备份失败必须中止"
+    c_fail "无法创建备份目录（$SRC 不可写）: $BACKUP_ROOT" "备份失败必须中止"
   fi
 
   # 8. 语法
@@ -423,6 +534,22 @@ run_checks() {
     fi
   else
     c_ok "白名单网段由命令行提供：${#ALLOWS[@]} 个"
+  fi
+
+  # 9b. 来源自检 —— 本步可能替换白名单。
+  #      若当前会话来源不在新白名单内，现有连接只靠 established 规则暂时活着，
+  #      一旦断开就再也连不上。（这两个函数此前定义了却从未被调用。）
+  local src_ip
+  if src_ip="$(find_ssh_client)"; then
+    if ip_in_cidrs "$src_ip" "${ALLOWS[@]}"; then
+      c_ok "当前会话来源 $src_ip 在新白名单内"
+    else
+      c_fail "当前会话来源 $src_ip 不在新白名单内" \
+             "现有连接靠 established 暂时保留，断开即失联：请把该来源加入 --allow"
+    fi
+  else
+    c_warn "无法确定会话来源（非 SSH 登录，或 sudo 清空了环境）" \
+           "无法预检「改完还能不能连上」；请自行确认本机来源在新白名单内"
   fi
 
   # 10. 探针自校准 —— 证明探针本身工作
@@ -585,19 +712,28 @@ gen_nft_rules() {
   } > "$f"
 }
 
+# 全局，不是 local：EXIT trap 在函数返回之后才触发，
+# 那时局部变量早已离开作用域（set -u 下会报 unbound variable，临时目录也漏清理）。
+TMPD=""
+
+# 安装配置文件；失败立即中止，绝不带着半完成配置往下走
+put_file() {  # put_file <临时文件> <目标路径> <权限>
+  install -m "$3" -o root -g root "$1" "$2" \
+    || die "安装失败: $2 —— 中止（配置可能已部分写入，可执行 --rollback）"
+}
+
 do_apply() {
-  local tmp
-  tmp="$(mktemp -d)" || die "无法创建临时目录"
-  trap 'rm -rf "$tmp"' EXIT
+  TMPD="$(mktemp -d)" || die "无法创建临时目录"
+  trap '[ -n "$TMPD" ] && rm -rf "$TMPD"' EXIT
 
-  gen_dropin_root "$tmp/10-permit-root-login.conf"
-  gen_dropin_pass "$tmp/20-disable-password-auth.conf"
-  gen_sshd_dropin "$tmp/99-hardening.conf"
-  gen_socket_override "$tmp/override.conf"
-  gen_nft_rules "$tmp/ssh-allowlist.nft"
+  gen_dropin_root "$TMPD/10-permit-root-login.conf"
+  gen_dropin_pass "$TMPD/20-disable-password-auth.conf"
+  gen_sshd_dropin "$TMPD/99-hardening.conf"
+  gen_socket_override "$TMPD/override.conf"
+  gen_nft_rules "$TMPD/ssh-allowlist.nft"
 
-  if ! nft -c -f "$tmp/ssh-allowlist.nft" 2>"$tmp/nft.err"; then
-    fail "nft 语法校验未通过：$(cat "$tmp/nft.err")"
+  if ! nft -c -f "$TMPD/ssh-allowlist.nft" 2>"$TMPD/nft.err"; then
+    fail "nft 语法校验未通过：$(cat "$TMPD/nft.err")"
     die "中止（未做任何修改）"
   fi
   ok "nft 语法校验通过"
@@ -607,9 +743,12 @@ do_apply() {
   backup_file "$SSHD_DROPIN"; backup_file "$SSH_SOCKET_OVERRIDE"; backup_file "$NFT_RULES"
   backup_file "$F2B_JAIL"
 
+  mkdir -p /etc/ssh/sshd_config.d /etc/systemd/system/ssh.socket.d /etc/nftables.d \
+    || die "无法创建配置目录 —— 中止（未做任何修改，可执行 --rollback）"
+
   sub "阶段 A · 认证策略"
-  install -m 0644 -o root -g root "$tmp/10-permit-root-login.conf"    "$DROPIN_ROOT"
-  install -m 0644 -o root -g root "$tmp/20-disable-password-auth.conf" "$DROPIN_PASS"
+  put_file "$TMPD/10-permit-root-login.conf"    "$DROPIN_ROOT" 0644
+  put_file "$TMPD/20-disable-password-auth.conf" "$DROPIN_PASS" 0644
   act "已写入 $DROPIN_ROOT"
   act "已写入 $DROPIN_PASS"
 
@@ -619,22 +758,23 @@ do_apply() {
   fi
   ok "sshd 配置语法正确"
 
-  systemctl daemon-reload
+  systemctl daemon-reload || { fail "daemon-reload 失败，回滚"; do_rollback "$MANIFEST"; exit 1; }
   systemctl restart ssh.socket || { fail "ssh.socket 重启失败，回滚"; do_rollback "$MANIFEST"; exit 1; }
   sleep 1
   systemctl is-failed --quiet ssh.socket && { fail "ssh.socket 处于 failed，回滚"; do_rollback "$MANIFEST"; exit 1; }
 
-  local eff_root eff_pass
-  eff_root="$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2; exit}')"
-  eff_pass="$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2; exit}')"
-  [[ "$eff_root" == "no" ]] && ok "生效：PermitRootLogin = no" || { fail "PermitRootLogin=$eff_root 未生效，回滚"; do_rollback "$MANIFEST"; exit 1; }
-  [[ "$eff_pass" == "no" ]] && ok "生效：PasswordAuthentication = no" || { fail "PasswordAuthentication=$eff_pass 未生效，回滚"; do_rollback "$MANIFEST"; exit 1; }
+  local eff_root eff_pass addr
+  addr="$(client_addr)"
+  eff_root="$(sshd_eff permitrootlogin root "$addr")"
+  eff_pass="$(sshd_eff passwordauthentication "$USERNAME" "$addr")"
+  [[ "$eff_root" == "no" ]] && ok "生效：PermitRootLogin = no" || { fail "PermitRootLogin=${eff_root:-读不到} 未生效，回滚"; do_rollback "$MANIFEST"; exit 1; }
+  [[ "$eff_pass" == "no" ]] && ok "生效：PasswordAuthentication = no" || { fail "PasswordAuthentication=${eff_pass:-读不到} 未生效，回滚"; do_rollback "$MANIFEST"; exit 1; }
 
   if [[ "$OLD_PORT" != "none" ]]; then
     sub "阶段 B · 关闭旧端口 $OLD_PORT"
-    install -m 0644 -o root -g root "$tmp/99-hardening.conf" "$SSHD_DROPIN"
-    install -m 0644 -o root -g root "$tmp/override.conf"     "$SSH_SOCKET_OVERRIDE"
-    install -m 0644 -o root -g root "$tmp/ssh-allowlist.nft" "$NFT_RULES"
+    put_file "$TMPD/99-hardening.conf" "$SSHD_DROPIN"         0644
+    put_file "$TMPD/override.conf"     "$SSH_SOCKET_OVERRIDE" 0644
+    put_file "$TMPD/ssh-allowlist.nft" "$NFT_RULES"           0644
     act "已收窄 sshd drop-in / socket override / nft 规则到 {$PORT}"
 
     if ! sshd -t -f /etc/ssh/sshd_config; then
@@ -642,7 +782,7 @@ do_apply() {
     fi
 
     # socket 单元缓存：必须先 daemon-reload，否则沿用旧 ListenStream
-    systemctl daemon-reload
+    systemctl daemon-reload || { fail "daemon-reload 失败，回滚"; do_rollback "$MANIFEST"; exit 1; }
     systemctl restart ssh-firewall.service || { fail "防火墙重载失败，回滚"; do_rollback "$MANIFEST"; exit 1; }
     systemctl restart ssh.socket || { fail "ssh.socket 重启失败，回滚"; do_rollback "$MANIFEST"; exit 1; }
     sleep 1
@@ -703,11 +843,15 @@ do_verify() {
     ok "root 已无法登录（密钥与密码均被拒）"
   fi
 
-  local eff_root eff_pass
-  eff_root="$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2; exit}')"
-  eff_pass="$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2; exit}')"
-  [[ "$eff_root" == "no" ]] && ok "sshd -T: permitrootlogin no" || { fail "permitrootlogin=$eff_root"; bad=1; }
-  [[ "$eff_pass" == "no" ]] && ok "sshd -T: passwordauthentication no" || { fail "passwordauthentication=$eff_pass"; bad=1; }
+  local eff_root eff_pass eff_kbd addr
+  addr="$(client_addr)"
+  eff_root="$(sshd_eff permitrootlogin root "$addr")"
+  eff_pass="$(sshd_eff passwordauthentication "$USERNAME" "$addr")"
+  eff_kbd="$(sshd_eff kbdinteractiveauthentication "$USERNAME" "$addr")"
+  [[ "$eff_root" == "no" ]] && ok "sshd 生效: permitrootlogin no" || { fail "permitrootlogin=${eff_root:-读不到}"; bad=1; }
+  [[ "$eff_pass" == "no" ]] && ok "sshd 生效: passwordauthentication no" || { fail "passwordauthentication=${eff_pass:-读不到}"; bad=1; }
+  # KbdInteractive 不关的话，密码可以经 PAM 绕过 PasswordAuthentication no
+  [[ "$eff_kbd" == "no" ]] && ok "sshd 生效: kbdinteractiveauthentication no" || { fail "kbdinteractiveauthentication=${eff_kbd:-读不到} —— 密码仍可经 PAM 登录"; bad=1; }
 
   if port_listening "$PORT"; then ok "端口 $PORT 仍在监听"; else fail "端口 $PORT 未监听"; bad=1; fi
 
@@ -769,9 +913,13 @@ print_dry_run_table
 
 if (( ! APPLY )); then
   print_plan
-  conclude || true
-  printf '\n   %s这是只读检查（默认行为）。加 --apply 才会真正执行。%s\n\n' "$C_B" "$C_RST"
-  exit 0
+  # 只读检查的退出码要反映检查结论：有 FAIL 就不能返回 0。
+  if conclude; then
+    printf '\n   %s这是只读检查（默认行为）。加 --apply 才会真正执行。%s\n\n' "$C_B" "$C_RST"
+    exit 0
+  fi
+  printf '\n   %s只读检查未全过 —— 先修好上面标 ✗ 的项。%s\n\n' "$C_FAIL" "$C_RST"
+  exit 1
 fi
 
 conclude || { printf '\n   未做任何修改。\n\n'; exit 1; }
