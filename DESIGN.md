@@ -226,6 +226,13 @@ ssh -v -p PORT -o PreferredAuthentications=password -o PubkeyAuthentication=no \
   `authorized_keys`」上会误判为「有公钥」并放行，接着关掉密码认证 = **自锁**。
 - **权限盲区**：以普通用户跑 `journalctl` 返回空，是权限问题，不是「没有日志」。
   故障排查时别拿低权限输出当证据。
+- **脚本自己的探测也会骗人**：`detect_stage` 靠 `nft list` 与 `sshd -T` 判断阶段，
+  而这两个命令**需要 root**。非 root 时它们返回的是权限错误
+  （`Operation not permitted` / `no hostkeys available`），脚本会把「读不到」
+  当成「不存在」—— 于是一台**已加固**的机器被报成 **S0「未加固」**，还会拒绝执行。
+  危险之处在于它是**反着**误导人：可能让人以为加固丢了，去做多余的操作。
+  修法：在任何探测之前先加**权限闸门**（`require_root`），明确区分
+  「读不到」和「确实没有」—— 宁可明确拒绝，也不要给出错误的状态判断。
 - **CR 污染**：见原则 5。
 
 ### 原则 9 · 幂等 + 可回滚；备份失败必须中止

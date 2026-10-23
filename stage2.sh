@@ -222,6 +222,24 @@ do_rollback() {
 
 # ─────────────────────── 共享框架 · 4. 状态探测 ───────────────────────
 
+# 权限闸门：必须在使用 detect_stage 之前调用。
+#
+# 为什么需要它：detect_stage 依赖 `nft list` 与 `sshd -T`，这两个命令**都需要 root**。
+# 非 root 执行时它们返回的是权限错误（nft: "Operation not permitted"、
+# sshd: "no hostkeys available"），而脚本会把「读不到」误判成「不存在」——
+# 于是一台已加固的机器被报成 S0「未加固」，还会拒绝执行。
+#
+# 低权限输出 ≠ 事实。宁可明确拒绝，也不要给出一个错误的状态判断。
+require_root() {
+  [[ $EUID -eq 0 ]] && return 0
+  fail "需要在 root 下运行：脚本内部直接调用 nft / sshd / systemctl，不会自己 sudo"
+  note "非 root 时这两个命令返回的是权限错误，不是真实状态 ——"
+  note "  nft  → Operation not permitted (you must be root)"
+  note "  sshd → no hostkeys available -- exiting."
+  note "把「读不到」当成「没有」，会把已加固的机器误报成「未加固」"
+  die "请用 sudo 运行，例如： sudo bash $0 ..."
+}
+
 detect_stage() {
   local fw_ok=0 nft_ok=0 auth_ok=0 legacy=0
   systemctl is-active --quiet ssh-firewall.service 2>/dev/null && fw_ok=1
@@ -309,10 +327,8 @@ run_checks() {
   # 1. 权限
   if [[ $EUID -eq 0 ]]; then
     c_ok "以 root 运行"
-  elif sudo -n true 2>/dev/null; then
-    c_ok "sudo 免密可用"
   else
-    c_fail "需要 root 或可用的 sudo" "请用 sudo 运行本脚本"
+    c_fail "不是以 root 运行" "脚本内部直接调 nft/sshd/systemctl，不会自己 sudo；请用 sudo 运行"
   fi
 
   # 2. 硬闸门：必须已有一条走新端口的活跃连接
@@ -724,6 +740,8 @@ do_verify() {
 # ─────────────────────── 主流程 ───────────────────────
 
 hdr "$SELF · 第二步：认证收口"
+
+require_root
 
 if (( DO_ROLLBACK )); then
   prev="$(newest_manifest_dir)" || die "找不到任何备份目录: $BACKUP_ROOT"
