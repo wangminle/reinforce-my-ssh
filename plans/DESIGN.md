@@ -4,9 +4,11 @@
 > 本文描述三阶段重构后的目标架构、操作契约和验证边界，不是上线验收报告。
 > 静态与隔离验证已完成；真实整机和公网验收仍未完成，详见 plans/AUDIT.md。
 
+当前推荐入口：stage0-audit.sh、stage1-newport.sh、stage2-harden.sh、stage3-reboot-check.sh；旧文件名兼容关系和发布清单见 [脚本命名](SCRIPT-NAMES.md)。
+
 ## 1. 目标与非目标
 
-已有旧方案或尚未纳管的服务器，请使用根目录 `audit.py` 独立只读审计，说明见 [已有服务器审计](AUDIT-EXISTING.md)。三个阶段的默认模式属于部署前提检查/受管复验，缺少新版记录不等于服务器未加固。独立审计不创建状态，不接管配置，不放松下述 apply 保护。
+已有旧方案或尚未纳管的服务器，请使用根目录 `stage0-audit.sh` 独立只读审计，说明见 [已有服务器审计](AUDIT-EXISTING.md)。三个阶段的默认模式属于部署前提检查/受管复验，缺少新版记录不等于服务器未加固。独立审计不创建状态，不接管配置，不放松下述 apply 保护。
 
 这套脚本把 SSH 迁移收敛为一条可证明可用的管理通道：
 
@@ -58,8 +60,8 @@
 
 | 阶段 | 修改内容 | 提交条件 | 完成状态 |
 |---|---|---|---|
-| stage1：候选通道 | 原子加载来源白名单；部署早期防火墙自启、`ssh.socket` 自启和新端口；默认同时保留旧端口 | 从外部经新端口以目标非 root 用户完成公钥登录，并在该会话真实执行 `sudo stage1.sh --confirm` | `candidate-ready` |
-| stage2：认证与端口收口 | 设置仅公钥、禁 root/密码/键盘交互；socket、sshd 和 nft 的端口集合只剩新端口 | 收口后另建一次全新的外部公钥登录，并只在该新会话执行 `sudo stage2.sh --confirm` | `hardened` |
+| stage1：候选通道 | 原子加载来源白名单；部署早期防火墙自启、`ssh.socket` 自启和新端口；默认同时保留旧端口 | 从外部经新端口以目标非 root 用户完成公钥登录，并在该会话真实执行 `sudo stage1-newport.sh --confirm` | `candidate-ready` |
+| stage2：认证与端口收口 | 设置仅公钥、禁 root/密码/键盘交互；socket、sshd 和 nft 的端口集合只剩新端口 | 收口后另建一次全新的外部公钥登录，并只在该新会话执行 `sudo stage2-harden.sh --confirm` | `hardened` |
 | stage3：重启验证 | 不修改 SSH、nft、socket 或单元；记录 pre/post 基线和 boot 状态 | `boot_id` 跨重启且完整复验通过 | `verified` |
 
 阶段间不能跳跃。stage1 只允许从 `unconfigured` 部署；stage2 只允许从 `candidate-ready` 部署；stage3 只接受 `hardened` 或既有 stage3 状态。
@@ -183,7 +185,7 @@ RESCUE_CONFIRMED=yes
 ### 5.2 stage3
 
 ```text
-stage3.sh [--port <n>] [--user <name>] [--old-port <n|none>] [--conf <file>] [模式]
+stage3-reboot-check.sh [--port <n>] [--user <name>] [--old-port <n|none>] [--conf <file>] [模式]
 ```
 
 - 默认：完整只读检查，不写状态或基线；
@@ -214,21 +216,21 @@ stage3.sh [--port <n>] [--user <name>] [--old-port <n|none>] [--conf <file>] [�
 
 ```bash
 cd /opt/reinforce-my-ssh
-sudo ./stage1.sh --port 2222 --user deploy --allow 203.0.113.0/24
+sudo bash ./stage1-newport.sh --port 2222 --user deploy --allow 203.0.113.0/24
 ```
 
 也可使用 §5.1 的配置文件：
 
 ```bash
-sudo ./stage1.sh --conf /root/reinforce.conf
-sudo ./stage1.sh --conf /root/reinforce.conf --apply
+sudo bash ./stage1-newport.sh --conf /root/reinforce.conf
+sudo bash ./stage1-newport.sh --conf /root/reinforce.conf --apply
 ```
 
 `--apply` 成功后状态是 `candidate-pending`，不是完成。记录输出的事务 ID，保留旧会话，在时限内从另一台外部机器执行：
 
 ```bash
 ssh -p 2222 deploy@<服务器地址>
-sudo /opt/reinforce-my-ssh/stage1.sh --confirm
+sudo bash /opt/reinforce-my-ssh/stage1-newport.sh --confirm
 ```
 
 确认成功后才为 `candidate-ready`。若无法登录，不要关闭旧会话或继续 stage2；排查或等待/执行自动恢复。若 stage1 已 pending，重复 apply 不会缩短或重置确认要求。
@@ -238,8 +240,8 @@ sudo /opt/reinforce-my-ssh/stage1.sh --confirm
 必须保持 stage1 已确认的新端口会话。stage2 apply 本身也会验证当前会话四元组、存活 sshd 进程链、stage1 cursor 之后的公钥日志和真实 sudo：
 
 ```bash
-sudo /opt/reinforce-my-ssh/stage2.sh
-sudo /opt/reinforce-my-ssh/stage2.sh --apply
+sudo bash /opt/reinforce-my-ssh/stage2-harden.sh
+sudo bash /opt/reinforce-my-ssh/stage2-harden.sh --apply
 ```
 
 目标 sshd 策略精确包含：
@@ -257,7 +259,7 @@ Port 2222
 
 ```bash
 ssh -p 2222 deploy@<服务器地址>
-sudo /opt/reinforce-my-ssh/stage2.sh --confirm
+sudo bash /opt/reinforce-my-ssh/stage2-harden.sh --confirm
 ```
 
 只在旧 apply 会话里 confirm 不符合设计。成功后才为 `hardened`，对应自动恢复定时器才会取消。
@@ -269,14 +271,14 @@ sudo /opt/reinforce-my-ssh/stage2.sh --confirm
 先执行完整只读检查，再登记重启前状态：
 
 ```bash
-sudo /opt/reinforce-my-ssh/stage3.sh
-sudo /opt/reinforce-my-ssh/stage3.sh --apply
+sudo bash /opt/reinforce-my-ssh/stage3-reboot-check.sh
+sudo bash /opt/reinforce-my-ssh/stage3-reboot-check.sh --apply
 ```
 
 apply 通过完整检查后保存 pre 基线、当前 `PENDING_BOOT` 和 `reboot-pending`；它不会重启。再次确认独立救援，由管理员自行重启。重启回来后：
 
 1. 从外部经新端口实际建立目标用户公钥登录并测试 sudo；
-2. 执行 `sudo /opt/reinforce-my-ssh/stage3.sh --verify`；
+2. 执行 `sudo bash /opt/reinforce-my-ssh/stage3-reboot-check.sh --verify`；
 3. 只有 boot 已变化且全部检查通过，脚本才保存 post 基线并写 `verified`；
 4. 可再运行默认只读检查，确认 verified 对应当前 boot 和摘要。
 
@@ -317,13 +319,13 @@ timer 只用 `OnActiveSec=<RECOVERY_SECONDS>` 控制本次启动的确认窗口�
 
 ```bash
 # 仅当当前为 reboot-pending 或 verified；只撤销验证状态
-sudo /opt/reinforce-my-ssh/stage3.sh --rollback
+sudo bash /opt/reinforce-my-ssh/stage3-reboot-check.sh --rollback
 
 # hardened/hardening-pending → candidate-ready，恢复 stage1 的候选配置
-sudo /opt/reinforce-my-ssh/stage2.sh --rollback
+sudo bash /opt/reinforce-my-ssh/stage2-harden.sh --rollback
 
 # candidate-ready/candidate-pending → unconfigured，恢复 stage1 前状态
-sudo /opt/reinforce-my-ssh/stage1.sh --rollback
+sudo bash /opt/reinforce-my-ssh/stage1-newport.sh --rollback
 ```
 
 `--transaction <TX_ID>` 只能指定当前事务；不是挑选任意历史备份绕过阶段顺序。每次回滚后先检查状态、监听和实际外部登录，再进入下一步，并同步调整云安全组。

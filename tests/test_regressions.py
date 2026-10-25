@@ -7,22 +7,24 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 INTEGRATION = False
+STAGE_FILES = {1: "stage1-newport.sh", 2: "stage2-harden.sh", 3: "stage3-reboot-check.sh"}
 
 
 def function(stage, name):
-    text = (ROOT / f"stage{stage}.sh").read_text(encoding="utf-8")
+    text = (ROOT / STAGE_FILES[stage]).read_text(encoding="utf-8")
     start = text.index(name + "() {")
     # 函数以顶格 } 结尾；Python heredoc 内没有单独的顶格 }。
     return text[start:start + re.search(r"^}\n", text[start:], re.M).end()]
 
 
 def library(stage):
-    text = (ROOT / f"stage{stage}.sh").read_text(encoding="utf-8")
+    text = (ROOT / STAGE_FILES[stage]).read_text(encoding="utf-8")
     return text[:text.index("\nneed_val()")] + text[text.index("\nnormalize_port()"):text.index("\nrequire_root\n")]
 
 
@@ -49,16 +51,48 @@ class Regression(unittest.TestCase):
         return result.stdout
 
     def test_static(self):
-        for stage in (1, 2, 3):
-            path = ROOT / f"stage{stage}.sh"
+        for name in (*STAGE_FILES.values(), "stage0-audit.sh", "stage1.sh", "stage2.sh", "stage3.sh"):
+            path = ROOT / name
             for command in (["bash", "-n"], ["shellcheck", "-S", "warning"]):
-                with self.subTest(stage=stage, command=command):
+                with self.subTest(script=name, command=command):
                     result = subprocess.run([*command, str(path)], capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_normalizers_identical(self):
         self.assertEqual(function(1, "normalize_nft"), function(2, "normalize_nft"))
         self.assertEqual(function(1, "normalize_nft"), function(3, "normalize_nft"))
+
+    def test_old_entry_names_delegate_and_stage0_preserves_arguments(self):
+        for stage, canonical in STAGE_FILES.items():
+            with self.subTest(stage=stage):
+                old = subprocess.run(["bash", str(ROOT / f"stage{stage}.sh"), "--help"], capture_output=True, text=True)
+                new = subprocess.run(["bash", str(ROOT / canonical), "--help"], capture_output=True, text=True)
+                self.assertEqual(old.returncode, 0, old.stderr)
+                self.assertEqual(new.returncode, 0, new.stderr)
+                self.assertEqual(old.stdout, new.stdout)
+                self.assertIn(canonical, new.stdout)
+        for arguments in (["--help"], ["--port", "2222", "--user", "deploy", "--allow", "203.0.113.0/24", "--apply"]):
+            wrapper = subprocess.run(["bash", str(ROOT / "stage0-audit.sh"), *arguments], capture_output=True, text=True)
+            backend = subprocess.run([sys.executable, str(ROOT / "audit.py"), *arguments], capture_output=True, text=True)
+            self.assertEqual(wrapper.returncode, backend.returncode)
+            self.assertEqual(wrapper.stdout, backend.stdout)
+            self.assertEqual(wrapper.stderr, backend.stderr)
+
+    def test_recovery_uses_stable_stage_id_after_rename(self):
+        for stage in (1, 2):
+            for name in (f"stage{stage}.sh", STAGE_FILES[stage]):
+                with self.subTest(stage=stage, name=name):
+                    self.bash(stage, rf'''
+SELF={name}; TX_ROOT=$WORK; STATE_TX=newer; STATE_STAGE=verified
+mkdir -p "$WORK/old"
+printf '{{"files":[]}}\n' > "$WORK/old/manifest.json"
+: > "$WORK/old/units.conf"; printf 'stage{stage}\n' > "$WORK/old/stage"
+cancel_recovery() {{ return 0; }}
+tx_restore old 1 || exit 1
+printf 'stage9\n' > "$WORK/old/stage"
+(tx_restore old 1) && exit 2
+exit 0
+''')
 
     def test_socket_output_and_bind_configuration(self):
         for stage in (1, 2):
@@ -71,7 +105,7 @@ grep -qx 'BindIPv6Only=ipv6-only' "$WORK/socket" || exit 3
 gen_fw_unit "$WORK/fw" || exit 4
 grep -qx "ExecReload=$NFT_LOADER" "$WORK/fw"
 ''')
-        stage3 = (ROOT / "stage3.sh").read_text()
+        stage3 = (ROOT / STAGE_FILES[3]).read_text()
         self.assertIn('awk \'$2 == "(Stream)" {print $1}\'', stage3)
 
     def test_nft_equivalence_and_extra_rule_rejection(self):
@@ -277,7 +311,7 @@ run_checks() { echo UNEXPECTED; exit 9; }
     def test_unmanaged_diagnostics_do_not_report_security_failure(self):
         for stage, variable in ((2, "STATE_ROOT"), (3, "STATE_DIR")):
             with self.subTest(stage=stage):
-                text = (ROOT / f"stage{stage}.sh").read_text(encoding="utf-8")
+                text = (ROOT / STAGE_FILES[stage]).read_text(encoding="utf-8")
                 text = text.replace(f"{variable}=/var/lib/reinforce-my-ssh", f"{variable}={self.work}/absent")
                 # 所有受管路径也映射到临时目录，避免读取本机已有配置。
                 for name, path in (
@@ -299,7 +333,7 @@ run_checks() { echo UNEXPECTED; exit 9; }
                 result = subprocess.run(["bash", str(script)], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("未执行", result.stdout + result.stderr)
-                self.assertIn("audit.py", result.stdout + result.stderr)
+                self.assertIn("stage0-audit.sh", result.stdout + result.stderr)
                 self.assertEqual(before, sorted(self.work.iterdir()))
 
     def test_stage2_order_reload_firewall_and_boundary_after_checks(self):

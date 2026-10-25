@@ -277,7 +277,9 @@ class AuditTests(unittest.TestCase):
         result = subprocess.run(["bash", str(path), "--dry-run"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("audit.py", result.stdout)
-        self.assertNotIn("sudo bash", result.stdout)
+        for name in ("stage0-audit.sh", "stage1-newport.sh", "stage2-harden.sh", "stage3-reboot-check.sh"):
+            self.assertIn(name, result.stdout)
+        self.assertNotIn("stage3.sh --port", result.stdout)
         self.assertIn("不创建新版 state/policy", result.stdout)
 
 

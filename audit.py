@@ -712,7 +712,7 @@ class Auditor:
 
 
 def arguments(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, epilog="退出码：0=当前审计范围通过，1=明确不符合，2=证据/权限/支持范围不足。归属与重启记录另列。")
+    parser = argparse.ArgumentParser(prog="stage0-audit.sh", description=__doc__, epilog="退出码：0=当前审计范围通过，1=明确不符合，2=证据/权限/支持范围不足。归属与重启记录另列。")
     parser.add_argument("--port", type=int, required=True, help="目标 SSH 端口")
     parser.add_argument("--user", required=True, help="目标非 root 管理用户")
     parser.add_argument("--allow", action="append", required=True, help="预期来源 CIDR，可重复")
@@ -747,7 +747,7 @@ def main(argv=None):
     options, policy = arguments(argv)
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
         report = {"schema": 1, "read_only": True, "security_result": UNKNOWN,
-                  "checks": [asdict(Check("完整读取权限", UNKNOWN, "请以目标普通用户登录后 sudo python3 audit.py；不必开放 root SSH 登录"))]}
+                  "checks": [asdict(Check("完整读取权限", UNKNOWN, "请以目标普通用户登录后 sudo bash stage0-audit.sh；不必开放 root SSH 登录"))]}
     else:
         report = Auditor(policy).audit()
     if options.format == "json":

@@ -2,6 +2,8 @@
 
 测试脚本只提取待测函数，不执行三个阶段脚本的完整 apply。默认测试使用临时目录和命令替身。
 
+主脚本采用 stage1-newport.sh、stage2-harden.sh、stage3-reboot-check.sh，独立审计入口为 stage0-audit.sh。回归同时验证旧入口兼容、参数和退出码透传，以及改名后事务阶段标识仍然稳定。
+
 Linux / WSL 中运行：
 
 ```bash
