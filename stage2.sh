@@ -1,945 +1,905 @@
 #!/usr/bin/env bash
-# ═══════════════════════════════════════════════════════════════════════════
-#  stage2.sh —— 远程 SSH 加固 · 第二步：认证收口
-# ═══════════════════════════════════════════════════════════════════════════
-#
-#  【这一步做什么】
-#    把「谁能登录、用什么方式登录」收口：
-#      1) PermitRootLogin no        切断 root 直连，强制走普通账户 + sudo
-#      2) PasswordAuthentication no 只留公钥认证
-#      3) 关闭旧端口                 监听集合收窄到只剩新端口
-#    本步做完，SSH 的攻击面从「端口 × 账户 × 认证方式」三个维度同时收窄，
-#    且所有特权操作都会在 sudo 审计里留痕。
-#
-#  【什么时候能跑】
-#    当前处于 S1（通道已建）或 S2（本步已完成，幂等重跑）。
-#    处于 S0 时先跑 stage1.sh；处于 S3 时本脚本**拒绝执行**（会把固化成果倒退）。
-#
-#  【参数的含义】（脚本里的注释就是手册）
-#    --port <n>       必填。**保留**的 SSH 端口（即第一步建立的那个新端口）。
-#    --old-port <n>   可选，默认 22。本步要**关闭**的旧端口；none 表示没有要关的。
-#                     这个参数只影响「关哪些端口」，不影响认证策略。
-#    --user <name>    必填。日常管理用的非 root 账户（须已存在、在 sudo 组、有公钥）。
-#    --allow <cidr>   可选，可重复。白名单来源网段，用于重写 nft 规则。
-#                     不提供时会从现有的 nft 规则里**自动提取**并打印出来供你核对。
-#    --conf <file>    可选。从文件读默认值（每行 KEY=VALUE，# 开头为注释）。
-#    --apply          实际执行。**不加这个参数时脚本只读不改**（默认行为）。
-#    --yes            跳过交互确认（用于无人值守）。
-#    --rollback       按**本阶段**最近一次未回滚的备份还原（不碰别阶段的备份）。
-#
-#  【为什么有一道「活跃会话」闸门】
-#    关掉旧端口之后，如果新端口有问题，你就没有第二条路进来了。
-#    所以本脚本强制要求两件事同时成立，否则拒绝执行：
-#      ① 已有一条走**新端口**的活跃连接（TCP 层面确实通了）
-#      ② sshd 日志里能看到**本账户在本次开机内**被 Accepted（公钥真的验过了）
-#    只看 ① 不够 —— 一条连到端口却卡在认证前的 TCP 连接也算「活跃」，
-#    而且它可能走的是旧端口。只有服务端日志能证明「我的钥匙真的能开门」。
-#    这是整个方案里唯一一道「不满足就绝不往下走」的硬闸门。
-#
-#  【为什么换白名单之前先自检来源】
-#    改白名单最危险的形态是：新规则里没有你自己的来源，改完当场失联。
-#    所以重写 nft 规则之前，脚本先解析你**当前这条 SSH 会话**的客户端地址，
-#    逐个网段核对它是否被包含；不包含就拒绝执行。
-#
-#  【为什么验证要「自校准」】
-#    黑盒探针（本机回环发起连接，读服务端宣告的认证方式）必须先证明它
-#    在改动**之前**能看到 password —— 否则改动后「看不到 password」
-#    可能只是因为探针根本没工作。没有校准的通过，等于没验证。
-#
-#  【典型用法】
-#    ./stage2.sh --port 2222 --user deploy                                   # 只检查
-#    ./stage2.sh --port 2222 --user deploy --apply                           # 执行
-#    ./stage2.sh --rollback                                                  # 回滚
-#
-# ═══════════════════════════════════════════════════════════════════════════
-#  ⚠ 维护提示：下面的「共享框架」段（参数解析 / 输出 / 阶段探测 / 备份回滚）
-#    在 stage1.sh、stage2.sh、stage3.sh 中**各自完整存在一份**（刻意不拆 lib.sh）。
-#    改动其中一份时请同步另外两份。
-# ═══════════════════════════════════════════════════════════════════════════
-
+# stage2.sh — 收紧认证并关闭旧入口；全新外部公钥登录和 sudo 验证后才提交。
+# 支持 Ubuntu/Debian + systemd + ssh.socket。默认只读。
+# 用法见 --help；设计与限制见 plans/DESIGN.md。
 set -uo pipefail
 
-# ─────────────────────── 共享框架 · 1. 常量与输出 ───────────────────────
+SELF=${0##*/}
+SRC=$(cd "$(dirname "$0")" && pwd)
+STATE_ROOT=/var/lib/reinforce-my-ssh
+POLICY_FILE=$STATE_ROOT/policy.conf
+STATE_FILE=$STATE_ROOT/state.conf
+TX_ROOT=$STATE_ROOT/transactions
+LOCK_FILE=/run/lock/reinforce-my-ssh.lock
+SSHD_DROPIN=/etc/ssh/sshd_config.d/00-reinforce-my-ssh.conf
+NFT_RULES=/etc/nftables.d/reinforce-my-ssh.nft
+NFT_LOADER=/usr/local/sbin/reinforce-my-ssh-firewall
+FW_UNIT=/etc/systemd/system/reinforce-my-ssh-firewall.service
+FW_NAME=reinforce-my-ssh-firewall.service
+SOCKET_OVERRIDE=/etc/systemd/system/ssh.socket.d/00-reinforce-my-ssh.conf
+NFT_TABLE=sshguard
+MANAGED_FILES=("$SSHD_DROPIN" "$NFT_RULES" "$NFT_LOADER" "$FW_UNIT" "$SOCKET_OVERRIDE")
 
-SELF="$(basename "$0")"
-SRC="$(cd "$(dirname "$0")" && pwd)"
-BACKUP_ROOT="$SRC/backups"
-SSH_SOCKET_OVERRIDE=/etc/systemd/system/ssh.socket.d/override.conf
-SSHD_DROPIN=/etc/ssh/sshd_config.d/99-hardening.conf
-DROPIN_ROOT=/etc/ssh/sshd_config.d/10-permit-root-login.conf
-DROPIN_PASS=/etc/ssh/sshd_config.d/20-disable-password-auth.conf
-NFT_RULES=/etc/nftables.d/ssh-allowlist.nft
-FW_UNIT=/etc/systemd/system/ssh-firewall.service
-F2B_JAIL=/etc/fail2ban/jail.d/sshd.local
-NFT_TABLE="sshguard"
+PORT=""; OLD_PORT=22; USERNAME=""; CONF=""; RECOVERY_SECONDS=900; RESCUE_CONFIRMED=no
+ALLOWS=(); APPLY=0; CONFIRM=0; DO_ROLLBACK=0; ASSUME_YES=0; AUTO_RECOVERY=0; REQUEST_TX=""
+PORT_SET=0; OLD_PORT_SET=0; USER_SET=0; ALLOW_SET=0; RECOVERY_SET=0
+STATE_STAGE=unconfigured; STATE_TX=""; STATE_CONFIG_SHA=""; STATE_PENDING_BOOT=""; STATE_VERIFIED_BOOT=""
+TX_ID=""; TX_DIR=""; TX_STARTED=""; PARENT_STAGE=unconfigured; PARENT_TX=""
 
-if [[ -t 1 ]]; then
-  C_RST=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'
-  C_OK=$'\033[32m';  C_FAIL=$'\033[31m'; C_WARN=$'\033[33m'; C_ACT=$'\033[36m'
-else
-  C_RST=; C_B=; C_DIM=; C_OK=; C_FAIL=; C_WARN=; C_ACT=
-fi
-
-hdr()  { printf '\n%s══ %s ══%s\n'      "$C_B"   "$*" "$C_RST"; }
-sub()  { printf '\n%s── %s ──%s\n'      "$C_DIM" "$*" "$C_RST"; }
-ok()   { printf '   %s[ OK ]%s %s\n'    "$C_OK"   "$C_RST" "$*"; }
-fail() { printf '   %s[FAIL]%s %s\n'    "$C_FAIL" "$C_RST" "$*"; }
-warn() { printf '   %s[WARN]%s %s\n'    "$C_WARN" "$C_RST" "$*"; }
-skip() { printf '   %s[SKIP]%s %s\n'    "$C_DIM"  "$C_RST" "$*"; }
-act()  { printf '   %s[ →  ]%s %s\n'    "$C_ACT"  "$C_RST" "$*"; }
-note() { printf '          %s↳ %s%s\n'  "$C_DIM"  "$*" "$C_RST"; }
-inf()  { printf '          %s%s%s\n'    "$C_DIM"  "$*" "$C_RST"; }
-
-die() { printf '\n%sfatal:%s %s\n' "$C_FAIL" "$C_RST" "$*" >&2; exit 1; }
+log()  { printf '[%s] %s\n' "$1" "$2"; }
+ok()   { log OK "$1"; }
+warn() { log WARN "$1"; }
+fail() { log FAIL "$1" >&2; }
+die()  { fail "$1"; exit 1; }
 
 usage() {
   cat <<'USAGE'
-用法: stage2.sh --port <n> --user <name> [--old-port <n>] [--allow <cidr>...] [选项]
-
-必填:
-  --port <n>        保留的 SSH 端口（第一步建立的那个）
-  --user <name>     日常管理用的非 root 账户（须已存在、在 sudo 组、有公钥）
+用法:
+  stage2.sh [--conf <file>]                                     # 只读预检
+  stage2.sh --apply                                              # 收紧认证并关闭旧入口
+  stage2.sh --confirm                                            # 从全新外部会话中 sudo 执行
+  stage2.sh --rollback [--transaction <id>]                       # 回到 candidate-ready
 
 选项:
-  --old-port <n>    要关闭的旧端口，默认 22；none 表示没有要关的
-  --allow <cidr>    白名单来源网段，可重复；不提供则从现有 nft 规则自动提取
-  --conf <file>     从文件读默认值（KEY=VALUE 每行一个）
-  --apply           实际执行（不加则只检查，脚本只读不改）
-  --yes             跳过交互确认
-  --rollback        按本阶段最近一次未回滚的备份还原
-  -h, --help        显示本帮助
+  --port/--user/--old-port/--allow  只允许核对已存策略，不能在第二阶段改策略
+  --old-port <n|none>       第一阶段保留、这一阶段关闭的旧端口
+  --allow <cidr>            已存来源白名单，可重复核对
+  --conf <file>             严格 KEY=VALUE 配置文件
+  --recovery-seconds <n>    未确认前自动恢复时限，默认 900
+  --apply / --confirm       部署 / 外部验证后提交
+  --yes                     跳过交互；仍需 RESCUE_CONFIRMED=yes
+  --rollback                回滚当前阶段事务
+  --transaction <id>        精确指定事务（自动恢复内部使用）
+  -h, --help                显示帮助
 
-完整说明见本脚本头部注释。
+配置文件键: PORT, OLD_PORT, USER, ALLOW（可重复）, RECOVERY_SECONDS,
+            RESCUE_CONFIRMED=yes（表示已实际演练独立于 sshd 的救援通道）。
 USAGE
 }
 
-# ─────────────────────── 共享框架 · 2. 参数解析 ───────────────────────
-
-PORT=""; OLD_PORT="22"; USERNAME=""; CONF=""; ALLOWS=()
-APPLY=0; ASSUME_YES=0; DO_ROLLBACK=0
-# 「命令行是否显式给过这个键」。配置文件只补没给过的键 ——
-# 否则 `--old-port 22` 会被配置里的 OLD_PORT 悄悄覆盖，
-# 配置里的宽泛 ALLOW 也会追加进用户本想替换掉的白名单。
-PORT_SET=0; OLD_PORT_SET=0; USER_SET=0; ALLOW_SET=0
-
-# 选项缺值守卫：在**当前 shell**里退出。
-# 旧写法 `PORT="${2:-}"; shift 2` 在只写 `--port` 时 shift 失败、参数不变，
-# 循环永远退不出去（死循环）。这里遇到缺值立即报错。
-need_val() {  # need_val <选项名> <当前剩余参数个数>
-  (( $2 >= 2 )) && return 0
-  printf '参数 %s 缺少取值\n\n' "$1" >&2
-  usage >&2
-  exit 2
-}
-
-while [[ $# -gt 0 ]]; do
+need_val() { (($2 >= 2)) || { fail "$1 缺少取值"; usage >&2; exit 2; }; }
+while (($#)); do
   case "$1" in
-    --port)     need_val "$1" $#; PORT="$2";      PORT_SET=1;     shift 2 ;;
-    --old-port) need_val "$1" $#; OLD_PORT="$2";  OLD_PORT_SET=1; shift 2 ;;
-    --user)     need_val "$1" $#; USERNAME="$2";  USER_SET=1;     shift 2 ;;
-    --allow)    need_val "$1" $#; ALLOWS+=("$2"); ALLOW_SET=1;    shift 2 ;;
-    --conf)     need_val "$1" $#; CONF="$2";                      shift 2 ;;
-    --apply)    APPLY=1;      shift ;;
-    --yes)      ASSUME_YES=1; shift ;;
+    --port) need_val "$1" $#; PORT=$2; PORT_SET=1; shift 2 ;;
+    --old-port) need_val "$1" $#; OLD_PORT=$2; OLD_PORT_SET=1; shift 2 ;;
+    --user) need_val "$1" $#; USERNAME=$2; USER_SET=1; shift 2 ;;
+    --allow) need_val "$1" $#; ALLOWS+=("$2"); ALLOW_SET=1; shift 2 ;;
+    --conf) need_val "$1" $#; CONF=$2; shift 2 ;;
+    --recovery-seconds) need_val "$1" $#; RECOVERY_SECONDS=$2; RECOVERY_SET=1; shift 2 ;;
+    --apply) APPLY=1; shift ;;
+    --confirm) CONFIRM=1; shift ;;
     --rollback) DO_ROLLBACK=1; shift ;;
-    -h|--help)  usage; exit 0 ;;
-    *) printf '未知参数: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+    --transaction) need_val "$1" $#; REQUEST_TX=$2; shift 2 ;;
+    --auto-recovery) AUTO_RECOVERY=1; shift ;;
+    --yes) ASSUME_YES=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) fail "未知参数: $1"; usage >&2; exit 2 ;;
   esac
 done
+(( APPLY + CONFIRM + DO_ROLLBACK <= 1 )) || die "--apply、--confirm、--rollback 互斥"
+(( AUTO_RECOVERY == 0 || DO_ROLLBACK == 1 )) || die "--auto-recovery 只能与 --rollback 连用"
 
-# 配置文件补默认值（命令行 > 配置文件 > 报错）
-if [[ -n "$CONF" ]]; then
-  [[ -r "$CONF" ]] || die "配置文件不可读: $CONF"
-  while IFS='=' read -r k v; do
-    k="${k%%#*}"; k="$(printf '%s' "$k" | tr -d '[:space:]')"
-    v="$(printf '%s' "$v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    [[ -z "$k" || -z "$v" ]] && continue
-    case "$k" in
-      PORT)     (( PORT_SET ))     || PORT="$v" ;;
-      OLD_PORT) (( OLD_PORT_SET )) || OLD_PORT="$v" ;;
-      USER)     (( USER_SET ))     || USERNAME="$v" ;;
-      ALLOW)    (( ALLOW_SET ))    || ALLOWS+=("$v") ;;
+if [[ -n $CONF ]]; then
+  [[ -r $CONF ]] || die "配置文件不可读: $CONF"
+  [[ ! -s $CONF || -z $(tail -c 1 "$CONF") ]] || die "配置文件最后一行必须以 LF 结束"
+  declare -A CONF_SEEN=()
+  while IFS= read -r line; do
+    [[ $line =~ ^[[:space:]]*$ || $line =~ ^[[:space:]]*# ]] && continue
+    [[ $line =~ ^([A-Z_]+)=(.*)$ ]] || die "配置文件存在非法行: $line"
+    key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+    [[ $value != *$'\r'* ]] || die "配置文件含 CR，请转换为 LF"
+    case $key in
+      PORT|OLD_PORT|USER|RECOVERY_SECONDS|RESCUE_CONFIRMED)
+        [[ -z ${CONF_SEEN[$key]:-} ]] || die "配置键重复: $key"; CONF_SEEN[$key]=1 ;;
+      ALLOW) ;;
+      *) die "未知配置键: $key" ;;
+    esac
+    case $key in
+      PORT) ((PORT_SET)) || PORT=$value ;;
+      OLD_PORT) ((OLD_PORT_SET)) || OLD_PORT=$value ;;
+      USER) ((USER_SET)) || USERNAME=$value ;;
+      ALLOW) ((ALLOW_SET)) || ALLOWS+=("$value") ;;
+      RECOVERY_SECONDS) ((RECOVERY_SET)) || RECOVERY_SECONDS=$value ;;
+      RESCUE_CONFIRMED) RESCUE_CONFIRMED=$value ;;
     esac
   done < "$CONF"
 fi
 
-# 端口合法性：只接受十进制 1–65535。
-# 注意 10# 强制十进制：不写它的话 "08" 会让 Bash 按八进制解析并直接报错退出。
-is_port() {
-  [[ "$1" =~ ^[0-9]{1,5}$ ]] || return 1
-  local n=$((10#$1))
-  (( n >= 1 && n <= 65535 ))
+normalize_port() {
+  [[ $1 =~ ^[0-9]{1,5}$ ]] || return 1
+  local n=$((10#$1)); ((n >= 1 && n <= 65535)) || return 1
+  printf '%d' "$n"
 }
-
-require_params() {
-  local miss=0
-  [[ -z "$PORT" ]]     && { fail "--port 未提供"; miss=1; }
-  [[ -z "$USERNAME" ]] && { fail "--user 未提供"; miss=1; }
-  if [[ -n "$PORT" ]] && ! is_port "$PORT"; then
-    fail "--port 非法: $PORT（应为 1–65535 的端口号）"; miss=1
-  fi
-  if [[ "$OLD_PORT" != "none" ]] && ! is_port "$OLD_PORT"; then
-    fail "--old-port 非法: $OLD_PORT（应为 1–65535 的端口号，或 none）"; miss=1
-  fi
-  if [[ "$OLD_PORT" != "none" && "$OLD_PORT" == "$PORT" ]]; then
-    fail "--old-port 与 --port 相同（$PORT）"; miss=1
-  fi
-  if (( miss )); then
-    printf '\n'
-    die "参数不完整。用 -h 看用法，完整说明见脚本头部注释。"
-  fi
-}
-
-# ─────────────────────── 共享框架 · 3. 备份与回滚 ───────────────────────
-
-TS=""; MANIFEST=""
-STAGE_TAG="stage2"    # 备份目录带上阶段标签：两步共用 backups/，靠它区分归属
-
-backup_begin() {
-  TS="$(date +%Y%m%d-%H%M%S)"
-  MANIFEST="$BACKUP_ROOT/$STAGE_TAG-$TS"
-  if ! mkdir -p "$MANIFEST" 2>/dev/null; then
-    die "无法创建备份目录 $MANIFEST —— 备份失败必须中止，不能「没备成也接着改」"
-  fi
-  [[ -w "$MANIFEST" ]] || die "备份目录不可写 $MANIFEST —— 同上，中止"
-  : > "$MANIFEST/MANIFEST"
-  ok "备份目录 $MANIFEST"
-}
-
-backup_file() {
-  local f="$1" base
-  base="$(printf '%s' "$f" | tr '/' '_')"
-  if [[ -e "$f" ]]; then
-    cp -p "$f" "$MANIFEST/$base" 2>/dev/null || die "备份失败: $f —— 中止（不留半个改动）"
-    printf 'EXIST %s %s\n' "$f" "$base" >> "$MANIFEST/MANIFEST"
-    act "备份 $f"
-  else
-    printf 'ABSENT %s %s\n' "$f" "$base" >> "$MANIFEST/MANIFEST"
-    act "备份 $f（不存在，标记为「原本没有」）"
-  fi
-}
-
-newest_manifest_dir() {
-  local d
-  # 只认本阶段的备份：两步共用 backups/ 时，「取最新一个」可能取到另一阶段的，
-  # 回滚就会恢复到错误的状态。已回滚过的目录（ROLLED_BACK 标记）跳过，
-  # 避免同一次改动被重复回滚。
-  while IFS= read -r d; do
-    [[ -n "$d" ]] || continue
-    [[ -f "$d/ROLLED_BACK" ]] && { skip "跳过已回滚的备份: ${d%/}"; continue; }
-    printf '%s' "${d%/}"
-    return 0
-  done < <(ls -1dt "$BACKUP_ROOT/$STAGE_TAG"-*/ 2>/dev/null)
-  return 1
-}
-
-do_rollback() {
-  local d="$1" kind orig base nb=""
-  [[ -f "$d/MANIFEST" ]] || die "备份目录里没有 MANIFEST: $d"
-  hdr "回滚 · 依据 $d/MANIFEST"
-  while read -r kind orig base; do
-    [[ -z "${orig:-}" ]] && continue
-    if [[ "$kind" == "EXIST" ]]; then
-      cp -f "$d/$base" "$orig" 2>/dev/null && act "还原 $orig" || fail "还原失败 $orig"
-    else
-      if [[ -e "$orig" ]]; then rm -f "$orig" && act "删除 $orig（原本不存在）"; else skip "$orig 本就不存在"; fi
-    fi
-  done < "$d/MANIFEST"
-
-  # nft 表是内核态，不在 MANIFEST 里，只能从备份的规则文件恢复。
-  # 备份名由路径 tr '/' '_' 得来 —— 首字符也是 '_'，此前这里少写了下划线，
-  # 于是永远匹配不到备份（`ls` 报错被 2>/dev/null 吞掉，旧端口恢复后
-  # 内核规则仍只保护新端口）。
-  # 另外 `nft -f` 是「加载」不是「替换」：必须先删旧表，否则新旧规则并存。
-  nb="$d/$(printf '%s' "$NFT_RULES" | tr '/' '_')"
-  [[ -f "$nb" ]] || nb=""
-  if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
-    nft delete table inet "$NFT_TABLE" 2>/dev/null || true
-  fi
-  if [[ -n "$nb" ]] && nft -f "$nb" 2>/dev/null; then
-    act "已按备份恢复 nft 规则: $nb"
-  elif [[ -n "$nb" ]]; then
-    fail "nft 备份重载失败: $nb"
-  else
-    act "nft 表已删除（备份里没有规则文件）"
-  fi
-
-  systemctl daemon-reload 2>/dev/null || true
-  systemctl restart ssh.socket 2>/dev/null || true
-  if command -v fail2ban-client >/dev/null 2>&1; then
-    fail2ban-client reload >/dev/null 2>&1 || true
-  fi
-
-  : > "$d/ROLLED_BACK" 2>/dev/null || true
-  printf '\n'
-  ok "回滚完成"
-  inf "当前监听："
-  ss -tlnH 2>/dev/null | awk '{print $4}' | grep -E ':[0-9]+$' | sort -u | sed 's/^/        /'
-}
-
-# ─────────────────────── 共享框架 · 4. 状态探测 ───────────────────────
-
-# 权限闸门：必须在使用 detect_stage 之前调用。
-#
-# 为什么需要它：detect_stage 依赖 `nft list` 与 `sshd -T`，这两个命令**都需要 root**。
-# 非 root 执行时它们返回的是权限错误（nft: "Operation not permitted"、
-# sshd: "no hostkeys available"），而脚本会把「读不到」误判成「不存在」——
-# 于是一台已加固的机器被报成 S0「未加固」，还会拒绝执行。
-#
-# 低权限输出 ≠ 事实。宁可明确拒绝，也不要给出一个错误的状态判断。
-require_root() {
-  [[ $EUID -eq 0 ]] && return 0
-  fail "需要在 root 下运行：脚本内部直接调用 nft / sshd / systemctl，不会自己 sudo"
-  note "非 root 时这两个命令返回的是权限错误，不是真实状态 ——"
-  note "  nft  → Operation not permitted (you must be root)"
-  note "  sshd → no hostkeys available -- exiting."
-  note "把「读不到」当成「没有」，会把已加固的机器误报成「未加固」"
-  die "请用 sudo 运行，例如： sudo bash $0 ..."
-}
-
-# 读 sshd 的「生效值」—— 带连接上下文。
-# 不带 -C 的 `sshd -T` 只给出默认上下文；主配置里后来若出现
-# `Match Address <远程网段>` / `Match User` 之类的分支，password / root 的放行
-# 会藏在那里，而普通的 `sshd -T` 看不到。这里用真实来源 IP 构造上下文去读。
-# 取不到时退回不带 -C 的读法。
-sshd_eff() {  # sshd_eff <key> <user> [addr]
-  local key="$1" u="$2" addr="${3:-0.0.0.0}" v=""
-  v="$(sshd -T -C "user=$u,host=localhost,addr=$addr" 2>/dev/null \
-       | awk -v k="$key" '$1==k{print $2; exit}')" || true
-  if [[ -z "$v" ]]; then
-    v="$(sshd -T 2>/dev/null | awk -v k="$key" '$1==k{print $2; exit}')" || true
-  fi
-  printf '%s' "$v"
-}
-
-detect_stage() {
-  local fw_ok=0 nft_ok=0 auth_ok=0 legacy=0 ip
-  systemctl is-active --quiet ssh-firewall.service 2>/dev/null && fw_ok=1
-  nft list table inet "$NFT_TABLE" >/dev/null 2>&1 && nft_ok=1
-  ip="$(find_ssh_client 2>/dev/null || true)"; [[ -n "$ip" ]] || ip="0.0.0.0"
-  if [[ "$(sshd_eff permitrootlogin root "$ip")" == "no" ]] \
-     && [[ "$(sshd_eff passwordauthentication "${USERNAME:-root}" "$ip")" == "no" ]]; then auth_ok=1; fi
-  # 旧端口不能写死 22：自定义旧端口仍开放时会误判 S2；
-  # 新端口恰好是 22 时又会永远判成 S1（见 --old-port 的语义）。
-  if [[ -n "${OLD_PORT:-}" && "$OLD_PORT" != "none" && "$OLD_PORT" != "${PORT:-}" ]]; then
-    port_listening "$OLD_PORT" && legacy=1
-  fi
-
-  if (( !fw_ok || !nft_ok )); then printf 'S0'; return; fi
-  if (( !auth_ok || legacy ));    then printf 'S1'; return; fi
-  if [[ -f "$SRC/.stage3-verified" ]] \
-     && [[ "$(cat "$SRC/.stage3-verified" 2>/dev/null)" == "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]]; then
-    printf 'S3'; return
-  fi
-  printf 'S2'
-}
-
-port_listening() { ss -tlnH 2>/dev/null | grep -qE "[:.]$1\b"; }
-
-find_ssh_client() {
-  local v p
-  if [[ -n "${SSH_CLIENT:-}" ]]; then printf '%s' "${SSH_CLIENT%% *}"; return 0; fi
-  p=$PPID
-  while [[ "$p" -gt 1 ]]; do
-    if [[ -r "/proc/$p/environ" ]]; then
-      v="$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | sed -n 's/^SSH_CLIENT=//p' | head -1)"
-      if [[ -n "$v" ]]; then printf '%s' "${v%% *}"; return 0; fi
-    fi
-    p="$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)" || return 1
-    [[ -z "$p" || "$p" -le 1 ]] && return 1
+normalize_params() {
+  PORT=$(normalize_port "$PORT") || die "非法 --port: $PORT"
+  if [[ $OLD_PORT != none ]]; then OLD_PORT=$(normalize_port "$OLD_PORT") || die "非法 --old-port"; fi
+  [[ $OLD_PORT == none || $OLD_PORT != "$PORT" ]] || die "新旧端口数值相同"
+  [[ $USERNAME =~ ^[a-z_][a-z0-9_-]*\$?$ ]] || die "非法账户名"
+  [[ $USERNAME != root ]] || die "--user 必须是非 root 账户"
+  id "$USERNAME" >/dev/null 2>&1 || die "账户不存在: $USERNAME"
+  [[ $(id -u "$USERNAME") != 0 ]] || die "禁止使用 UID 0 管理账户"
+  [[ $RECOVERY_SECONDS =~ ^[0-9]+$ ]] && ((10#$RECOVERY_SECONDS >= 60 && 10#$RECOVERY_SECONDS <= 86400)) \
+    || die "RECOVERY_SECONDS 应为 60–86400"
+  [[ $RESCUE_CONFIRMED == yes || $RESCUE_CONFIRMED == no ]] || die "RESCUE_CONFIRMED 只能是 yes/no"
+  ((${#ALLOWS[@]} > 0)) || die "至少提供一个 --allow"
+  local a n; local normalized=()
+  for a in "${ALLOWS[@]}"; do
+    n=$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=True))' "$a" 2>/dev/null) \
+      || die "非法或带主机位的 CIDR: $a"
+    normalized+=("$n")
   done
-  return 1
+  mapfile -t ALLOWS < <(printf '%s\n' "${normalized[@]}" | sort -u)
 }
-
-# 当前会话来源；取不到时返回一个可行的默认上下文地址
-client_addr() { find_ssh_client 2>/dev/null || printf '0.0.0.0'; }
-
-# 本次开机内，sshd 是否真的接受过该账户的公钥登录。
-# 「公钥能解析」只说明文件里有串可解析的文本；sshd 是否接受还要看
-# 属主/权限/Match 策略。服务端日志里的 `Accepted ... for <user>` 是唯一
-# 从行为层面取到的证据 —— 关掉密码认证前，这条证据必须存在。
-key_login_evidence() {
-  local logs=""
-  if command -v journalctl >/dev/null 2>&1; then
-    logs="$(journalctl -b -u ssh -u sshd --no-pager 2>/dev/null)"
+load_state() {
+  local f k v seen_stage=0 seen_tx=0 seen_sha=0
+  if [[ ! -e $STATE_FILE ]]; then
+    for f in "${MANAGED_FILES[@]}"; do
+      [[ ! -e $f ]] || die "发现受管配置但状态文件缺失，拒绝继续: $f"
+    done
+    return 0
   fi
-  if [[ -z "$logs" && -r /var/log/auth.log ]]; then
-    logs="$(cat /var/log/auth.log 2>/dev/null)"
+  [[ -r $STATE_FILE ]] || die "状态文件存在但不可读: $STATE_FILE"
+  while IFS='=' read -r k v; do
+    case $k in
+      STAGE) STATE_STAGE=$v; seen_stage=1 ;;
+      TX) STATE_TX=$v; seen_tx=1 ;;
+      CONFIG_SHA) STATE_CONFIG_SHA=$v; seen_sha=1 ;;
+      PENDING_BOOT) STATE_PENDING_BOOT=$v ;; VERIFIED_BOOT) STATE_VERIFIED_BOOT=$v ;;
+    esac
+  done < "$STATE_FILE"
+  ((seen_stage && seen_tx && seen_sha)) || die "状态文件缺少 STAGE/TX/CONFIG_SHA，拒绝继续"
+  case $STATE_STAGE in unconfigured|candidate-pending|candidate-ready|hardening-pending|hardened|reboot-pending|verified) ;; *) die "未知阶段状态: $STATE_STAGE" ;; esac
+  if [[ $STATE_STAGE == unconfigured ]]; then
+    [[ -z $STATE_TX && -z $STATE_CONFIG_SHA ]] || die "unconfigured 状态包含事务或摘要，拒绝继续"
+    for f in "${MANAGED_FILES[@]}"; do [[ ! -e $f ]] || die "unconfigured 与受管文件矛盾: $f"; done
+  else
+    [[ -n $STATE_TX ]] || die "非 unconfigured 状态缺少当前事务"
+    [[ $STATE_STAGE == candidate-pending || $STATE_STAGE == hardening-pending || $STATE_CONFIG_SHA =~ ^[0-9a-f]{64}$ ]] \
+      || die "已提交状态缺少有效配置摘要"
   fi
-  # 只认 `Accepted publickey`。
-  # 不能把 `keyboard-interactive/pam` 也算进来 —— 那个方法可能就是密码经 PAM
-  # 通过的记录，拿它当「公钥已验证」的证据，等于在关密码之前自欺。
-  printf '%s\n' "$logs" \
-    | grep -E "Accepted publickey for ${USERNAME} from " | tail -1
 }
-
-ip_in_cidrs() {
-  local ip="$1"; shift
-  python3 - "$ip" "$@" <<'PY' 2>/dev/null
-import ipaddress, sys
+load_policy() {
+  [[ $STATE_STAGE != unconfigured ]] || return 0
+  [[ -r $POLICY_FILE ]] || die "已有阶段状态但策略文件不可读: $POLICY_FILE"
+  local k v; local saved=("${ALLOWS[@]}"); local policy_allows=()
+  while IFS='=' read -r k v; do
+    case $k in
+      PORT) ((PORT_SET)) && [[ $PORT != "$v" ]] && die "PORT 与已存策略冲突"; PORT=$v ;;
+      OLD_PORT) ((OLD_PORT_SET)) && [[ $OLD_PORT != "$v" ]] && die "OLD_PORT 与已存策略冲突"; OLD_PORT=$v ;;
+      USER) ((USER_SET)) && [[ $USERNAME != "$v" ]] && die "USER 与已存策略冲突"; USERNAME=$v ;;
+      ALLOW) policy_allows+=("$v") ;;
+      RECOVERY_SECONDS) ((RECOVERY_SET)) && [[ $RECOVERY_SECONDS != "$v" ]] && die "RECOVERY_SECONDS 与已存策略冲突"; RECOVERY_SECONDS=$v ;;
+      RESCUE_CONFIRMED) RESCUE_CONFIRMED=$v ;;
+    esac
+  done < "$POLICY_FILE"
+  if ((ALLOW_SET)); then
+    local saved_normal policy_normal
+    saved_normal=$(python3 -c 'import ipaddress,sys; print("\n".join(sorted({str(ipaddress.ip_network(x,strict=True)) for x in sys.argv[1:]})))' "${saved[@]}") || die "ALLOW 非法"
+    policy_normal=$(python3 -c 'import ipaddress,sys; print("\n".join(sorted({str(ipaddress.ip_network(x,strict=True)) for x in sys.argv[1:]})))' "${policy_allows[@]}") || die "已存 ALLOW 非法"
+    [[ $saved_normal == "$policy_normal" ]] || die "ALLOW 与已存策略冲突；如需改策略请先回滚 stage1"
+  else
+    ALLOWS=("${policy_allows[@]}")
+  fi
+}
+require_root() { ((EUID == 0)) || die "请通过 sudo 运行"; }
+ensure_state_root() {
+  mkdir -p "$STATE_ROOT" && mkdir -p "$TX_ROOT" || die "无法创建 $STATE_ROOT"
+  chmod 0700 "$STATE_ROOT" "$TX_ROOT" || die "无法保护状态目录"
+}
+lock_all() { exec 9>"$LOCK_FILE" || die "无法打开锁"; flock -x 9 || die "无法取得事务锁"; }
+write_policy() {
+  local t; t=$(mktemp "$STATE_ROOT/.policy.XXXXXX") || return 1
+  { printf 'PORT=%s\nOLD_PORT=%s\nUSER=%s\nRECOVERY_SECONDS=%s\nRESCUE_CONFIRMED=%s\n' \
+      "$PORT" "$OLD_PORT" "$USERNAME" "$RECOVERY_SECONDS" "$RESCUE_CONFIRMED"
+    printf 'ALLOW=%s\n' "${ALLOWS[@]}"
+  } > "$t" || { rm -f "$t"; return 1; }
+  chmod 0600 "$t" && mv -f "$t" "$POLICY_FILE"
+}
+write_state() {
+  local stage=$1 tx=$2 config_sha=${3-$STATE_CONFIG_SHA}; local t
+  t=$(mktemp "$STATE_ROOT/.state.XXXXXX") || return 1
+  printf 'STAGE=%s\nTX=%s\nCONFIG_SHA=%s\nPENDING_BOOT=%s\nVERIFIED_BOOT=%s\n' \
+    "$stage" "$tx" "$config_sha" "$STATE_PENDING_BOOT" "$STATE_VERIFIED_BOOT" > "$t" \
+    || { rm -f "$t"; return 1; }
+  chmod 0600 "$t" && mv -f "$t" "$STATE_FILE" || { rm -f "$t"; return 1; }
+  STATE_STAGE=$stage; STATE_TX=$tx; STATE_CONFIG_SHA=$config_sha
+}
+config_digest() {
+  { printf 'POLICY\n'; cat "$POLICY_FILE" 2>/dev/null || return 1
+    local f; for f in "${MANAGED_FILES[@]}"; do
+      if [[ -f $f ]]; then printf 'FILE %s\n' "$f"; cat "$f" || return 1; else printf 'ABSENT %s\n' "$f"; fi
+    done
+  } | sha256sum | awk '{print $1}'
+}
+all_ports() {
+  if [[ ${TARGET_STAGE:-hardened} == candidate && $OLD_PORT != none ]]; then printf '%s\n%s\n' "$OLD_PORT" "$PORT"
+  else printf '%s\n' "$PORT"; fi
+}
+port_set() { local p out=""; while IFS= read -r p; do out+="${out:+, }$p"; done < <(all_ports | sort -n -u); printf '{ %s }' "$out"; }
+ip_in_cidrs() { python3 - "$@" <<'PY'
+import ipaddress,sys
 try:
-    a = ipaddress.ip_address(sys.argv[1])
-except ValueError:
-    sys.exit(2)
-for c in sys.argv[2:]:
-    try:
-        if a in ipaddress.ip_network(c, strict=False):
-            sys.exit(0)
-    except ValueError:
-        pass
-sys.exit(1)
+ a=ipaddress.ip_address(sys.argv[1]); nets=[ipaddress.ip_network(x) for x in sys.argv[2:]]
+except ValueError: sys.exit(2)
+sys.exit(0 if any(a in n for n in nets) else 1)
 PY
 }
-
-# 从现有 nft 规则文件里提取白名单网段（用于 --allow 未提供时）
-extract_allows() {
-  grep -oE 'saddr[[:space:]]+[0-9a-fA-F:.]+(/[0-9]+)?' "$NFT_RULES" 2>/dev/null \
-    | awk '{print $2}' | grep -vE '^(127\.0\.0\.1|::1)$' | sort -u
+ip_is_local() {
+  ip -j address show 2>/dev/null | python3 -c '
+import ipaddress,json,sys
+target=ipaddress.ip_address(sys.argv[1])
+try: data=json.load(sys.stdin)
+except Exception: sys.exit(2)
+for link in data:
+ for item in link.get("addr_info",[]):
+  try:
+   if ipaddress.ip_address(item["local"])==target: sys.exit(0)
+  except (KeyError,ValueError): pass
+sys.exit(1)' "$1"
 }
 
-# 黑盒探针：从本机回环发一次真实连接，读服务端宣告的认证方式。
-# 两个坑，缺一不可：
-#   1) 'Authentications that can continue' 是 debug1 级消息，必须 -v（LogLevel=DEBUG）
-#      才输出；LogLevel=VERBOSE 级别不够，那一行根本取不到。
-#   2) ssh 客户端在非 tty 下输出的行尾会多带一个回车符（CR），会被一并取到。
-#      所以下面用字符类 [a-z,]* 而不是 .*，借字符类把 CR 挡在匹配之外。
-probe_line() {
-  local u="$1"
-  ssh -v -p "$PORT" -o PreferredAuthentications=password -o PubkeyAuthentication=no -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 "$u@127.0.0.1" true 2>&1 | grep -oE 'Authentications that can continue: [a-z,]*' | head -1
+find_ssh_connection() {
+  local p v
+  if [[ -n ${SSH_CONNECTION:-} ]]; then printf '%s\n' "$SSH_CONNECTION"; return 0; fi
+  p=$PPID
+  while [[ $p =~ ^[0-9]+$ ]] && ((p > 1)); do
+    if [[ -r /proc/$p/environ ]]; then
+      v=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | sed -n 's/^SSH_CONNECTION=//p' | head -1)
+      [[ -z $v ]] || { printf '%s\n' "$v"; return 0; }
+    fi
+    p=$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null) || return 1
+  done
+  return 1
+}
+require_source_allowed() {
+  local conn c cp s sp
+  conn=$(find_ssh_connection) || { fail "无法确定当前 SSH_CONNECTION；远程 apply 已拒绝"; return 1; }
+  read -r c cp s sp extra <<< "$conn"
+  [[ -n ${sp:-} && -z ${extra:-} ]] || { fail "SSH_CONNECTION 格式异常"; return 1; }
+  ip_in_cidrs "$c" "${ALLOWS[@]}" || { fail "当前来源 $c 不在白名单内"; return 1; }
+  ok "当前来源 $c 在白名单内"
+}
+record_confirmation_boundary() {
+  local raw tmp
+  raw=$(mktemp "$TX_DIR/.journal.XXXXXX") || return 1
+  tmp=$(mktemp "$TX_DIR/.confirmation.XXXXXX") || { rm -f "$raw"; return 1; }
+  journalctl -b -n 1 --no-pager -o json > "$raw" \
+    && python3 - "$raw" "$tmp" <<'PY'
+import json,sys
+events=[json.loads(x) for x in open(sys.argv[1]) if x.strip()]
+if not events or not events[-1].get('__CURSOR'): raise SystemExit('缺少 journal cursor')
+boot=open('/proc/sys/kernel/random/boot_id').read().strip().replace('-','')
+if events[-1].get('_BOOT_ID')!=boot: raise SystemExit('journal boot 不匹配')
+json.dump({'cursor':events[-1]['__CURSOR'],'boot':boot},open(sys.argv[2],'w'))
+PY
+  local rc=$?
+  rm -f "$raw"
+  if ((rc == 0)); then chmod 0600 "$tmp" && mv -f "$tmp" "$TX_DIR/confirmation.json" || rc=1; fi
+  rm -f "$tmp"
+  return "$rc"
+}
+session_evidence() {
+  local boundary=$1 conn c cp s sp uid extra d rc=0
+  [[ ${SUDO_USER:-} == "$USERNAME" ]] || { fail "必须由 $USERNAME 通过 sudo 执行"; return 1; }
+  uid=$(id -u "$USERNAME") || return 1
+  [[ ${SUDO_UID:-} == "$uid" ]] || { fail "SUDO_UID 与目标账户不匹配"; return 1; }
+  conn=$(find_ssh_connection) || { fail "找不到当前外部 SSH 会话四元组"; return 1; }
+  read -r c cp s sp extra <<< "$conn"
+  [[ -n ${sp:-} && -z ${extra:-} && $sp == "$PORT" && $cp =~ ^[0-9]+$ ]] \
+    || { fail "当前会话不是新端口 $PORT 的有效连接"; return 1; }
+  python3 -c 'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); sys.exit(1 if a.is_loopback else 0)' "$c" \
+    || { fail "回环连接不能作为外部登录证据"; return 1; }
+  local local_rc; ip_is_local "$c"; local_rc=$?
+  ((local_rc == 1)) || { fail "来源为本机或无法核实来源地址"; return 1; }
+  ip_in_cidrs "$c" "${ALLOWS[@]}" || { fail "会话来源 $c 不在白名单内"; return 1; }
+  [[ -f $boundary ]] || { fail "确认事件边界缺失；请回滚后重新部署"; return 1; }
+  d=$(mktemp -d) || return 1
+  local cursor
+  cursor=$(python3 - "$boundary" <<'PY'
+import json,sys
+b=json.load(open(sys.argv[1])); boot=open('/proc/sys/kernel/random/boot_id').read().strip().replace('-','')
+if b.get('boot')!=boot or not isinstance(b.get('cursor'),str) or not b['cursor']: raise SystemExit(1)
+print(b['cursor'])
+PY
+  ) || { rm -rf "$d"; fail "确认边界不属于本次启动"; return 1; }
+  ss -tnpH state established "( sport = :$PORT )" > "$d/ss" 2>/dev/null \
+    && journalctl -b -u ssh -u sshd -u 'ssh@*' --after-cursor "$cursor" --no-pager -o json > "$d/journal" 2>/dev/null \
+    && python3 - "$d" "$USERNAME" "$c" "$cp" "$s" "$sp" "$$" <<'PY'
+import ipaddress,json,re,sys
+root,u,c,cp,s,sp,pid=sys.argv[1:]
+def split(endpoint):
+ host,port=endpoint.rsplit(':',1)
+ return ipaddress.ip_address(host.strip('[]')),int(port)
+ancestors=set()
+while pid.isdigit() and int(pid)>1 and pid not in ancestors:
+ ancestors.add(pid)
+ try:
+  status=open('/proc/'+pid+'/status').read()
+  pid=re.search(r'^PPid:\s+(\d+)',status,re.M).group(1)
+ except (OSError,AttributeError): break
+live=set()
+for line in open(root+'/ss'):
+ fields=line.split()
+ if len(fields)<5: continue
+ try:
+  if split(fields[2])!=(ipaddress.ip_address(s),int(sp)) or split(fields[3])!=(ipaddress.ip_address(c),int(cp)): continue
+ except ValueError: continue
+ live.update(re.findall(r'"sshd(?:-session|-auth)?",pid=(\d+)',line))
+if not live.intersection(ancestors): raise SystemExit('连接不属于当前 sudo 会话的 sshd 进程链')
+boot=open('/proc/sys/kernel/random/boot_id').read().strip().replace('-','')
+pat=re.compile(r'^Accepted publickey for (\S+) from (\S+) port ([0-9]+)(?:\s|$)')
+matched=False
+for line in open(root+'/journal'):
+ event=json.loads(line)
+ if event.get('_BOOT_ID')!=boot or str(event.get('_PID','')) not in ancestors: continue
+ message=event.get('MESSAGE','')
+ if not isinstance(message,str): continue
+ match=pat.search(message)
+ if match and match[1]==u and match[3]==cp:
+  try: matched |= ipaddress.ip_address(match[2])==ipaddress.ip_address(c)
+  except ValueError: pass
+if not matched: raise SystemExit('缺少边界之后、属于当前 sshd 进程链的公钥日志')
+PY
+  rc=$?
+  rm -rf "$d"
+  ((rc == 0)) || { fail "当前连接、公钥日志与 sudo 进程链关联失败"; return 1; }
+  ok "已证明目标用户经新端口公钥登录、会话仍存活，并完成真实 sudo"
 }
 
-# ─────────────────────────────────────────────────────────────────────────
-#                              第二步：认证收口
-# ─────────────────────────────────────────────────────────────────────────
-
-CHECK_FAILED=0
-CHECKS=()
-
-rec()    { CHECKS+=("$1|$2|${3:-}"); }
-c_ok()   { ok "$1";   rec "OK"   "$1"; }
-c_fail() { fail "$1"; CHECK_FAILED=$((CHECK_FAILED+1)); rec "FAIL" "$1" "${2:-}"; }
-c_warn() { warn "$1"; rec "WARN" "$1" "${2:-}"; }
-
-run_checks() {
-  sub "前置检查（只读，不做任何修改）"
-
-  # 1. 权限
-  if [[ $EUID -eq 0 ]]; then
-    c_ok "以 root 运行"
-  else
-    c_fail "不是以 root 运行" "脚本内部直接调 nft/sshd/systemctl，不会自己 sudo；请用 sudo 运行"
-  fi
-
-  # 2. 硬闸门
-  #    只看 TCP established 不够：未认证的连接（扫描器、nc）也是 established。
-  #    只看 pts 数量也不够：那可能是走旧端口的会话。
-  #    真正要证明的是「$USERNAME 用公钥、经新端口、被 sshd 接受过」——
-  #    前两项只是必要条件，日志里的 Accepted 记录才是证据。
-  local alive cred pts
-  alive="$(ss -tnH state established '( sport = :'"$PORT"' )' 2>/dev/null | wc -l)"
-  if (( alive > 0 )); then
-    c_ok "端口 $PORT 上有 $alive 条活跃连接"
-  else
-    c_fail "端口 $PORT 上没有任何活跃连接" \
-           "关掉旧端口后若出问题就没有回头路。请先另开终端：ssh -p $PORT $USERNAME@<地址>，保持该会话不断，再重跑"
-  fi
-  if cred="$(key_login_evidence)"; then
-    c_ok "本次开机有 $USERNAME 的公钥登录成功记录（密钥确实被 sshd 接受过）"
-    inf "  $cred"
-  else
-    c_fail "本次开机找不到 $USERNAME 的公钥登录成功记录" \
-           "公钥可解析 ≠ sshd 会接受（属主/权限/Match 都可能拒绝）。请先用新端口以该账户登录一次，再跑本步"
-  fi
-  pts="$(who 2>/dev/null | awk -v u="$USERNAME" '$1==u && $2 ~ /^pts/ {c++} END{print c+0}')"
-  (( pts > 0 )) && inf "另有 $pts 个 $USERNAME 的交互式会话（仅供参考 —— 无法区分它们走的是新端口还是旧端口）"
-
-  # 3. 管理账户
-  if id "$USERNAME" >/dev/null 2>&1; then
-    if id -nG "$USERNAME" 2>/dev/null | tr ' ' '\n' | grep -qx sudo; then
-      c_ok "账户 $USERNAME 存在且在 sudo 组"
-    else
-      c_fail "账户 $USERNAME 不在 sudo 组" "本脚本只检查不代建"
-    fi
-  else
-    c_fail "账户 $USERNAME 不存在" "本脚本只检查不代建"
-  fi
-
-  local home k
-  home="$(getent passwd "$USERNAME" 2>/dev/null | cut -d: -f6)"
-  if [[ -n "$home" && -r "$home/.ssh/authorized_keys" ]]; then
-    k="$(ssh-keygen -lf "$home/.ssh/authorized_keys" 2>/dev/null | wc -l)"
-    if (( k > 0 )); then
-      c_ok "账户 $USERNAME 有 $k 条可解析公钥"
-    else
-      c_fail "账户 $USERNAME 没有可解析的公钥" "关掉密码后就没有登录手段了。本脚本只检查不代建"
-    fi
-  else
-    c_fail "读不到 $USERNAME 的 authorized_keys" "本脚本只检查不代建"
-  fi
-
-  # 4. 公钥认证必须可用（否则关密码 = 自锁）
-  local pub kbd addr
-  addr="$(client_addr)"
-  pub="$(sshd_eff pubkeyauthentication "$USERNAME" "$addr")"
-  if [[ "$pub" == "yes" ]]; then
-    c_ok "PubkeyAuthentication=yes（关掉密码后仍能进来）"
-  else
-    c_fail "PubkeyAuthentication=${pub:-读不到} —— 关掉密码会自锁" "先把它改回 yes"
-  fi
-
-  # 5. KbdInteractive 必须关 —— 否则密码可经 PAM 绕过后面的改动
-  kbd="$(sshd_eff kbdinteractiveauthentication "$USERNAME" "$addr")"
-  if [[ "$kbd" == "no" ]]; then
-    c_ok "KbdInteractiveAuthentication=no（无 PAM 密码旁路）"
-  else
-    c_fail "KbdInteractiveAuthentication=${kbd:-读不到} —— 密码仍可经 PAM 登录，本步改动会无效" \
-           "先把它设为 no（这是 PasswordAuthentication no 能否真正生效的前提）"
-  fi
-
-  # 6. 云厂商兜底通道
-  if grep -q 'AuthorizedKeysCommand.*instance_connect\|AuthorizedKeysCommand.*ecs_config' /etc/ssh/sshd_config 2>/dev/null; then
-    c_ok "云厂商控制台通道在位（AuthorizedKeysCommand 已配置）"
-  else
-    c_warn "未发现云厂商控制台通道" "请确认 VNC / 控制台救援可用，且其登录名不是 root"
-  fi
-
-  # 7. 备份可写 —— 只读模式不能有副作用：目录不存在时只测父目录，不创建它
-  if [[ -d "$BACKUP_ROOT" ]]; then
-    if [[ -w "$BACKUP_ROOT" ]]; then
-      c_ok "备份目录可写: $BACKUP_ROOT"
-    else
-      c_fail "备份目录不可写: $BACKUP_ROOT" "备份失败必须中止"
-    fi
-  elif [[ -w "$SRC" ]]; then
-    c_ok "备份目录尚不存在，$SRC 可写 —— --apply 时会创建"
-  else
-    c_fail "无法创建备份目录（$SRC 不可写）: $BACKUP_ROOT" "备份失败必须中止"
-  fi
-
-  # 8. 语法
-  if sshd -t 2>/dev/null; then
-    c_ok "当前 sshd 配置语法正确"
-  else
-    c_fail "当前 sshd 配置语法有错" "先修好现有配置"
-  fi
-
-  # 9. 白名单网段可得
-  if (( ${#ALLOWS[@]} == 0 )); then
-    mapfile -t ALLOWS < <(extract_allows)
-    if (( ${#ALLOWS[@]} > 0 )); then
-      c_ok "从现有 nft 规则提取到 ${#ALLOWS[@]} 个网段（未提供 --allow）"
-      inf "提取结果：${ALLOWS[*]}"
-    else
-      c_fail "没有白名单网段，也无法从现有规则提取" "请显式提供 --allow"
-    fi
-  else
-    c_ok "白名单网段由命令行提供：${#ALLOWS[@]} 个"
-  fi
-
-  # 9b. 来源自检 —— 本步可能替换白名单。
-  #      若当前会话来源不在新白名单内，现有连接只靠 established 规则暂时活着，
-  #      一旦断开就再也连不上。（这两个函数此前定义了却从未被调用。）
-  local src_ip
-  if src_ip="$(find_ssh_client)"; then
-    if ip_in_cidrs "$src_ip" "${ALLOWS[@]}"; then
-      c_ok "当前会话来源 $src_ip 在新白名单内"
-    else
-      c_fail "当前会话来源 $src_ip 不在新白名单内" \
-             "现有连接靠 established 暂时保留，断开即失联：请把该来源加入 --allow"
-    fi
-  else
-    c_warn "无法确定会话来源（非 SSH 登录，或 sudo 清空了环境）" \
-           "无法预检「改完还能不能连上」；请自行确认本机来源在新白名单内"
-  fi
-
-  # 10. 探针自校准 —— 证明探针本身工作
-  local pre
-  pre="$(probe_line root)"
-  if [[ -z "$pre" ]]; then
-    c_fail "黑盒探针取不到认证方式列表（探针本身有问题）" \
-           "没有可靠探针，「验证通过」就没有意义。检查 ssh 客户端与回环可达性"
-  elif [[ "$pre" == "Authentications that can continue: publickey,password" ]]; then
-    c_ok "探针自校准通过（改动前服务端提供：publickey,password）"
-  elif [[ "$pre" == "Authentications that can continue: publickey" ]]; then
-    c_ok "探针自校准通过（密码通道已是关闭状态 —— 本步为幂等重跑）"
-  else
-    c_fail "探针取到意外结果：$pre" "无法据此判断改动效果"
-  fi
+scan_sshd_config() {
+  python3 - "$SSHD_DROPIN" <<'PY'
+import glob,os,re,sys
+managed=os.path.realpath(sys.argv[1]); seen=set(); errors=[]; controlled={
+ 'port','listenaddress','permitrootlogin','pubkeyauthentication','passwordauthentication',
+ 'kbdinteractiveauthentication','authenticationmethods'}
+def visit(path,depth=0):
+ if depth>16: errors.append(path+': Include 递归过深'); return
+ path=os.path.realpath(path)
+ if path in seen: return
+ seen.add(path)
+ try: lines=open(path,encoding='utf-8').read().splitlines()
+ except OSError as e: errors.append(f'{path}: {e}'); return
+ for no,line in enumerate(lines,1):
+  s=line.strip()
+  if not s or s.startswith('#'): continue
+  m=re.match(r'(\S+)\s+(.*)',s)
+  if not m: errors.append(f'{path}:{no}: 无法解析'); continue
+  key,args=m.group(1).lower(),m.group(2).strip()
+  if key=='match': errors.append(f'{path}:{no}: 不支持活动 Match，请先人工整理')
+  elif key=='include':
+   if not os.path.isabs(args) or len(args.split())!=1:
+    errors.append(f'{path}:{no}: 仅支持单个绝对 Include pattern，拒绝无法完整解析的配置'); continue
+   for pat in glob.glob(args): visit(pat,depth+1)
+  elif key in controlled and path!=managed:
+   errors.append(f'{path}:{no}: 非受管指令 {m.group(1)} 会影响目标策略，请先人工整理')
+visit('/etc/ssh/sshd_config')
+print('\n'.join(errors))
+sys.exit(bool(errors))
+PY
 }
-
-print_dry_run_table() {
-  sub "预期状态 vs 当前状态"
-  printf '   %-6s %-52s %s\n' "" "检查项" "结论 / 建议"
-  printf '   %s\n' "────────────────────────────────────────────────────────────────────"
-  local e s d adv
-  for e in "${CHECKS[@]}"; do
-    IFS='|' read -r s d adv <<< "$e"
-    printf '   %-6s %-52s %s\n' "[$s]" "$d" "${adv:-—}"
+assert_manageable() {
+  local f
+  for f in "${MANAGED_FILES[@]}"; do
+    [[ ! -e $f ]] && continue
+    [[ -f $f ]] || { fail "受管路径不是普通文件: $f"; return 1; }
+    grep -q 'Managed by reinforce-my-ssh' "$f" 2>/dev/null \
+      || { fail "拒绝接管非本工具文件: $f"; return 1; }
   done
 }
-
-print_plan() {
-  local cur_root cur_pass
-  cur_root="$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2; exit}')"
-  cur_pass="$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2; exit}')"
-  sub "本步将改动的项"
-  printf '   %-26s %-22s %s\n' "配置项" "当前 → 目标" "落在哪个文件"
-  printf '   %s\n' "────────────────────────── ────────────────────── ──────────────────────────────"
-  printf '   %-26s %-22s %s\n' "PermitRootLogin"        "$cur_root → no" "$DROPIN_ROOT"
-  printf '   %-26s %-22s %s\n' "PasswordAuthentication" "$cur_pass → no" "$DROPIN_PASS"
-  printf '   %-26s %-22s %s\n' "监听端口"               "$(cur_port_set) → {$PORT}" "99-hardening.conf + socket override"
-  printf '   %-26s %-22s %s\n' "nft 白名单端口"         "$(cur_port_set) → {$PORT}" "$NFT_RULES"
-  printf '   %-26s %-22s %s\n' "fail2ban 端口"          "（对齐实际监听）" "$F2B_JAIL"
-  printf '\n'
-  inf "执行顺序："
-  inf "  A) 写两个认证 drop-in → sshd -t → daemon-reload + restart ssh.socket"
-  inf "  B) 收窄端口集合（sshd drop-in / socket override / nft / fail2ban）"
-  inf "  C) daemon-reload（socket 单元有缓存，不 reload 会「文件改了端口没变」）"
+preflight() {
+  local bad=0 cmd
+  for cmd in python3 nft sshd systemctl ssh ss ip flock sha256sum install journalctl timeout; do
+    command -v "$cmd" >/dev/null 2>&1 || { fail "缺少命令: $cmd"; bad=1; }
+  done
+  id -nG "$USERNAME" 2>/dev/null | tr ' ' '\n' | grep -qx sudo \
+    || { fail "$USERNAME 不在 sudo 组"; bad=1; }
+  systemctl cat ssh.socket >/dev/null 2>&1 || { fail "仅支持 ssh.socket 激活布局"; bad=1; }
+  scan_sshd_config || bad=1
+  assert_manageable || bad=1
+  require_source_allowed || bad=1
+  [[ $(systemctl show ssh.service -p KillMode --value) == process ]] || { fail "仅支持 KillMode=process 的 ssh.service"; bad=1; }
+  [[ $(systemctl show ssh.socket -p Accept --value) == no ]] || { fail "仅支持 Accept=no 的 ssh.socket"; bad=1; }
+  sshd -t || bad=1
+  return "$bad"
 }
-
-# 当前实际监听的端口集合（去掉回环/内部端口）
-cur_port_set() {
-  sshd -T 2>/dev/null | awk '$1=="port"{printf "%s%s",sep,$2; sep=", "}' | sed 's/^/{/;s/$/}/'
-}
-
-conclude() {
-  printf '\n%s── 结论 ──%s\n' "$C_DIM" "$C_RST"
-  if (( CHECK_FAILED > 0 )); then
-    printf '   %s✗ %d 项检查未通过，脚本中止，未做任何修改。%s\n' "$C_FAIL" "$CHECK_FAILED" "$C_RST"
-    return 1
-  fi
-  printf '   %s✅ 检查全过。%s\n' "$C_OK" "$C_RST"
-  return 0
-}
-
-# ─────────────────────── 执行 ───────────────────────
-
-gen_dropin_root() {
-  {
-    printf '# 禁止 root 通过 SSH 直接登录 —— 由 stage2.sh 生成于 %s\n' "$(date -Is)"
-    printf '#\n'
-    printf '# 生效原理：sshd 对多数指令采用「首次取值优先」，而 Include 的 drop-in\n'
-    printf '# 位于 /etc/ssh/sshd_config 第一行，先于主文件正文被解析，因此本文件的\n'
-    printf '# no 会覆盖主文件里后面的 PermitRootLogin yes。\n'
-    printf '#\n'
-    printf '# 为什么这样做：root 凭证一旦泄露，攻击者即完全控制服务器，且特权操作\n'
-    printf '# 不留可审计的痕迹。改为「普通账户 + sudo」后权限等价，但每一步提权都\n'
-    printf '# 在 sudo 审计里留痕，操作责任人明确。\n'
-    printf '#\n'
-    printf '# 影响：Workbench / 控制台一律用普通账户登录后 sudo 提权。\n'
-    printf '# 预期噪音：云厂商的「一键诊断 / 成熟度评估」会把本项报为「警告」，\n'
-    printf '#           那是合规提示，不是故障 —— 不要照着「修复建议」把它改回去。\n'
-    printf '# 回滚：删除本文件后 systemctl restart ssh.socket\n'
-    printf 'PermitRootLogin no\n'
-  } > "$1"
-}
-
-gen_dropin_pass() {
-  {
-    printf '# 关闭 SSH 密码认证，仅保留公钥 —— 由 stage2.sh 生成于 %s\n' "$(date -Is)"
-    printf '#\n'
-    printf '# 生效原理：同上，drop-in 先于主配置被解析，覆盖主配置里的\n'
-    printf '#           PasswordAuthentication yes。\n'
-    printf '#\n'
-    printf '# ⚠ 前提条件：KbdInteractiveAuthentication 必须为 no。\n'
-    printf '#   若它是 yes，密码仍可经 PAM 的键盘交互通道登录，\n'
-    printf '#   本文件的 no 会看起来「生效了」但实际没堵住。\n'
-    printf '#\n'
-    printf '# 为什么不影响可用性：\n'
-    printf '#   - 公网口已关闭（安全组 + nft 双侧），唯一入口是 nft 白名单内的来源\n'
-    printf '#   - 管理账户已装配公钥\n'
-    printf '#   - 云助手 / 运维编排 / 云监控均为 Agent 通道，不经 sshd\n'
-    printf '#   - VNC 走 PAM + login，与 sshd 无关，实例密码仍可用于控制台兜底\n'
-    printf '#\n'
-    printf '# 影响：① 密码方式 SSH 登录全部失效（含 root）\n'
-    printf '#       ② Workbench「终端连接 → 密码认证」失效；「免密连接」不受影响\n'
-    printf '# 回滚：删除本文件后 systemctl restart ssh.socket\n'
-    printf 'PasswordAuthentication no\n'
-  } > "$1"
-}
-
-gen_sshd_dropin() {
-  {
-    printf '# SSH 加固配置 —— 由 stage2.sh 生成于 %s\n' "$(date -Is)"
-    printf '# 监听端口：仅 %s（旧端口已在本次收口时关闭）\n' "$PORT"
-    printf '# 监听地址：通配，不绑定具体 IP —— 绑具体 IP 后换网络环境可能整体失联\n'
-    printf '# 来源限制：由 nftables 表 inet %s 按网段白名单控制\n' "$NFT_TABLE"
-    printf '# 注意：Port 是多值指令，取值会累加；一条都不写时 sshd 会补上默认的 22。\n'
-    printf 'Port %s\n' "$PORT"
-  } > "$1"
-}
-
-gen_socket_override() {
-  {
-    printf '[Unit]\n'
-    printf '# 失败方向：Require 白名单防火墙。加载失败 => ssh.socket 不启动 => SSH 不对外提供。\n'
-    printf 'Requires=ssh-firewall.service\n'
-    printf 'After=ssh-firewall.service\n'
-    printf '\n'
-    printf '[Socket]\n'
-    printf '# 清空继承自 /usr/lib/systemd/system/ssh.socket 的默认监听\n'
-    printf 'ListenStream=\n'
-    printf '# 必须与 sshd_config 的 Port 集合保持一致：sshd-socket-generator 会从\n'
-    printf '# sshd_config 的 Port 反推 ListenStream，两边不一致时结果难以预测。\n'
-    printf 'ListenStream=0.0.0.0:%s\n' "$PORT"
-    printf 'ListenStream=[::]:%s\n'      "$PORT"
-  } > "$1"
+confirm_rescue() {
+  [[ $RESCUE_CONFIRMED == yes ]] && return 0
+  ((ASSUME_YES == 0)) || die "--yes 不能替代 RESCUE_CONFIRMED=yes"
+  local answer
+  printf '请确认已实际登录过独立于 sshd 的 VNC/串口/Agent 救援通道。输入 yes: '
+  read -r answer; [[ $answer == yes ]] || die "未确认独立救援通道"
+  RESCUE_CONFIRMED=yes
 }
 
 gen_nft_rules() {
-  local f="$1" a fam
+  local out=$1 a fam
   {
-    printf '#!/usr/sbin/nft -f\n'
-    printf '# SSH 来源白名单 —— 由 stage2.sh 生成于 %s\n' "$(date -Is)"
-    printf '# 只匹配本机 SSH 端口，不影响其他服务与出向流量。\n'
-    printf '# policy accept：本表未匹配的流量一律放行，失败方向是「不拦」而非「断网」。\n'
-    printf '# 末尾 counter drop：对本端口而言本表是默认拒绝，白名单是唯一入口。\n'
-    printf '\n'
-    printf 'table inet %s {\n' "$NFT_TABLE"
-    printf '\tchain input {\n'
+    printf '# Managed by reinforce-my-ssh; do not edit\nadd table inet %s\ndelete table inet %s\n' "$NFT_TABLE" "$NFT_TABLE"
+    printf 'table inet %s {\n\tchain input {\n' "$NFT_TABLE"
     printf '\t\ttype filter hook input priority -100; policy accept;\n'
-    printf '\t\t# 回环隐式放行（fail2ban、本机自检、脚本自身验证都依赖它）\n'
-    printf '\t\t# 每条规则都带 counter：既能看见「挡了多少」，也能看见「放了多少、被谁放的」\n'
-    printf '\t\tip  saddr 127.0.0.1          tcp dport { %s } counter accept\n' "$PORT"
-    printf '\t\tip6 saddr ::1                tcp dport { %s } counter accept\n' "$PORT"
-    for a in "${ALLOWS[@]}"; do
-      if [[ "$a" == *:* ]]; then fam="ip6"; else fam="ip"; fi
-      printf '\t\t%s saddr %-22s tcp dport { %s } counter accept\n' "$fam" "$a" "$PORT"
+    printf '\t\tiif "lo" ip saddr 127.0.0.1 tcp dport %s counter accept\n' "$(port_set)"
+    printf '\t\tiif "lo" ip6 saddr ::1 tcp dport %s counter accept\n' "$(port_set)"
+    for a in "${ALLOWS[@]}"; do [[ $a == *:* ]] && fam=ip6 || fam=ip; printf '\t\t%s saddr %s tcp dport %s counter accept\n' "$fam" "$a" "$(port_set)"; done
+    printf '\t\ttcp dport %s ct state established,related counter accept\n' "$(port_set)"
+    printf '\t\ttcp dport %s counter drop\n\t}\n}\n' "$(port_set)"
+  } > "$out"
+}
+gen_loader() { printf '#!/bin/sh\n# Managed by reinforce-my-ssh; do not edit\nexec /usr/sbin/nft -f %s\n' "$NFT_RULES" > "$1"; }
+gen_fw_unit() {
+  cat > "$1" <<UNIT
+# Managed by reinforce-my-ssh; do not edit
+[Unit]
+Description=Reinforce My SSH firewall
+DefaultDependencies=no
+After=local-fs.target network-pre.target
+Wants=network-pre.target
+Before=ssh.socket shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$NFT_LOADER
+ExecReload=$NFT_LOADER
+
+[Install]
+WantedBy=sysinit.target
+UNIT
+}
+gen_sshd_dropin() {
+  local stage=$1 p
+  {
+    printf '# Managed by reinforce-my-ssh; do not edit\n'
+    if [[ $stage == hardened ]]; then
+      printf 'PermitRootLogin no\nPubkeyAuthentication yes\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nAuthenticationMethods publickey\n'
+    fi
+    while IFS= read -r p; do printf 'Port %s\n' "$p"; done < <(all_ports | sort -n -u)
+  } > "$1"
+}
+gen_socket_override() {
+  local p
+  {
+    printf '# Managed by reinforce-my-ssh; do not edit\n[Unit]\nRequires=%s\nAfter=%s\n\n[Socket]\nBindIPv6Only=ipv6-only\nListenStream=\n' "$FW_NAME" "$FW_NAME"
+    while IFS= read -r p; do printf 'ListenStream=0.0.0.0:%s\nListenStream=[::]:%s\n' "$p" "$p"; done < <(all_ports | sort -n -u)
+  } > "$1"
+}
+generate_files() {
+  local d=$1 stage=$2
+  TARGET_STAGE=$stage
+  mkdir -p "$d" || return 1
+  gen_nft_rules "$d/nft" && gen_loader "$d/loader" && gen_fw_unit "$d/unit" \
+    && gen_sshd_dropin "$d/sshd" "$stage" && gen_socket_override "$d/socket"
+}
+put_file() { install -m "$3" -o root -g root "$1" "$2"; }
+
+normalize_nft() {
+  python3 - "$1" "${2:--}" "$NFT_TABLE" <<'PY'
+import ipaddress,re,sys
+src,dst,table=sys.argv[1:]
+text=open(src,encoding='utf-8').read()
+# 仅忽略本表的事务前导；其他命令必须保留，不能掩盖额外操作。
+lines=[]
+for raw in text.splitlines():
+ line=raw.strip()
+ if not line or line.startswith('#'): continue
+ if line in {f'add table inet {table}',f'delete table inet {table}',f'flush table inet {table}'}: continue
+ line=re.sub(r'\bcounter(?:\s+packets\s+\d+\s+bytes\s+\d+)?\b','',line)
+ lines.append(line)
+tokens=re.findall(r'"(?:\\.|[^"\\])*"|[^\s{};,]+|[{};,]', '\n'.join(lines))
+out=[]; i=0
+while i<len(tokens):
+ token=tokens[i]
+ if token in {'saddr','daddr'} and i+1<len(tokens):
+  out.append(token); i+=1
+  try:
+   net=ipaddress.ip_network(tokens[i],strict=False)
+   token=str(net.network_address) if net.prefixlen==net.max_prefixlen else str(net)
+  except ValueError: token=tokens[i]
+ elif token=='{' and out and out[-1]=='dport' and i+2<len(tokens) and tokens[i+1].isdigit() and tokens[i+2]=='}':
+  token=tokens[i+1]; i+=2
+ out.append(token); i+=1
+normalized='\n'.join(out)+'\n'
+if dst=='-': sys.stdout.write(normalized)
+else:
+ with open(dst,'w',encoding='utf-8') as f: f.write(normalized)
+PY
+}
+verify_nft_semantics() {
+  local expected=$1 actual=$2
+  nft -s -y list table inet "$NFT_TABLE" > "$actual.raw" 2>/dev/null || return 1
+  normalize_nft "$expected" > "$expected.norm" && normalize_nft "$actual.raw" > "$actual.norm" && cmp -s "$expected.norm" "$actual.norm"
+}
+socket_addrs() { systemctl show ssh.socket -p Listen --value 2>/dev/null | awk '$2=="(Stream)"{print $1}' | sort; }
+check_listener() {
+  local port=$1
+  ss -tlnpH 2>/dev/null | python3 -c '
+import sys
+p=int(sys.argv[1]); found=set()
+for line in sys.stdin:
+ f=line.split()
+ if len(f)<5 or not ("systemd" in line or "sshd" in line): continue
+ try:
+  h,port=f[3].rsplit(":",1)
+  if int(port)==p: found.add(h.strip("[]"))
+ except ValueError: pass
+sys.exit(0 if {"0.0.0.0","::"}<=found else 1)' "$port"
+}
+port_any_listening() {
+  ss -tlnH 2>/dev/null | python3 -c '
+import sys
+p=int(sys.argv[1])
+for line in sys.stdin:
+ f=line.split()
+ if len(f)<4: continue
+ try:
+  if int(f[3].rsplit(":",1)[1])==p: sys.exit(0)
+ except (ValueError,IndexError): pass
+sys.exit(1)' "$1"
+}
+verify_auth_context() {
+  local conn c cp s sp key value u
+  conn=$(find_ssh_connection 2>/dev/null) || conn="127.0.0.1 1 127.0.0.1 $PORT"
+  read -r c cp s sp <<< "$conn"
+  for u in "$USERNAME" root; do
+    local output
+    output=$(sshd -T -C "user=$u,host=localhost,addr=$c,laddr=$s,lport=$PORT" 2>/dev/null) || { fail "sshd 上下文解析失败: $u"; return 1; }
+    for key in permitrootlogin pubkeyauthentication passwordauthentication kbdinteractiveauthentication authenticationmethods; do
+      value=$(awk -v k="$key" '$1==k{print $2;exit}' <<< "$output")
+      case $u:$key in
+        root:permitrootlogin|*:passwordauthentication|*:kbdinteractiveauthentication) [[ $value == no ]] || { fail "$u $key=$value"; return 1; } ;;
+        *:pubkeyauthentication) [[ $value == yes ]] || { fail "$u $key=$value"; return 1; } ;;
+        *:authenticationmethods) [[ $value == publickey ]] || { fail "$u $key=$value"; return 1; } ;;
+        *) ;;
+      esac
     done
-    printf '\t\ttcp dport { %s } ct state established,related counter accept\n' "$PORT"
-    printf '\t\ttcp dport { %s } counter drop\n' "$PORT"
-    printf '\t}\n}\n'
-  } > "$f"
+  done
+}
+verify_runtime() {
+  local stage=$1 d bad=0 p expected actual
+  scan_sshd_config || bad=1
+  d=$(mktemp -d) || return 1
+  generate_files "$d" "$stage" || { rm -rf "$d"; return 1; }
+  for pair in "$d/nft:$NFT_RULES" "$d/loader:$NFT_LOADER" "$d/unit:$FW_UNIT" "$d/sshd:$SSHD_DROPIN" "$d/socket:$SOCKET_OVERRIDE"; do
+    [[ -f ${pair#*:} ]] && cmp -s "${pair%%:*}" "${pair#*:}" || { fail "受管文件漂移: ${pair#*:}"; bad=1; }
+  done
+  sshd -t || bad=1
+  expected=$(all_ports | sort -n -u | tr '\n' ' ' | sed 's/ $//')
+  actual=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -n -u | tr '\n' ' ' | sed 's/ $//')
+  [[ $actual == "$expected" ]] || { fail "sshd 端口 [$actual]，期望 [$expected]"; bad=1; }
+  [[ $(systemctl show ssh.socket -p BindIPv6Only --value) == ipv6-only ]] || { fail "socket 未明确隔离 IPv6/IPv4 绑定"; bad=1; }
+  local expected_addrs
+  expected_addrs=$(while IFS= read -r p; do printf '0.0.0.0:%s\n[::]:%s\n' "$p" "$p"; done < <(all_ports | sort -n -u) | sort | tr '\n' ' ' | sed 's/ $//')
+  actual=$(socket_addrs | tr '\n' ' ' | sed 's/ $//')
+  [[ $actual == "$expected_addrs" ]] || { fail "socket 监听 [$actual]，期望 [$expected_addrs]"; bad=1; }
+  while IFS= read -r p; do
+    check_listener "$p" || { fail "端口 $p 缺少 IPv4/IPv6 通配监听"; bad=1; }
+    timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$p" 2>/dev/null || { fail "IPv4 回环不可连: $p"; bad=1; }
+    timeout 5 bash -c "exec 3<>/dev/tcp/::1/$p" 2>/dev/null || { fail "IPv6 回环不可连: $p"; bad=1; }
+  done < <(all_ports | sort -n -u)
+  if [[ $stage == hardened && $OLD_PORT != none ]] && port_any_listening "$OLD_PORT"; then
+    fail "旧端口 $OLD_PORT 仍有监听（可能是独立 sshd 或其他进程）"; bad=1
+  fi
+  verify_nft_semantics "$d/nft" "$d/actual" || { fail "nft 规则语义与目标不一致"; bad=1; }
+  systemctl is-active --quiet ssh.service && systemctl is-active --quiet ssh.socket && systemctl is-active --quiet "$FW_NAME" || { fail "SSH/firewall 单元未全部 active"; bad=1; }
+  [[ $(systemctl is-enabled ssh.socket) == enabled && $(systemctl is-enabled "$FW_NAME") == enabled ]] || { fail "SSH/firewall 单元未全部 enabled"; bad=1; }
+  systemctl show ssh.socket -p Requires --value | grep -qw "$FW_NAME" || { fail "socket 缺少防火墙 Requires"; bad=1; }
+  systemctl show ssh.socket -p After --value | grep -qw "$FW_NAME" || { fail "socket 缺少防火墙 After"; bad=1; }
+  [[ $stage != hardened ]] || verify_auth_context || bad=1
+  rm -rf "$d"
+  ((bad == 0))
 }
 
-# 全局，不是 local：EXIT trap 在函数返回之后才触发，
-# 那时局部变量早已离开作用域（set -u 下会报 unbound variable，临时目录也漏清理）。
-TMPD=""
-
-# 安装配置文件；失败立即中止，绝不带着半完成配置往下走
-put_file() {  # put_file <临时文件> <目标路径> <权限>
-  install -m "$3" -o root -g root "$1" "$2" \
-    || die "安装失败: $2 —— 中止（配置可能已部分写入，可执行 --rollback）"
+tx_begin() {
+  local stage=$1 pending=$2
+  ensure_state_root
+  TX_ID="$(date +%Y%m%d-%H%M%S-%N)-$$"; TX_DIR=$TX_ROOT/$TX_ID
+  mkdir -m 0700 "$TX_DIR" || die "无法创建事务目录"
+  python3 - "$TX_DIR" "${MANAGED_FILES[@]}" <<'PY' || die "文件备份失败"
+import hashlib,json,os,shutil,stat,sys
+out=sys.argv[1]; paths=sys.argv[2:]; entries=[]; os.mkdir(out+'/files',0o700)
+for i,p in enumerate(paths):
+ e={'path':p,'exists':os.path.exists(p)}
+ if e['exists']:
+  if not os.path.isfile(p): raise SystemExit('not a regular file: '+p)
+  st=os.stat(p); data=open(p,'rb').read(); name=str(i); shutil.copy2(p,out+'/files/'+name)
+  if hashlib.sha256(open(out+'/files/'+name,'rb').read()).digest()!=hashlib.sha256(data).digest(): raise SystemExit('backup digest mismatch')
+  e.update(name=name,mode=stat.S_IMODE(st.st_mode),uid=st.st_uid,gid=st.st_gid,sha256=hashlib.sha256(data).hexdigest())
+ entries.append(e)
+tmp=out+'/manifest.tmp'; json.dump({'files':entries},open(tmp,'w'),indent=2); os.replace(tmp,out+'/manifest.json')
+PY
+  : > "$TX_DIR/units.conf" || die "无法记录单元状态"
+  local u en ac
+  for u in ssh.socket ssh.service "$FW_NAME"; do
+    en=$(systemctl is-enabled "$u" 2>/dev/null || true); ac=$(systemctl is-active "$u" 2>/dev/null || true)
+    printf '%s|%s|%s\n' "$u" "${en:-unknown}" "${ac:-unknown}" >> "$TX_DIR/units.conf" || die "单元状态写入失败"
+  done
+  if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+    nft -s -y list table inet "$NFT_TABLE" > "$TX_DIR/runtime.nft" || die "内核 nft 备份失败"
+  else
+    : > "$TX_DIR/NFT_ABSENT" || die "nft 状态记录失败"
+  fi
+  ss -tlnH > "$TX_DIR/listeners.before" || die "监听状态备份失败"
+  cp -- "$0" "$TX_DIR/$SELF" || die "恢复脚本备份失败"
+  chmod 0700 "$TX_DIR/$SELF" || die "恢复脚本权限设置失败"
+  TX_STARTED=$(date +%s); printf '%s\n' "$TX_STARTED" > "$TX_DIR/started" || die "事务时间写入失败"
+  printf '%s\n' "$stage" > "$TX_DIR/stage" || die "事务阶段写入失败"
+  printf '%s\n%s\n%s\n' "$STATE_STAGE" "$STATE_TX" "$STATE_CONFIG_SHA" > "$TX_DIR/parent" || die "父状态写入失败"
+  cp "$POLICY_FILE" "$TX_DIR/policy.before" 2>/dev/null || [[ ! -e $POLICY_FILE ]] || die "策略备份失败"
+  write_policy || die "目标策略写入失败"
+  write_state "$pending" "$TX_ID" "" || die "pending 状态写入失败"
+  ok "事务 $TX_ID 已备份；尚未修改 SSH 配置"
 }
+recovery_paths() { RECOVERY_UNIT=/etc/systemd/system/reinforce-my-ssh-$TX_ID.service; RECOVERY_TIMER=/etc/systemd/system/reinforce-my-ssh-$TX_ID.timer; }
+arm_recovery() {
+  recovery_paths
+  cat > "$RECOVERY_UNIT" <<UNIT || return 1
+[Unit]
+Description=Automatic rollback for reinforce-my-ssh $TX_ID
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $TX_DIR/$SELF --rollback --transaction $TX_ID --auto-recovery --yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  cat > "$RECOVERY_TIMER" <<UNIT || return 1
+[Unit]
+Description=Deadline for reinforce-my-ssh $TX_ID
+
+[Timer]
+OnActiveSec=$RECOVERY_SECONDS
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload \
+    && systemctl enable "reinforce-my-ssh-$TX_ID.service" \
+    && systemctl enable --now "reinforce-my-ssh-$TX_ID.timer"
+}
+cancel_recovery() {
+  recovery_paths; local bad=0
+  if [[ -e $RECOVERY_TIMER || -e $RECOVERY_UNIT ]]; then
+    if [[ -e $RECOVERY_TIMER ]] || [[ $(systemctl show "reinforce-my-ssh-$TX_ID.timer" -p LoadState --value) != not-found ]]; then
+      systemctl disable --now "reinforce-my-ssh-$TX_ID.timer" >/dev/null 2>&1 || bad=1
+    fi
+    if [[ -e $RECOVERY_UNIT ]]; then
+      systemctl disable "reinforce-my-ssh-$TX_ID.service" >/dev/null 2>&1 || bad=1
+    fi
+    # 清理失败时保留文件，迟到任务仍能找到并重试清理。
+    ((bad == 0)) || return 1
+    rm -f "$RECOVERY_TIMER" "$RECOVERY_UNIT" || return 1
+    systemctl daemon-reload || return 1
+  fi
+}
+stop_ssh_entry() {
+  [[ $(systemctl show ssh.service -p KillMode --value) == process ]] \
+    || { fail "ssh.service KillMode 必须是 process，拒绝可能终止现存会话的操作"; return 1; }
+  systemctl stop ssh.service ssh.socket
+}
+start_ssh_entry() {
+  sshd -t && stop_ssh_entry && systemctl start ssh.socket && systemctl start ssh.service
+}
+restore_unit_state() {
+  local wanted=$1 u en ac current load
+  while IFS='|' read -r u en ac; do
+    [[ $u == "$wanted" ]] || continue
+    load=$(systemctl show "$u" -p LoadState --value 2>/dev/null) || return 1
+    if [[ $en == not-found && $ac == inactive && $load == not-found ]]; then
+      current=$(systemctl is-active "$u" 2>/dev/null || true)
+      [[ $current == inactive || $current == unknown ]] && return 0
+    fi
+    if [[ $ac == active ]]; then systemctl restart "$u" >/dev/null 2>&1 || return 1
+    elif [[ $ac == inactive || $ac == failed ]]; then systemctl stop "$u" >/dev/null 2>&1 || return 1
+    else fail "拒绝恢复未知 active 状态: $u=$ac"; return 1; fi
+    current=$(systemctl is-enabled "$u" 2>/dev/null || true)
+    [[ $current == "$en" ]] && return 0
+    case $en in
+      enabled) systemctl enable "$u" >/dev/null 2>&1 ;;
+      enabled-runtime) systemctl disable "$u" >/dev/null 2>&1 && systemctl enable --runtime "$u" >/dev/null 2>&1 ;;
+      disabled) systemctl disable "$u" >/dev/null 2>&1 ;;
+      masked) systemctl mask "$u" >/dev/null 2>&1 ;;
+      not-found) [[ $load == not-found ]] ;;
+      static|indirect|generated|transient) return 0 ;;
+      *) fail "拒绝恢复未知 enabled 状态: $u=$en"; return 1 ;;
+    esac
+    return $?
+  done < "$TX_DIR/units.conf"
+  return 1
+}
+policy_listeners() {
+  python3 - "$1" "$PORT" "$OLD_PORT" <<'PY'
+import sys
+wanted={sys.argv[2]} | ({sys.argv[3]} if sys.argv[3]!='none' else set())
+for line in open(sys.argv[1],encoding='utf-8'):
+ f=line.split()
+ if len(f)<4: continue
+ try:
+  if f[3].rsplit(':',1)[1] in wanted: print(f[3])
+ except IndexError: pass
+PY
+}
+tx_restore() {
+  local requested=$1 auto=$2 expected_stage=${SELF%.sh}
+  [[ -n $requested ]] || die "没有可回滚事务"
+  TX_ID=$requested; TX_DIR=$TX_ROOT/$TX_ID
+  [[ -f $TX_DIR/manifest.json && -f $TX_DIR/units.conf && -f $TX_DIR/stage ]] || die "事务备份不完整"
+  [[ $(cat "$TX_DIR/stage") == "$expected_stage" ]] || die "$SELF 不能回滚其他阶段的事务"
+  if ((auto)) && { [[ $STATE_TX != "$requested" ]] || [[ $STATE_STAGE != candidate-pending && $STATE_STAGE != hardening-pending ]]; }; then
+    cancel_recovery || return 1
+    ok "事务已提交或已结束，残留恢复单元已清理"; return 0
+  fi
+  [[ $STATE_TX == "$requested" ]] || die "事务不是当前事务；请按阶段逆序回滚"
+  case $STATE_STAGE in
+    candidate-pending|candidate-ready|hardening-pending|hardened) ;;
+    *) die "请先撤销后续阶段，再回滚配置" ;;
+  esac
+  local parent_lines=() parent_sha
+  mapfile -t parent_lines < "$TX_DIR/parent"
+  ((${#parent_lines[@]} == 3)) || { fail "父事务记录不完整"; return 1; }
+  PARENT_STAGE=${parent_lines[0]}; PARENT_TX=${parent_lines[1]}; parent_sha=${parent_lines[2]}
+  cancel_recovery || warn "恢复定时器清理失败，将继续恢复配置"
+  stop_ssh_entry || { fail "无法安全停止 SSH 监听，拒绝继续恢复"; return 1; }
+  local bad=0 fw_bad=0
+  # 在删除本次创建的单元文件前撤销 enable，避免留下悬空链接。
+  if grep -Fqx "$FW_NAME|not-found|inactive" "$TX_DIR/units.conf" \
+     && [[ $(systemctl show "$FW_NAME" -p LoadState --value) != not-found ]]; then
+    systemctl disable --now "$FW_NAME" || { bad=1; fw_bad=1; }
+  fi
+  python3 - "$TX_DIR" "${MANAGED_FILES[@]}" <<'PY' || { bad=1; fw_bad=1; }
+import hashlib,json,os,shutil,sys
+root=sys.argv[1]; allowed=set(sys.argv[2:]); entries=json.load(open(root+'/manifest.json'))['files']
+if len(entries)!=len(allowed) or {e['path'] for e in entries}!=allowed: raise SystemExit('manifest path set mismatch')
+# 修改任何文件前检查所有备份，避免恢复到一半才发现损坏。
+for e in entries:
+ if e['exists'] and hashlib.sha256(open(root+'/files/'+e['name'],'rb').read()).hexdigest()!=e['sha256']:
+  raise SystemExit('backup digest mismatch: '+e['path'])
+for e in entries:
+ p=e['path']
+ if e['exists']:
+  src=root+'/files/'+e['name']; tmp=p+'.reinforce-restore'
+  shutil.copyfile(src,tmp); os.chown(tmp,e['uid'],e['gid']); os.chmod(tmp,e['mode']); os.replace(tmp,p)
+ else:
+  try: os.unlink(p)
+  except FileNotFoundError: pass
+PY
+  if [[ -f $TX_DIR/policy.before ]]; then
+    local policy_tmp
+    policy_tmp=$(mktemp "$STATE_ROOT/.policy-restore.XXXXXX") \
+      && cp -- "$TX_DIR/policy.before" "$policy_tmp" && chmod 0600 "$policy_tmp" && mv -f "$policy_tmp" "$POLICY_FILE" \
+      || { bad=1; fw_bad=1; }
+  elif [[ $PARENT_STAGE == unconfigured ]]; then
+    rm -f "$POLICY_FILE" || { bad=1; fw_bad=1; }
+  else
+    fail "父阶段策略备份缺失"; bad=1; fw_bad=1
+  fi
+  systemctl daemon-reload || { bad=1; fw_bad=1; }
+  restore_unit_state "$FW_NAME" || { fail "防火墙单元状态恢复失败"; bad=1; fw_bad=1; }
+  local restore
+  restore=$(mktemp) || { bad=1; fw_bad=1; }
+  if [[ -n ${restore:-} ]]; then
+    { printf 'add table inet %s\ndelete table inet %s\n' "$NFT_TABLE" "$NFT_TABLE"
+      [[ -f $TX_DIR/NFT_ABSENT ]] || cat "$TX_DIR/runtime.nft"
+    } > "$restore" && nft -f "$restore" || { bad=1; fw_bad=1; }
+    rm -f "$restore"
+  fi
+  if [[ -f $TX_DIR/NFT_ABSENT ]]; then
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then fail "nft 表未撤销"; bad=1; fw_bad=1; fi
+  else
+    verify_nft_semantics "$TX_DIR/runtime.nft" "$TX_DIR/restored" \
+      || { fail "恢复后的 nft 与备份语义不同"; bad=1; fw_bad=1; }
+  fi
+  sshd -t || { fail "恢复后的 sshd 配置无效"; bad=1; fw_bad=1; }
+  if ((fw_bad == 0)); then
+    restore_unit_state ssh.socket && restore_unit_state ssh.service || { fail "SSH 单元状态恢复失败"; bad=1; }
+  fi
+  if ((bad == 0)); then
+    local before after
+    ss -tlnH > "$TX_DIR/listeners.after" || bad=1
+    before=$(policy_listeners "$TX_DIR/listeners.before" | sort -u) || bad=1
+    after=$(policy_listeners "$TX_DIR/listeners.after" | sort -u) || bad=1
+    [[ $before == "$after" ]] || { fail "恢复后的监听集合与备份不同"; bad=1; }
+    if [[ $PARENT_STAGE != unconfigured ]]; then
+      [[ $(config_digest) == "$parent_sha" ]] || { fail "恢复后的父摘要不匹配"; bad=1; }
+    fi
+  fi
+  if ((bad)); then
+    stop_ssh_entry || fail "停止新 SSH 接入失败，请立即使用独立救援通道"
+    fail "回滚未完成；事务保留，可修复原因后重试: $TX_ID"; return 1
+  fi
+  : > "$TX_DIR/ROLLED_BACK" || { fail "无法写回滚标记"; return 1; }
+  if ! write_state "$PARENT_STAGE" "$PARENT_TX" "$parent_sha"; then
+    rm -f "$TX_DIR/ROLLED_BACK"
+    fail "配置已恢复但父状态写失败；事务仍可重试"; return 1
+  fi
+  ok "事务 $TX_ID 已完整回滚"
+}
+tx_commit() {
+  local stage=$1 digest
+  digest=$(config_digest) || { fail "无法计算配置摘要"; return 1; }
+  write_state "$stage" "$TX_ID" "$digest" || { fail "提交状态写失败"; return 1; }
+  : > "$TX_DIR/COMMITTED" || { fail "事务提交标记写失败"; return 1; }
+  cancel_recovery || { warn "已提交，但恢复定时器清理失败；迟到任务将空操作"; return 1; }
+  STATE_CONFIG_SHA=$digest; ok "阶段已提交: $stage"
+}
+abort_tx() { fail "$1；开始自动回滚"; tx_restore "$TX_ID" 0 || die "自动回滚失败，请使用控制台并指定事务 $TX_ID"; die "变更已撤回"; }
 
 do_apply() {
-  TMPD="$(mktemp -d)" || die "无法创建临时目录"
-  trap '[ -n "$TMPD" ] && rm -rf "$TMPD"' EXIT
-
-  gen_dropin_root "$TMPD/10-permit-root-login.conf"
-  gen_dropin_pass "$TMPD/20-disable-password-auth.conf"
-  gen_sshd_dropin "$TMPD/99-hardening.conf"
-  gen_socket_override "$TMPD/override.conf"
-  gen_nft_rules "$TMPD/ssh-allowlist.nft"
-
-  if ! nft -c -f "$TMPD/ssh-allowlist.nft" 2>"$TMPD/nft.err"; then
-    fail "nft 语法校验未通过：$(cat "$TMPD/nft.err")"
-    die "中止（未做任何修改）"
+  [[ $STATE_STAGE == candidate-ready ]] || die "stage2 只能从 candidate-ready 部署；当前 $STATE_STAGE"
+  [[ $(config_digest) == "$STATE_CONFIG_SHA" ]] || die "父阶段配置摘要已变化，拒绝建立子事务"
+  preflight || die "预检失败，未修改系统"
+  verify_runtime candidate || die "候选通道已漂移，请先恢复第一阶段"
+  local evidence_since=$TX_ROOT/$STATE_TX/confirmation.json
+  session_evidence "$evidence_since" || die "必须保持指定用户经新端口公钥登录的会话"
+  confirm_rescue
+  local d; d=$(mktemp -d) || die "无法创建临时目录"
+  generate_files "$d" hardened || { rm -rf "$d"; die "配置生成失败"; }
+  nft -c -f "$d/nft" || { rm -rf "$d"; die "nft 候选语法无效"; }
+  tx_begin stage2 hardening-pending
+  arm_recovery || abort_tx "自动恢复定时器安装失败"
+  put_file "$d/sshd" "$SSHD_DROPIN" 0644 && put_file "$d/socket" "$SOCKET_OVERRIDE" 0644 \
+    || { rm -rf "$d"; abort_tx "认证或端口文件安装失败"; }
+  sshd -t && systemctl daemon-reload && start_ssh_entry \
+    || { rm -rf "$d"; abort_tx "认证/socket 生效失败"; }
+  if [[ $OLD_PORT != none ]] && port_any_listening "$OLD_PORT"; then
+    rm -rf "$d"; abort_tx "旧端口仍有监听，拒绝撤销其防火墙保护"
   fi
-  ok "nft 语法校验通过"
+  put_file "$d/nft" "$NFT_RULES" 0644 && systemctl reload "$FW_NAME" && verify_nft_semantics "$d/nft" "$d/check" \
+    || { rm -rf "$d"; abort_tx "白名单收窄或验证失败"; }
+  verify_runtime hardened || { rm -rf "$d"; abort_tx "收口后的完整验证失败"; }
+  record_confirmation_boundary || { rm -rf "$d"; abort_tx "确认日志边界记录失败"; }
+  rm -rf "$d"
+  cat <<DONE
 
-  backup_begin
-  backup_file "$DROPIN_ROOT"; backup_file "$DROPIN_PASS"
-  backup_file "$SSHD_DROPIN"; backup_file "$SSH_SOCKET_OVERRIDE"; backup_file "$NFT_RULES"
-  backup_file "$F2B_JAIL"
-
-  mkdir -p /etc/ssh/sshd_config.d /etc/systemd/system/ssh.socket.d /etc/nftables.d \
-    || die "无法创建配置目录 —— 中止（未做任何修改，可执行 --rollback）"
-
-  sub "阶段 A · 认证策略"
-  put_file "$TMPD/10-permit-root-login.conf"    "$DROPIN_ROOT" 0644
-  put_file "$TMPD/20-disable-password-auth.conf" "$DROPIN_PASS" 0644
-  act "已写入 $DROPIN_ROOT"
-  act "已写入 $DROPIN_PASS"
-
-  if ! sshd -t -f /etc/ssh/sshd_config; then
-    fail "sshd -t 未通过，回滚"
-    do_rollback "$MANIFEST"; exit 1
-  fi
-  ok "sshd 配置语法正确"
-
-  systemctl daemon-reload || { fail "daemon-reload 失败，回滚"; do_rollback "$MANIFEST"; exit 1; }
-  systemctl restart ssh.socket || { fail "ssh.socket 重启失败，回滚"; do_rollback "$MANIFEST"; exit 1; }
-  sleep 1
-  systemctl is-failed --quiet ssh.socket && { fail "ssh.socket 处于 failed，回滚"; do_rollback "$MANIFEST"; exit 1; }
-
-  local eff_root eff_pass addr
-  addr="$(client_addr)"
-  eff_root="$(sshd_eff permitrootlogin root "$addr")"
-  eff_pass="$(sshd_eff passwordauthentication "$USERNAME" "$addr")"
-  [[ "$eff_root" == "no" ]] && ok "生效：PermitRootLogin = no" || { fail "PermitRootLogin=${eff_root:-读不到} 未生效，回滚"; do_rollback "$MANIFEST"; exit 1; }
-  [[ "$eff_pass" == "no" ]] && ok "生效：PasswordAuthentication = no" || { fail "PasswordAuthentication=${eff_pass:-读不到} 未生效，回滚"; do_rollback "$MANIFEST"; exit 1; }
-
-  if [[ "$OLD_PORT" != "none" ]]; then
-    sub "阶段 B · 关闭旧端口 $OLD_PORT"
-    put_file "$TMPD/99-hardening.conf" "$SSHD_DROPIN"         0644
-    put_file "$TMPD/override.conf"     "$SSH_SOCKET_OVERRIDE" 0644
-    put_file "$TMPD/ssh-allowlist.nft" "$NFT_RULES"           0644
-    act "已收窄 sshd drop-in / socket override / nft 规则到 {$PORT}"
-
-    if ! sshd -t -f /etc/ssh/sshd_config; then
-      fail "sshd -t 未通过，回滚"; do_rollback "$MANIFEST"; exit 1
-    fi
-
-    # socket 单元缓存：必须先 daemon-reload，否则沿用旧 ListenStream
-    systemctl daemon-reload || { fail "daemon-reload 失败，回滚"; do_rollback "$MANIFEST"; exit 1; }
-    systemctl restart ssh-firewall.service || { fail "防火墙重载失败，回滚"; do_rollback "$MANIFEST"; exit 1; }
-    systemctl restart ssh.socket || { fail "ssh.socket 重启失败，回滚"; do_rollback "$MANIFEST"; exit 1; }
-    sleep 1
-    systemctl is-failed --quiet ssh.socket && { fail "ssh.socket 处于 failed，回滚"; do_rollback "$MANIFEST"; exit 1; }
-
-    local want got
-    want="$(grep -cE '^ListenStream=(0\.0\.0\.0|\[::\]):' "$SSH_SOCKET_OVERRIDE")"
-    got="$(systemctl show ssh.socket -p Listen --value 2>/dev/null | grep -c Stream)"
-    if [[ "$want" -ne "$got" ]]; then
-      fail "单元文件写了 $want 条监听，systemd 实际 $got 条 —— 缓存未刷新，回滚"
-      do_rollback "$MANIFEST"; exit 1
-    fi
-    ok "systemd 实际监听 $got 条，与配置文件一致"
-  else
-    skip "未指定要关闭的旧端口（--old-port none）"
-  fi
-
-  sub "阶段 C · fail2ban 端口对齐"
-  if command -v fail2ban-client >/dev/null 2>&1 && [[ -f "$F2B_JAIL" ]]; then
-    local ports
-    ports="$(sshd -T 2>/dev/null | awk '$1=="port"{printf "%s%s",sep,$2; sep=","}')"
-    if [[ -n "$ports" ]]; then
-      if grep -qE '^\s*port\s*=' "$F2B_JAIL"; then
-        sed -i -E "s/^[[:space:]]*port[[:space:]]*=.*/port     = $ports/" "$F2B_JAIL"
-      else
-        sed -i -E "s/^\[sshd\]/[sshd]\nport    = $ports/" "$F2B_JAIL"
-      fi
-      fail2ban-client reload >/dev/null 2>&1 && ok "fail2ban port = $ports" || warn "fail2ban reload 失败（不影响 SSH 可用性）"
-    fi
-  else
-    skip "无 fail2ban，跳过端口对齐"
-  fi
+认证和旧端口已收紧，但阶段尚未完成，自动恢复时限为 ${RECOVERY_SECONDS} 秒。
+请保留当前会话作为救援，从另一台机器建立一次全新的连接：
+  ssh -p $PORT $USERNAME@<服务器地址>
+然后只在新会话中执行：
+  sudo $SRC/$SELF --confirm
+事务: $TX_ID
+DONE
 }
-
-# ─────────────────────── 验证 ───────────────────────
-
-do_verify() {
-  sub "验证"
-  local bad=0 u line
-
-  # 黑盒自校准的「后」半段：改动后必须只剩 publickey
-  for u in root "$USERNAME"; do
-    line="$(probe_line "$u")"
-    if [[ -z "$line" ]]; then
-      fail "$u：探针取不到认证方式列表"; bad=1
-    elif [[ "$line" == "Authentications that can continue: publickey" ]]; then
-      ok "$u：服务端只提供 publickey —— 密码通道确已关闭"
-    else
-      fail "$u：$line"; bad=1
-    fi
-  done
-
-  # root 必须彻底不能登录
-  if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-         -p "$PORT" -o ConnectTimeout=8 root@127.0.0.1 true >/dev/null 2>&1; then
-    fail "root 仍能登录！"; bad=1
-  else
-    ok "root 已无法登录（密钥与密码均被拒）"
+do_confirm() {
+  if [[ $STATE_STAGE == hardened ]]; then
+    verify_runtime hardened && [[ $(config_digest) == "$STATE_CONFIG_SHA" ]] \
+      && { ok "第二阶段已经确认且复验通过"; return 0; }
+    die "第二阶段配置已漂移"
   fi
-
-  local eff_root eff_pass eff_kbd addr
-  addr="$(client_addr)"
-  eff_root="$(sshd_eff permitrootlogin root "$addr")"
-  eff_pass="$(sshd_eff passwordauthentication "$USERNAME" "$addr")"
-  eff_kbd="$(sshd_eff kbdinteractiveauthentication "$USERNAME" "$addr")"
-  [[ "$eff_root" == "no" ]] && ok "sshd 生效: permitrootlogin no" || { fail "permitrootlogin=${eff_root:-读不到}"; bad=1; }
-  [[ "$eff_pass" == "no" ]] && ok "sshd 生效: passwordauthentication no" || { fail "passwordauthentication=${eff_pass:-读不到}"; bad=1; }
-  # KbdInteractive 不关的话，密码可以经 PAM 绕过 PasswordAuthentication no
-  [[ "$eff_kbd" == "no" ]] && ok "sshd 生效: kbdinteractiveauthentication no" || { fail "kbdinteractiveauthentication=${eff_kbd:-读不到} —— 密码仍可经 PAM 登录"; bad=1; }
-
-  if port_listening "$PORT"; then ok "端口 $PORT 仍在监听"; else fail "端口 $PORT 未监听"; bad=1; fi
-
-  if [[ "$OLD_PORT" != "none" ]]; then
-    if port_listening "$OLD_PORT"; then
-      fail "旧端口 $OLD_PORT 仍在监听"; bad=1
-    else
-      ok "旧端口 $OLD_PORT 已不再监听"
-    fi
-    if ss -tlnH 2>/dev/null | grep -qE ":$OLD_PORT\b"; then
-      fail "仍有进程占用 $OLD_PORT"; bad=1
-    fi
-  fi
-
-  local want got
-  want="$(grep -cE '^ListenStream=(0\.0\.0\.0|\[::\]):' "$SSH_SOCKET_OVERRIDE")"
-  got="$(systemctl show ssh.socket -p Listen --value 2>/dev/null | grep -c Stream)"
-  [[ "$want" -eq "$got" ]] && ok "socket 监听条数与配置一致（$got）" || { fail "socket 监听 $got 条，期望 $want 条"; bad=1; }
-
-  nft list table inet "$NFT_TABLE" >/dev/null 2>&1 \
-    && ok "nft 白名单在位" || { fail "nft 白名单丢失"; bad=1; }
-
-  note "本机验证到此为止。请再从**另一台机器**确认："
-  note "    ssh -p $PORT $USERNAME@<地址>     ← 应成功"
-  note "    ssh -p $PORT root@<地址>           ← 应被拒"
-
-  (( bad == 0 ))
+  [[ $STATE_STAGE == hardening-pending ]] || die "只有 hardening-pending 可以确认；当前 $STATE_STAGE"
+  TX_ID=$STATE_TX; TX_DIR=$TX_ROOT/$TX_ID
+  verify_runtime hardened || die "收口配置或运行时验证失败"
+  session_evidence "$TX_DIR/confirmation.json" || die "全新外部登录/sudo 证据不足"
+  tx_commit hardened || die "提交失败；以实际 state 和恢复定时器状态为准"
+  printf '\n第二阶段完成。现在可执行 stage3.sh --apply 记录重启前基线。\n'
 }
-
-# ─────────────────────── 主流程 ───────────────────────
-
-hdr "$SELF · 第二步：认证收口"
 
 require_root
-
-if (( DO_ROLLBACK )); then
-  prev="$(newest_manifest_dir)" || die "找不到任何备份目录: $BACKUP_ROOT"
-  do_rollback "$prev"
-  exit 0
+load_state
+if ((DO_ROLLBACK)); then
+  load_policy
+  lock_all
+  load_state
+  load_policy
+  ((AUTO_RECOVERY)) || { [[ $STATE_STAGE != verified && $STATE_STAGE != reboot-pending ]] || die "请先执行 stage3.sh --rollback"; }
+  tx_restore "${REQUEST_TX:-$STATE_TX}" "$AUTO_RECOVERY"
+  exit $?
 fi
-
-require_params
-
-STAGE="$(detect_stage)"
-sub "阶段检测"
-inf "当前阶段：$STAGE"
-case "$STAGE" in
-  S0) inf "未加固 —— 本步的前提（通道）还不存在 ❌"
-      die "拒绝执行。请先跑 stage1.sh 建立新端口与白名单。" ;;
-  S1) inf "通道已建 —— 本步适用 ✅" ;;
-  S2) inf "认证已收口 —— 本步为幂等重跑 ✅" ;;
-  S3) inf "已固化验证 —— 本步会把状态倒退回去 ❌"
-      die "拒绝执行。先执行 stage3.sh --rollback 撤销固化，再来。" ;;
-  *)  die "无法识别阶段：$STAGE" ;;
-esac
-
-run_checks
-print_dry_run_table
-
-if (( ! APPLY )); then
-  print_plan
-  # 只读检查的退出码要反映检查结论：有 FAIL 就不能返回 0。
-  if conclude; then
-    printf '\n   %s这是只读检查（默认行为）。加 --apply 才会真正执行。%s\n\n' "$C_B" "$C_RST"
-    exit 0
-  fi
-  printf '\n   %s只读检查未全过 —— 先修好上面标 ✗ 的项。%s\n\n' "$C_FAIL" "$C_RST"
-  exit 1
+[[ $STATE_STAGE != unconfigured ]] || die "请先完成 stage1"
+load_policy
+normalize_params
+if ((APPLY || CONFIRM)); then lock_all; load_state; load_policy; normalize_params; fi
+case $STATE_STAGE in candidate-ready|hardening-pending|hardened) ;; *) die "当前阶段 $STATE_STAGE 不允许运行 stage2" ;; esac
+if ((CONFIRM)); then do_confirm; exit $?; fi
+if [[ $STATE_STAGE == hardening-pending ]]; then
+  ((APPLY)) || die "认证收口待外部确认；请在全新会话执行 --confirm"
+  TX_ID=$STATE_TX; TX_DIR=$TX_ROOT/$TX_ID
+  verify_runtime hardened && ok "收口配置已部署，无需重复修改；请执行 --confirm"
+  exit $?
 fi
-
-conclude || { printf '\n   未做任何修改。\n\n'; exit 1; }
-
-if (( ! ASSUME_YES )); then
-  printf '\n   %s即将执行变更。%s\n' "$C_WARN" "$C_RST"
-  printf '   %s请确认你另有一条走端口 %s 的可用通道，然后输入 yes 继续：%s ' "$C_WARN" "$PORT" "$C_RST"
-  read -r a
-  [[ "$a" == "yes" ]] || { printf '   已取消。\n\n'; exit 1; }
+if [[ $STATE_STAGE == hardened ]]; then
+  verify_runtime hardened || die "第二阶段配置已漂移"
+  [[ $(config_digest) == "$STATE_CONFIG_SHA" ]] || die "第二阶段配置摘要已变化"
+  ok "第二阶段已经完成且复验通过"; exit 0
 fi
-
-do_apply
-
-if do_verify; then
-  printf '\n   %s✅ 第二步完成。%s\n' "$C_OK" "$C_RST"
-  printf '   备份：%s\n' "$MANIFEST"
-  printf '   回滚：%s --rollback\n' "$SRC/$SELF"
-  printf '   下一步：执行 stage3.sh 做固化与重启验证。\n\n'
-else
-  printf '\n   %s✗ 验证未通过。%s\n' "$C_FAIL" "$C_RST"
-  printf '   可执行 %s --rollback 回滚。备份：%s\n\n' "$SRC/$SELF" "$MANIFEST"
-  exit 1
-fi
+if ((APPLY)); then do_apply; else preflight && verify_runtime candidate || exit 1; ok "只读预检通过；使用 --apply 收紧认证和端口"; fi

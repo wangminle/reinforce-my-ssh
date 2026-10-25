@@ -1,0 +1,24 @@
+test_allow_equivalent_cidr_and_leading_zero_window (__main__.Regression.test_allow_equivalent_cidr_and_leading_zero_window) ... ok
+test_initial_arm_failure_rolls_back_to_unconfigured (__main__.Regression.test_initial_arm_failure_rolls_back_to_unconfigured) ... ok
+test_journal_boundary_current_boot_and_capture_failure (__main__.Regression.test_journal_boundary_current_boot_and_capture_failure) ... ok
+test_late_recovery_cleans_only_its_own_units (__main__.Regression.test_late_recovery_cleans_only_its_own_units) ... ok
+test_native_nft_all_stages_and_atomic_failure (__main__.Regression.test_native_nft_all_stages_and_atomic_failure) ... ok
+test_native_restore_removes_extra_chain (__main__.Regression.test_native_restore_removes_extra_chain) ... ok
+test_native_systemd_dual_stack_and_service_switch (__main__.Regression.test_native_systemd_dual_stack_and_service_switch) ... ok
+test_nft_equivalence_and_extra_rule_rejection (__main__.Regression.test_nft_equivalence_and_extra_rule_rejection) ... ok
+test_normalizers_identical (__main__.Regression.test_normalizers_identical) ... ok
+test_partial_recovery_install_cleanup_and_retry (__main__.Regression.test_partial_recovery_install_cleanup_and_retry) ... ok
+test_restore_absent_unit_does_not_stop_missing_unit (__main__.Regression.test_restore_absent_unit_does_not_stop_missing_unit) ... ok
+test_restore_policy_digest_and_failed_nft_never_commits (__main__.Regression.test_restore_policy_digest_and_failed_nft_never_commits) ... ok
+test_session_evidence_positive_and_unrelated_or_old_log_rejected (__main__.Regression.test_session_evidence_positive_and_unrelated_or_old_log_rejected) ... ok
+test_socket_output_and_bind_configuration (__main__.Regression.test_socket_output_and_bind_configuration) ... ok
+test_ssh_switch_order_and_failed_socket (__main__.Regression.test_ssh_switch_order_and_failed_socket) ... ok
+test_stage2_order_reload_firewall_and_boundary_after_checks (__main__.Regression.test_stage2_order_reload_firewall_and_boundary_after_checks) ... ok
+test_stage2_rejects_parent_digest_before_system_changes (__main__.Regression.test_stage2_rejects_parent_digest_before_system_changes) ... ok
+test_stage3_boot_gate (__main__.Regression.test_stage3_boot_gate) ... ok
+test_static (__main__.Regression.test_static) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 5.010s
+
+OK
