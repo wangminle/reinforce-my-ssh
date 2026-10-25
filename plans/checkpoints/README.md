@@ -6,5 +6,7 @@
 - `2026-10-25-fix-summary.md`：修复映射、复跑结果和剩余验收事项。
 - `2026-10-25-regressions.txt`：本轮回归测试输出。
 - `2026-10-25-task-list-check.txt`：最终台账门禁输出。
+- `2026-10-25-legacy-vs-managed-analysis.md`：已有旧方案与新版受管状态的区别、证据边界及独立审计/迁移方案。
+- `2026-10-25-independent-audit-implementation.md`：独立审计、诊断指引实施结果、39 项验证及 build2 功能计数说明。
 
 后续检查继续新增日期或主题文件，不把新的结果覆盖成历史报告当时已通过的结论。长期设计保存在 `../DESIGN.md`，历史审计保存在 `../AUDIT.md`，可执行测试保存在根目录 `tests/`。

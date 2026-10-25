@@ -1,2 +1,4 @@
 .claude/
 working-scripts/
+__pycache__/
+*.py[cod]

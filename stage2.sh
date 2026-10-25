@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # stage2.sh — 收紧认证并关闭旧入口；全新外部公钥登录和 sudo 验证后才提交。
-# 支持 Ubuntu/Debian + systemd + ssh.socket。默认只读。
+# 支持 Ubuntu/Debian + systemd + ssh.socket。默认复验受管候选状态。
 # 用法见 --help；设计与限制见 plans/DESIGN.md。
 set -uo pipefail
 
@@ -54,6 +54,8 @@ usage() {
 
 配置文件键: PORT, OLD_PORT, USER, ALLOW（可重复）, RECOVERY_SECONDS,
             RESCUE_CONFIRMED=yes（表示已实际演练独立于 sshd 的救援通道）。
+默认检查需要新版阶段记录；已有旧方案请用独立 audit.py。
+普通用户 SSH 登录后 sudo 执行即可，不需要开放 root SSH 登录。
 USAGE
 }
 
@@ -181,7 +183,11 @@ load_policy() {
     ALLOWS=("${policy_allows[@]}")
   fi
 }
-require_root() { ((EUID == 0)) || die "请通过 sudo 运行"; }
+require_root() {
+  ((EUID == 0)) && return 0
+  fail "权限不足，未完成检查；请以目标普通用户登录后 sudo bash 执行，不必开放 root SSH 登录"
+  exit 2
+}
 ensure_state_root() {
   mkdir -p "$STATE_ROOT" && mkdir -p "$TX_ROOT" || die "无法创建 $STATE_ROOT"
   chmod 0700 "$STATE_ROOT" "$TX_ROOT" || die "无法保护状态目录"
@@ -371,7 +377,7 @@ def visit(path,depth=0):
     errors.append(f'{path}:{no}: 仅支持单个绝对 Include pattern，拒绝无法完整解析的配置'); continue
    for pat in glob.glob(args): visit(pat,depth+1)
   elif key in controlled and path!=managed:
-   errors.append(f'{path}:{no}: 非受管指令 {m.group(1)} 会影响目标策略，请先人工整理')
+   errors.append(f'{path}:{no}: 接管阻断：非受管指令 {m.group(1)}；这不是安全不合格结论，请先独立审计')
 visit('/etc/ssh/sshd_config')
 print('\n'.join(errors))
 sys.exit(bool(errors))
@@ -885,7 +891,11 @@ if ((DO_ROLLBACK)); then
   tx_restore "${REQUEST_TX:-$STATE_TX}" "$AUTO_RECOVERY"
   exit $?
 fi
-[[ $STATE_STAGE != unconfigured ]] || die "请先完成 stage1"
+if [[ $STATE_STAGE == unconfigured ]]; then
+  fail "新版管理状态未建立，stage2 未执行认证/端口复验；不代表服务器未加固"
+  warn "已有旧方案请先执行 sudo python3 $SRC/audit.py --help；需要部署时按 stage1 流程操作"
+  exit 2
+fi
 load_policy
 normalize_params
 if ((APPLY || CONFIRM)); then lock_all; load_state; load_policy; normalize_params; fi

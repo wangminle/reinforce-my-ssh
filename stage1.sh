@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # stage1.sh — 建立候选 SSH 通道；外部公钥登录和 sudo 验证后才提交。
-# 支持 Ubuntu/Debian + systemd + ssh.socket。默认只读。
+# 支持 Ubuntu/Debian + systemd + ssh.socket。默认只读部署预检，不是通用安全审计。
 # 用法见 --help；设计与限制见 plans/DESIGN.md。
 set -uo pipefail
 
@@ -53,6 +53,8 @@ usage() {
 
 配置文件键: PORT, OLD_PORT, USER, ALLOW（可重复）, RECOVERY_SECONDS,
             RESCUE_CONFIRMED=yes（表示已实际演练独立于 sshd 的救援通道）。
+默认检查只判断部署前提/受管配置；已有旧方案请用独立 audit.py。
+普通用户 SSH 登录后 sudo 执行即可，不需要开放 root SSH 登录。
 USAGE
 }
 
@@ -180,7 +182,11 @@ load_policy() {
     ALLOWS=("${policy_allows[@]}")
   fi
 }
-require_root() { ((EUID == 0)) || die "请通过 sudo 运行"; }
+require_root() {
+  ((EUID == 0)) && return 0
+  fail "权限不足，未完成检查；请以目标普通用户登录后 sudo bash 执行，不必开放 root SSH 登录"
+  exit 2
+}
 ensure_state_root() {
   mkdir -p "$STATE_ROOT" && mkdir -p "$TX_ROOT" || die "无法创建 $STATE_ROOT"
   chmod 0700 "$STATE_ROOT" "$TX_ROOT" || die "无法保护状态目录"
@@ -367,7 +373,7 @@ def visit(path,depth=0):
     errors.append(f'{path}:{no}: 仅支持单个绝对 Include pattern，拒绝无法完整解析的配置'); continue
    for pat in glob.glob(args): visit(pat,depth+1)
   elif key in controlled and path!=managed:
-   errors.append(f'{path}:{no}: 非受管指令 {m.group(1)} 会影响目标策略，请先人工整理')
+   errors.append(f'{path}:{no}: 接管阻断：非受管指令 {m.group(1)}；这不是安全不合格结论，请先独立审计')
 visit('/etc/ssh/sshd_config')
 print('\n'.join(errors))
 sys.exit(bool(errors))
@@ -892,4 +898,10 @@ if [[ $STATE_STAGE == candidate-ready ]]; then
   [[ $(config_digest) == "$STATE_CONFIG_SHA" ]] || die "第一阶段配置摘要已变化"
   ok "第一阶段已经完成且复验通过"; exit 0
 fi
-if ((APPLY)); then do_apply; else preflight || exit 1; ok "只读预检通过；使用 --apply 部署候选通道"; fi
+if ((APPLY)); then
+  do_apply
+else
+  warn "当前为部署预检，不是已有服务器的安全审计；未纳管不等于未加固。独立审计：sudo python3 $SRC/audit.py --help"
+  preflight || { fail "部署前提检查未通过；安全效果未由本命令判定，未修改系统"; exit 2; }
+  ok "部署前提检查通过；尚未部署、未证明整机安全；使用 --apply 部署候选通道"
+fi

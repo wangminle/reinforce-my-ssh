@@ -2,5 +2,6 @@
 # 显式声明可防止 Windows 上 clone 时被 autocrlf 转成 CRLF ——
 # 那会让脚本在 Linux 上报 `\r': command not found`。
 *.sh     text eol=lf
+*.py     text eol=lf
 *.md     text eol=lf
 LICENSE  text eol=lf

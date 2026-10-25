@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # stage3.sh —— 纯重启验证与基线记录
 #
-# 默认执行完整只读检查。--apply 只记录重启前状态，不重启系统；
+# 默认执行受管状态的完整只读复验；已有旧方案由 audit.py 独立审计。
+# --apply 只记录重启前状态，不重启系统；
 # --verify 只在跨过重启且配置未漂移时记录验证结果；--rollback 只回退验证状态。
 # 本脚本绝不 enable/disable 单元，也不修改 SSH、nft 或 socket 配置。
 
@@ -50,6 +51,8 @@ usage() {
 
 参数只用于核对权威策略，不会覆盖 /var/lib/reinforce-my-ssh/policy.conf。
 脚本不会重启、enable/disable 单元或修改任何 SSH/nft/socket 配置。
+默认检查需要新版策略和状态；未纳管不等于未加固，请用 audit.py。
+普通用户 SSH 登录后 sudo 执行即可，不需要开放 root SSH 登录。
 USAGE
 }
 
@@ -77,7 +80,15 @@ while [[ $# -gt 0 ]]; do
 done
 (( APPLY + VERIFY_MODE + DO_ROLLBACK <= 1 )) || die "--apply、--verify、--rollback 互斥"
 (( ! ASSUME_YES || APPLY )) || die "--yes 只能与 --apply 一起使用"
-(( EUID == 0 )) || die "需要 root 权限读取完整 SSH/nft/systemd 状态；请用 sudo 运行"
+if (( EUID != 0 )); then
+  fail "权限不足，未完成复验；普通用户 SSH 登录后 sudo bash 执行即可"
+  exit 2
+fi
+if [[ ! -f $POLICY_FILE || ! -r $POLICY_FILE || ! -f $STATE_FILE || ! -r $STATE_FILE ]]; then
+  fail "新版策略/状态缺失或不可读，stage3 未执行重启复验；这不是服务器安全不合格结论"
+  inf "已有旧方案请用独立审计：sudo python3 $(dirname "$0")/audit.py --help"
+  exit 2
+fi
 if (( APPLY || VERIFY_MODE || DO_ROLLBACK )); then
   exec 9>/run/lock/reinforce-my-ssh.lock || die "无法打开事务锁"
   flock -x 9 || die "无法取得事务锁"

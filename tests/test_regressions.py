@@ -274,6 +274,34 @@ run_checks() { echo UNEXPECTED; exit 9; }
         self.assertNotIn("UNEXPECTED", result.stdout)
         self.assertIn("boot_id 未变化", result.stdout)
 
+    def test_unmanaged_diagnostics_do_not_report_security_failure(self):
+        for stage, variable in ((2, "STATE_ROOT"), (3, "STATE_DIR")):
+            with self.subTest(stage=stage):
+                text = (ROOT / f"stage{stage}.sh").read_text(encoding="utf-8")
+                text = text.replace(f"{variable}=/var/lib/reinforce-my-ssh", f"{variable}={self.work}/absent")
+                # 所有受管路径也映射到临时目录，避免读取本机已有配置。
+                for name, path in (
+                    ("SSHD_DROPIN", "/etc/ssh/sshd_config.d/00-reinforce-my-ssh.conf"),
+                    ("NFT_RULES", "/etc/nftables.d/reinforce-my-ssh.nft"),
+                    ("NFT_LOADER", "/usr/local/sbin/reinforce-my-ssh-firewall"),
+                    ("FW_UNIT", "/etc/systemd/system/reinforce-my-ssh-firewall.service"),
+                    ("SOCKET_OVERRIDE" if stage == 2 else "SOCKET_DROPIN", "/etc/systemd/system/ssh.socket.d/00-reinforce-my-ssh.conf"),
+                ):
+                    text = text.replace(f"{name}={path}", f"{name}={self.work}/{name}")
+                # 该测试只验证只读入口语义，普通用户运行测试也不要求 root。
+                if stage == 2:
+                    text = text.replace("\nrequire_root\n", "\n:\n")
+                else:
+                    text = text.replace("if (( EUID != 0 )); then", "if false; then")
+                script = self.work / f"diagnostic-{stage}.sh"
+                script.write_text(text)
+                before = sorted(self.work.iterdir())
+                result = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("未执行", result.stdout + result.stderr)
+                self.assertIn("audit.py", result.stdout + result.stderr)
+                self.assertEqual(before, sorted(self.work.iterdir()))
+
     def test_stage2_order_reload_firewall_and_boundary_after_checks(self):
         for old_open in (False, True):
             output = self.bash(2, r'''
@@ -388,6 +416,47 @@ nft -s -n -y list table inet sshguard > "$WORK/restored"
 grep -q 'chain original' "$WORK/restored" && ! grep -q 'chain input' "$WORK/restored"
 ''', integration=True)
         self.assertTrue((tx / "ROLLED_BACK").exists())
+
+    def test_native_audit_nft_json(self):
+        if not INTEGRATION:
+            self.skipTest("需要 --integration：真实 nft JSON 独立审计")
+        (self.work / "audit-check.py").write_text('''import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, ''' + repr(str(ROOT)) + ''')
+import audit, json
+policy=audit.Policy(2222,'deploy',['203.0.113.7/32','2001:db8::1/128'],[22])
+data=json.loads(audit.System().run('nft','-j','-s','list','ruleset'))
+check=audit.firewall_policy(data,policy)
+print(check)
+assert check.result==sys.argv[1], check
+''')
+        self.bash(2, r'''
+PORT=2222; OLD_PORT=22; ALLOWS=(203.0.113.7/32 2001:db8::1/128); TARGET_STAGE=hardened
+gen_nft_rules "$WORK/new.nft" && nft -f "$WORK/new.nft" || exit 1
+python3 "$WORK/audit-check.py" pass || exit 2
+nft insert rule inet sshguard input tcp dport 2222 accept || exit 3
+python3 "$WORK/audit-check.py" fail || exit 4
+''', integration=True)
+
+    def test_native_audit_dual_stack_socket_option(self):
+        if not INTEGRATION:
+            self.skipTest("需要 --integration：真实 socket 的 v6only 属性")
+        (self.work / "socket-audit.py").write_text('''import socket, sys
+sys.dont_write_bytecode=True
+sys.path.insert(0, ''' + repr(str(ROOT)) + ''')
+import audit
+for only, expected in ((0,audit.PASS),(1,audit.FAIL)):
+ s=socket.socket(socket.AF_INET6,socket.SOCK_STREAM)
+ s.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,only)
+ s.bind(('::',42222)); s.listen()
+ auditor=audit.Auditor(audit.Policy(42222,'deploy',['203.0.113.0/24']))
+ auditor.unit=lambda name: {'Listen':'[::]:42222 (Stream)'}
+ auditor.listeners()
+ check=next(x for x in auditor.checks if x.name=='来源地址族监听')
+ assert check.result==expected, check
+ s.close()
+''')
+        self.bash(2, 'python3 "$WORK/socket-audit.py"\n', integration=True)
 
     def test_native_systemd_dual_stack_and_service_switch(self):
         if not INTEGRATION:
