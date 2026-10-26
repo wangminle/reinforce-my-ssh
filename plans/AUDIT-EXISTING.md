@@ -2,7 +2,7 @@
 
 `stage0-audit.sh` 用于核验已经手工加固、使用旧 apply 方案或已经由新版管理的机器。它不要求 `/var/lib/reinforce-my-ssh` 已存在，不会创建或更新该目录，不会接管配置、安装文件、加载 nft、启停单元或重启服务器。
 
-该入口调用同目录 audit.py；旧的 python3 audit.py 用法仍然可用。四个阶段入口和兼容关系见 [脚本命名](SCRIPT-NAMES.md)。
+审计实现已内嵌在该文件中，环境仍需 Python 3，但无需分发外部 audit.py。四个工作脚本和旧入口关系见 [脚本命名](SCRIPT-NAMES.md)。
 
 ## 执行方式
 

@@ -15,7 +15,7 @@ SSH hardening for Ubuntu/Debian: audit an existing server, establish a new port,
 | [stage2-harden.sh](stage2-harden.sh) | Disable root, password and keyboard-interactive login; require public keys and close the old port. |
 | [stage3-reboot-check.sh](stage3-reboot-check.sh) | Record a baseline and verify after a real reboot. Does not change SSH/firewall settings or reboot the server. |
 
-Stage0 can run independently; it does not enroll a server. Stages 1–3 use explicit state, policy and transaction records under `/var/lib/reinforce-my-ssh`. Old `stage1.sh` / `stage2.sh` / `stage3.sh` names remain compatibility entry points. Keep the repository files together, including the `audit.py` backend.
+Stage0 can run independently; it does not enroll a server. Stages 1–3 use explicit state, policy and transaction records under `/var/lib/reinforce-my-ssh`. Deploy only the **four stage scripts** listed above: the audit implementation is embedded in stage0, with Python 3 still required. Old `stage1.sh` / `stage2.sh` / `stage3.sh` names remain optional compatibility entry points in the repository.
 
 ### Before you start
 
@@ -94,7 +94,7 @@ Integration tests use isolated nft namespaces and dedicated temporary systemd un
 | [stage2-harden.sh](stage2-harden.sh) | 禁止 root、密码和键盘交互登录，仅允许公钥，并关闭旧端口。 |
 | [stage3-reboot-check.sh](stage3-reboot-check.sh) | 记录基线，跨真实重启复验；不修改 SSH/防火墙配置，不代为重启。 |
 
-stage0 可独立执行，不会自动纳管服务器。stage1–3 的策略、状态和事务记录保存在 `/var/lib/reinforce-my-ssh`。旧的 `stage1.sh`、`stage2.sh`、`stage3.sh` 保留兼容入口；分发时保持仓库文件完整，包括审计实现 `audit.py`。
+stage0 可独立执行，不会自动纳管服务器。stage1–3 的策略、状态和事务记录保存在 `/var/lib/reinforce-my-ssh`。部署只需上述 **四个 stage 脚本**：审计实现已内嵌 stage0，环境仍需 Python 3。旧的 `stage1.sh`、`stage2.sh`、`stage3.sh` 仅作为仓库中的可选兼容入口。
 
 ### 使用前提
 

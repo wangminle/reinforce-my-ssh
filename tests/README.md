@@ -4,6 +4,8 @@
 
 主脚本采用 stage1-newport.sh、stage2-harden.sh、stage3-reboot-check.sh，独立审计入口为 stage0-audit.sh。回归同时验证旧入口兼容、参数和退出码透传，以及改名后事务阶段标识仍然稳定。
 
+生产部署只需这四个 shell 文件。stage0 的 Python 实现内嵌于文件中；tests/audit_source.py 仅为测试提取并加载它，不会分发到服务器。回归包含四文件独立目录运行检查，防止重新引入外部工作文件依赖。
+
 Linux / WSL 中运行：
 
 ```bash

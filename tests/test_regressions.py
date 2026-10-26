@@ -11,6 +11,9 @@ import sys
 import tempfile
 import unittest
 
+sys.dont_write_bytecode = True
+from audit_source import audit_source
+
 ROOT = Path(__file__).resolve().parents[1]
 INTEGRATION = False
 STAGE_FILES = {1: "stage1-newport.sh", 2: "stage2-harden.sh", 3: "stage3-reboot-check.sh"}
@@ -72,11 +75,26 @@ class Regression(unittest.TestCase):
                 self.assertEqual(old.stdout, new.stdout)
                 self.assertIn(canonical, new.stdout)
         for arguments in (["--help"], ["--port", "2222", "--user", "deploy", "--allow", "203.0.113.0/24", "--apply"]):
+            reference = self.work / "audit-reference.py"
+            reference.write_text(audit_source(), encoding="utf-8")
             wrapper = subprocess.run(["bash", str(ROOT / "stage0-audit.sh"), *arguments], capture_output=True, text=True)
-            backend = subprocess.run([sys.executable, str(ROOT / "audit.py"), *arguments], capture_output=True, text=True)
+            backend = subprocess.run([sys.executable, str(reference), *arguments], capture_output=True, text=True)
             self.assertEqual(wrapper.returncode, backend.returncode)
             self.assertEqual(wrapper.stdout, backend.stdout)
             self.assertEqual(wrapper.stderr, backend.stderr)
+
+    def test_four_runtime_files_are_self_contained(self):
+        names = ("stage0-audit.sh", *STAGE_FILES.values())
+        runtime = self.work / "runtime"
+        runtime.mkdir()
+        for name in names:
+            (runtime / name).write_bytes((ROOT / name).read_bytes())
+        self.assertEqual(sorted(path.name for path in runtime.iterdir()), sorted(names))
+        for name in names:
+            result = subprocess.run(["bash", str(runtime / name), "--help"], cwd=runtime,
+                                    capture_output=True, text=True, env={**os.environ, "PYTHONPATH": ""})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(name, result.stdout)
 
     def test_recovery_uses_stable_stage_id_after_rename(self):
         for stage in (1, 2):
@@ -456,8 +474,10 @@ grep -q 'chain original' "$WORK/restored" && ! grep -q 'chain input' "$WORK/rest
             self.skipTest("需要 --integration：真实 nft JSON 独立审计")
         (self.work / "audit-check.py").write_text('''import sys
 sys.dont_write_bytecode = True
-sys.path.insert(0, ''' + repr(str(ROOT)) + ''')
-import audit, json
+sys.path.insert(0, ''' + repr(str(ROOT / "tests")) + ''')
+from audit_source import load_audit
+import json
+audit=load_audit()
 policy=audit.Policy(2222,'deploy',['203.0.113.7/32','2001:db8::1/128'],[22])
 data=json.loads(audit.System().run('nft','-j','-s','list','ruleset'))
 check=audit.firewall_policy(data,policy)
@@ -477,8 +497,9 @@ python3 "$WORK/audit-check.py" fail || exit 4
             self.skipTest("需要 --integration：真实 socket 的 v6only 属性")
         (self.work / "socket-audit.py").write_text('''import socket, sys
 sys.dont_write_bytecode=True
-sys.path.insert(0, ''' + repr(str(ROOT)) + ''')
-import audit
+sys.path.insert(0, ''' + repr(str(ROOT / "tests")) + ''')
+from audit_source import load_audit
+audit=load_audit()
 for only, expected in ((0,audit.PASS),(1,audit.FAIL)):
  s=socket.socket(socket.AF_INET6,socket.SOCK_STREAM)
  s.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,only)

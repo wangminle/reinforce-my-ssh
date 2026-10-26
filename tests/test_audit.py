@@ -16,7 +16,9 @@ from unittest.mock import patch
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-import audit
+from audit_source import load_audit
+
+audit = load_audit()
 
 
 def match(left, right):
@@ -262,7 +264,7 @@ class AuditTests(unittest.TestCase):
         with patch.object(audit.os, "geteuid", return_value=1000), contextlib.redirect_stdout(io.StringIO()) as stdout:
             self.assertEqual(audit.main(args), 2)
         self.assertEqual(json.loads(stdout.getvalue())["security_result"], audit.UNKNOWN)
-        result = subprocess.run([sys.executable, str(ROOT / "audit.py"), *args, "--apply"], capture_output=True, text=True)
+        result = subprocess.run(["bash", str(ROOT / "stage0-audit.sh"), *args, "--apply"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
 
     def test_mutating_commands_cannot_use_collector(self):
@@ -276,7 +278,8 @@ class AuditTests(unittest.TestCase):
             self.skipTest("本机上传脚本不入库")
         result = subprocess.run(["bash", str(path), "--dry-run"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("audit.py", result.stdout)
+        self.assertNotIn("audit.py", result.stdout)
+        self.assertNotIn("stage1.sh", result.stdout)
         for name in ("stage0-audit.sh", "stage1-newport.sh", "stage2-harden.sh", "stage3-reboot-check.sh"):
             self.assertIn(name, result.stdout)
         self.assertNotIn("stage3.sh --port", result.stdout)
