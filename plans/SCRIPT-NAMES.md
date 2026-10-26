@@ -16,7 +16,9 @@ stage0 是独立入口，可在已有旧方案或新版机器上随时执行。�
 普通管理账户 SSH 登录后 sudo 执行即可：
 
 ```bash
-sudo bash ./stage0-audit.sh --port 2222 --user deploy --allow 203.0.113.0/24 --closed-port 22
+sudo bash ./stage0-audit.sh
+# 可选：声明目标策略后比较白名单和应关闭的端口
+sudo bash ./stage0-audit.sh --allow 203.0.113.0/24 --closed-port 22
 sudo bash ./stage1-newport.sh --help
 sudo bash ./stage2-harden.sh --help
 sudo bash ./stage3-reboot-check.sh --help

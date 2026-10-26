@@ -29,6 +29,16 @@ Examples assume the repository is at `/opt/reinforce-my-ssh`. Replace `SERVER`, 
 
 **Existing server: audit without changing configuration.**
 
+From your normal administrator's SSH session, start with no parameters:
+
+```bash
+sudo bash stage0-audit.sh
+```
+
+It detects the sudo user, current SSH port and source, checks authentication and listeners, and collects firewall/startup evidence. The current source is a session fact, not an inferred allowlist. Root/password/public-key checks use the project's hardening baseline. Without `--allow`, source-policy compliance remains unassessed. If the session cannot be recovered or multiple ports remain ambiguous, supply `--user` / `--port` as needed.
+
+To compare against a declared allowlist and required closed port:
+
 ```bash
 sudo bash stage0-audit.sh --port 2222 --user deploy \
   --allow 203.0.113.0/24 --closed-port 22
@@ -107,6 +117,16 @@ stage0 可独立执行，不会自动纳管服务器。stage1–3 的策略、�
 以下假设仓库位于 `/opt/reinforce-my-ssh`，服务器命令均在此目录执行。请替换 `SERVER`、账户、端口和示例网段 `203.0.113.0/24`。
 
 **已有服务器：只审计，不改配置。**
+
+普通管理账户 SSH 登录后，直接执行：
+
+```bash
+sudo bash stage0-audit.sh
+```
+
+自动识别 sudo 用户、当前 SSH 端口和来源，检查认证与监听，采集防火墙和开机保护证据。当前来源只是会话事实，不会自动成为白名单。禁 root、禁密码、公钥要求按项目加固基线检查；未指定 `--allow` 时不判定来源策略合规。无法恢复会话或多个端口无法唯一识别时，可补 `--user` / `--port`。
+
+需要比较明确的白名单和必须关闭的端口时，再填写：
 
 ```bash
 sudo bash stage0-audit.sh --port 2222 --user deploy \

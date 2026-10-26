@@ -45,6 +45,7 @@
 | CHK-005 | 检查 | 验证独立审计及未纳管诊断：22 项三阶段/原生集成回归和 17 项审计专项全部通过 | 2026-10-25 21:55 | 2026-10-25 21:55 | 已完成 | 合计 39 项，无跳过；包含真实 nft JSON、v6only socket、原子替换/恢复和临时 systemd，使用隔离资源；不代表远端整机验收。见 plans/checkpoints/2026-10-25-independent-audit-implementation.md。 |
 | CHK-006 | 检查 | 复核 Build0092 后的工作区一致性：重命名入口、独立审计、README、测试、上传集合与行尾 | 2026-10-25 23:34 | 2026-10-25 23:34 | 已完成 | 七个 Bash 入口 bash -n 与 ShellCheck -S warning 通过；`python3 tests/run_tests.py --integration`（WSL root）41 项全部通过、无跳过；上传脚本 dry-run 列出 8 个文件且未执行远端动作。发现并修复 `CLAUDE.md` 8 个、`task-list.md` 78 个 CRLF，统一为 LF；刷新 Git 索引过期 stat 缓存后内容未变。Markdown 表格/围栏/反引号/本地链接检查通过；工作区仍有未提交的新文件，未执行提交或推送。 |
 | CHK-007 | 检查 | 复核 Build0122 提交 6b1102e 后的工作区、远端、回归与台账一致性 | 2026-10-26 07:15 | 2026-10-26 07:15 | 已完成 | HEAD 与 origin/main 同为 `6b1102e`；41 项回归（24 项三阶段/原生集成 + 17 项审计）、七个 Bash 入口 `bash -n`/ShellCheck、上传 dry-run 8 文件、Markdown 门禁（15 文件/7 表/38 ID）全部通过；修复 `task-list.md` 工作区 80 处 CRLF（HEAD 为 LF）后内容散列不变；未发现代码或文档缺陷。远端推送见 [[OPS-010]]。 |
+| CHK-008 | 检查 | 在 fenix-jdcloud-1 的真实普通账户 SSH/sudo 会话执行无参数 stage0 现状审计 | 2026-10-26 10:12 | - | 进行中 | 用户已授权远端执行；SSH 密钥登录成功。sudo -n 提示需要密码，已打开交互 PowerShell 终端供用户直接输入；结果将保存在远端 ~/ssh-apply/stage0-audit-20261026.json 与 .exit，待读取分析，不把尚未执行视为审计通过。 |
 
 ## 测试数据
 
@@ -53,6 +54,7 @@
 | TST-001 | 开发 | 建立 tests 回归脚本和 PowerShell/WSL 入口，覆盖九项审查问题及既有边界 | 2026-10-25 14:51 | 2026-10-25 14:51 | 已完成 | tests/test_regressions.py、tests/run_tests.ps1、tests/README.md；19 项通过，其中三项为真实 nft/systemd 隔离测试。 |
 | TST-002 | 检查 | 验证重命名入口兼容、审计参数/退出码透传及稳定事务阶段标识 | 2026-10-25 22:24 | 2026-10-25 22:24 | 已完成 | 41 项回归全部通过（24 项三阶段/原生集成及 17 项审计专项）；七个 Bash 入口 bash -n 和 ShellCheck 通过。检查点见 plans/checkpoints/2026-10-25-script-names.md。 |
 | TST-003 | 开发 | 适配内嵌审计测试加载，新增四工作文件空目录运行回归 | 2026-10-26 07:48 | 2026-10-26 07:48 | 已完成 | tests/audit_source.py 仅供测试；25 项三阶段/原生集成 + 17 项审计专项共 42 项通过，无跳过；七个 Bash 入口语法/ShellCheck、参数和退出码保持通过。 |
+| TST-004 | 检查 | 新增 12 项默认现状检查回归并完成 54 项隔离验证 | 2026-10-26 10:07 | 2026-10-26 10:07 | 已完成 | 25 项三阶段/原生集成加 29 项审计专项全部通过，无跳过；包括语法/ShellCheck、真实 nft、socket 与 systemd 隔离验证；不替代远端真实会话和整机验收。 |
 
 ## 文档维护
 
@@ -62,6 +64,7 @@
 | DOC-002 | 文档 | 补充独立只读审计使用说明、支持范围、统一测试入口和实施检查点 | 2026-10-25 21:55 | 2026-10-25 21:55 | 已完成 | plans/AUDIT-EXISTING.md、plans/DESIGN.md、tests/README.md 与 checkpoints 已更新；明确未知项、旧方案保持和未执行远端操作。 |
 | DOC-003 | 文档 | 新增简洁的英文/中文双语 README，顶部语言跳转，说明四阶段职责、审计与部署流程及验证边界 | 2026-10-25 22:49 | 2026-10-25 22:49 | 已完成 | 英文在前、中文在后，包含普通用户 sudo、外部新会话确认、重启验证、回滚、测试与详细文档链接；语言锚点、文件链接和围栏检查通过。 |
 | DOC-004 | 文档 | 同步四工作文件部署说明，明确内嵌 Python 环境依赖与可选兼容文件 | 2026-10-26 07:48 | 2026-10-26 07:48 | 已完成 | 更新 README.md、plans/SCRIPT-NAMES.md、plans/AUDIT-EXISTING.md、tests/README.md 及检查点；历史报告保留原证据，不要求随部署分发测试辅助文件。 |
+| DOC-005 | 文档 | 同步无参数审计的双语流程、模式边界、测试说明和检查点 | 2026-10-26 10:07 | 2026-10-26 10:07 | 已完成 | README.md、plans/AUDIT-EXISTING.md、plans/SCRIPT-NAMES.md、tests/README.md 及 plans/checkpoints/2026-10-26-auto-inspect.md；两个本地上传器提示同步但仍不入库。远端旧版需重新上传后才能无参数执行。；后续已重新上传新版，见 [[OPS-016]]；已补充 Build0167 自动计数及远端审计等待 sudo 的交付边界。 |
 
 ## 功能开发
 
@@ -69,6 +72,8 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | DEV-001 | 开发 | 新增 `working-scripts/upload-ssh-apply-to-aliyun-1.sh`：从开发目录上传 stage1/2/3 到 `fenix-aliyun-1:~/ssh-apply/`，支持 `--dry-run`，上传前检查纯 LF，上传后逐文件比对 md5 | 2026-10-25 14:38 | 2026-10-25 14:38 | 已完成 | 仅本机使用，`working-scripts/` 已加入 .gitignore（见 [[OPS-005]]）。当前工作区脚本为新设计版本，上传前需先修完 [[BUG-001]]、[[BUG-002]]，否则会把必然回滚的版本推上服务器。 |
 | DEV-002 | 开发 | 增加独立于新版 state/policy 的只读现状审计，分别报告安全效果、管理归属、迁移准备和重启证据 | 2026-10-25 15:30 | 2026-10-25 21:55 | 已完成 | 方案见 [[CHK-004]]；接受满足目标的旧配置布局，显式传入审计策略；结果区分通过、不符合和证据不足，不修改状态、不自动接管、不放松 apply 的所有权/回滚保护。；已实现 audit.py：显式目标策略、独立四类报告、中文/JSON 和退出码 0/1/2；仅调用读取命令，不创建状态、不自动接管。39 项回归通过；文档见 plans/AUDIT-EXISTING.md。 |
+| DEV-003 | 开发 | 新增 working-scripts/upload-ssh-apply-to-jdcloud-1.sh：仿照 to-aliyun 上传器，把四个自包含运行文件上传到 fenix-jdcloud-1:~/ssh-apply，支持 --dry-run、纯 LF/语法预检与逐文件 md5 核对 | 2026-10-26 08:31 | 2026-10-26 08:31 | 已完成 | 仿照 [[DEV-001]] 的 to-aliyun 版本按 aliyun-1→jdcloud-1 同名替换生成；上传清单同为 stage0-audit.sh、stage1-newport.sh、stage2-harden.sh、stage3-reboot-check.sh 四个自包含运行文件；默认 REMOTE_HOST=fenix-jdcloud-1、REMOTE_DIR=ssh-apply。bash -n、ShellCheck -S warning、纯 LF 和可执行位通过，--help 与 --dry-run 显示正确目标且无 audit.py/旧入口字样；未执行真实上传。 |
+| DEV-004 | 开发 | stage0 默认自动识别当前 SSH 账户、端口和来源，保留可选目标策略审计 | 2026-10-26 10:07 | 2026-10-26 10:07 | 已完成 | 零参数 sudo 即可现状检查；SUDO_USER/SSH_CONNECTION 与祖先环境恢复；唯一监听回退，不猜测多端口；不自动生成白名单或关闭当前 22；填写 --allow 才比较完整 nft 策略。密码登录与无关 established 连接区分。未上传远端、未提交。；后续新版上传完成见 [[OPS-016]]，本次提交计数见 [[OPS-017]]；远端真实审计仍见 [[CHK-008]]。 |
 
 ## 配置运维
 
@@ -84,5 +89,10 @@
 | OPS-008 | 运维 | 按本次两项完成功能使用 build2 标题提交独立审计与诊断改进，说明采用编号且少于 300 字 | 2026-10-25 21:55 | 2026-10-25 21:55 | 已完成 | 本条随本次 commit 提交；功能计数为 [[DEV-002]] 和 [[ADJ-002]]，测试/文档不重复计数；提交前差异与台账检查通过；当时未推送，后续推送见 [[OPS-010]]。；用户已将上次版本确认并调整为 Build0092，当前基线提交 17b729b；后续从 92 累加，不再沿用原 build2 试行编号。 |
 | OPS-009 | 运维 | 按实际完成的小任务从 Build0092 累加至 Build0122 并提交阶段入口重构与双语 README | 2026-10-25 23:36 | 2026-10-25 23:36 | 已完成 | 计数明细：11 个生产函数修改、4 个入口新增/重构、8 个测试函数、7 份文档，共 30 项；同一对象不重复计数，台账/提交/忽略目录不额外增加 build。41 项回归及 README 链接检查通过，编号说明采用 1.2.3. 且少于 300 字；明细见 plans/checkpoints/2026-10-25-script-names.md。本条随本次提交，当时未推送；后续推送见 [[OPS-010]]。 |
 | OPS-010 | 运维 | 补记 Build0092（17b729b）与 Build0122（6b1102e）推送 origin/main | 2026-10-25 22:06 | 2026-10-25 23:49 | 已完成 | 由其他会话执行；远端 reflog 分别显示 2026-10-25 22:06:38 和 23:49:50 的 update by push，本地与远端均指向对应提交；补齐 [[OPS-008]]/[[OPS-009]] 完成时「未推送」后的状态。 |
-| OPS-011 | 运维 | 在本地生成 ed25519 密钥对 fenix-jdcloud-1，并核对 Windows ACL | 2026-10-26 07:58 | 2026-10-26 07:58 | 已完成 | 使用原生 OpenSSH ssh-keygen 生成，无口令；私钥 ACL 无继承项且不含 CodexSandboxUsers，仅当前用户/SYSTEM/Administrators；公钥指纹 SHA256:yV+kTGAlqIpRg5l7at6di1QH/1m2L1VvEDbmqkxrP+4；未修改 ~/.ssh/config，未上传或部署。 |
+| OPS-011 | 运维 | 在本地生成 ed25519 密钥对 fenix-jdcloud-1，并核对 Windows ACL | 2026-10-26 07:58 | 2026-10-26 07:58 | 已完成 | 使用原生 OpenSSH ssh-keygen 生成，无口令；私钥 ACL 无继承项且不含 CodexSandboxUsers，仅当前用户/SYSTEM/Administrators；公钥指纹 SHA256:yV+kTGAlqIpRg5l7at6di1QH/1m2L1VvEDbmqkxrP+4；未修改 ~/.ssh/config；公钥安装与登录验证见 [[OPS-013]]。 |
+| OPS-013 | 运维 | 将 fenix-jdcloud-1 公钥安装到京东云 114.67.236.43 并验证密钥登录 | 2026-10-26 08:05 | 2026-10-26 08:05 | 已完成 | 承接 [[OPS-011]]；在 fenix 用户下写入 ~/.ssh/authorized_keys（目录 700、文件 600）；本机以 `ssh -i ~/.ssh/fenix-jdcloud-1 -o IdentitiesOnly=yes -p 22 fenix@114.67.236.43` 非交互验证成功，hostname 1763017675236、用户 fenix、HOME /home/fenix；新增本地 config 记录见 [[OPS-014]]；未部署项目文件。 |
+| OPS-014 | 运维 | 在本地 ~/.ssh/config 增加 fenix-jdcloud-1 主机记录 | 2026-10-26 08:07 | 2026-10-26 08:07 | 已完成 | 承接 [[OPS-013]]；仿照现有主机块配置 HostName 114.67.236.43、Port 22、User fenix、IdentityFile C:\Users\wangminle\.ssh\fenix-jdcloud-1、IdentitiesOnly yes 及 keepalive；`ssh -G` 解析正确，按别名非交互登录成功；修改前备份 config.bak-20261026-fenix-jdcloud-1。 |
 | OPS-012 | 运维 | 按实际小任务从 Build0122 累加至 Build0137 并提交四工作文件收敛 | 2026-10-26 08:00 | 2026-10-26 08:00 | 已完成 | 1 项入口重构、8 个测试/辅助函数、6 份文档，共 15 项；审计源码逐字搬移不重复计数。42 项回归全部通过；计数见 plans/checkpoints/2026-10-26-four-runtime-files.md。本条随提交记录，提交说明按 1.2.3. 且不超过 300 字；未推送。 |
+| OPS-015 | 运维 | 用 upload-ssh-apply-to-jdcloud-1.sh 上传四个自包含运行文件到 fenix-jdcloud-1:~/ssh-apply，并核对本地/远端 md5 与 python3 | 2026-10-26 09:46 | 2026-10-26 09:46 | 已完成 | 承接 [[DEV-003]]；上传到 fenix-jdcloud-1:~/ssh-apply，四个文件 md5 全部与本机一致：stage0 `5877e72e053d3f133d070eba06bac599`、stage1 `c3ae7153abc5fe4334a7391f20c88400`、stage2 `353996df4274443fda1e9d8f55b85ed2`、stage3 `95d5f13fc0623b401cfb22af29789f26`。远端复验目录 /home/fenix/ssh-apply、四文件均为 fenix 属主且可执行，/usr/bin/python3 为 3.12.3；未执行远端 apply 或审计。 |
+| OPS-016 | 运维 | 重新上传新版四个运行脚本到 fenix-jdcloud-1 并逐文件校验 MD5 | 2026-10-26 10:12 | 2026-10-26 10:12 | 已完成 | 本轮连接发现远端 stage0 仍为 5877e72e053d3f133d070eba06bac599，使用现有 upload-ssh-apply-to-jdcloud-1.sh 同步后为 1fb3a972cbc22ef63cc8e7224df002ed；stage1/2/3 分别为 c3ae7153abc5fe4334a7391f20c88400、353996df4274443fda1e9d8f55b85ed2、95d5f13fc0623b401cfb22af29789f26，全部与本地一致。未执行 apply 或更改 SSH/防火墙配置。 |
+| OPS-017 | 运维 | 自动统计 30 项已完成小任务，从 Build0137 累加至 Build0167 并提交无参数审计改进 | 2026-10-26 10:14 | 2026-10-26 10:14 | 已完成 | Python AST 对比得到 10 个生产函数、14 个测试/辅助函数，Git 文件清单得到 6 份文档，共 30 项；台账、提交、忽略目录和远端运维不额外计数。54 项回归已通过，本条随提交记录；说明按 1.2.3. 且少于 300 字，不推送。计数见 plans/checkpoints/2026-10-26-auto-inspect.md；CHK-008 仍待 sudo 验证。 |

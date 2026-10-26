@@ -51,6 +51,7 @@ class Policy:
     firewall_units: list = field(default_factory=list)
     sshd_config: str = "/etc/ssh/sshd_config"
     nft_table: str = "sshguard"
+    mode: str = "policy"
 
 
 def combine(checks):
@@ -364,7 +365,7 @@ class Auditor:
         self.checks, self.units = [], {}
         self.files, self.directives = [], []
         self.connection = None
-        self.report = {"schema": 1, "policy": asdict(policy), "read_only": True}
+        self.report = {"schema": 1, "policy": asdict(policy), "read_only": True, "mode": policy.mode, "observed": {}}
 
     def add(self, name, result, detail):
         self.checks.append(Check(name, result, detail))
@@ -421,9 +422,54 @@ class Auditor:
             client, client_port, local, local_port = value.split()
             ipaddress.ip_address(client)
             ipaddress.ip_address(local)
+            if not 1 <= int(client_port) <= 65535 or not 1 <= int(local_port) <= 65535:
+                raise EvidenceError("当前 SSH_CONNECTION 端口无效")
             self.connection = (client, int(client_port), local, int(local_port))
+            self.report["observed"]["connection"] = {"source": client, "source_port": int(client_port), "local": local, "port": int(local_port)}
+
+    def resolve_target(self):
+        origins = {"user": "explicit" if self.policy.user else "unknown", "port": "explicit" if self.policy.port else "unknown"}
+        if not self.policy.user:
+            for variable in ("SUDO_USER", "USER"):
+                candidate = os.environ.get(variable, "")
+                if candidate != "root" and re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", candidate):
+                    self.policy.user = candidate
+                    origins["user"] = variable
+                    break
+        if self.policy.port is None and self.connection:
+            self.policy.port = self.connection[3]
+            origins["port"] = "SSH_CONNECTION"
+        if self.policy.port is None:
+            candidates = set()
+            try:
+                for line in self.unit("ssh.socket").get("Listen", "").splitlines():
+                    if line.endswith(" (Stream)"):
+                        candidates.add(endpoint(line.rsplit(" (Stream)", 1)[0])[1])
+            except EvidenceError as exc:
+                self.report["observed"]["discovery_note"] = str(exc)
+            try:
+                # 配套服务可能不是 socket 激活；只采集有明确 sshd 归属的监听。
+                for line in self.system.run("ss", "-tlnpH").splitlines():
+                    words = line.split()
+                    if len(words) >= 5 and re.search(r'"sshd(?:-session)?"', line):
+                        candidates.add(endpoint(words[3])[1])
+            except EvidenceError as exc:
+                self.report["observed"]["discovery_note"] = str(exc)
+            candidates = {port for port in candidates if 1 <= port <= 65535}
+            self.report["observed"]["port_candidates"] = sorted(candidates)
+            if len(candidates) == 1:
+                self.policy.port = next(iter(candidates))
+                origins["port"] = "unique-live-listener"
+        self.report["target_origin"] = origins
+        self.report["policy"] = asdict(self.policy)
+        if not self.policy.user or self.policy.port is None:
+            self.add("检查对象识别", UNKNOWN, "无法唯一识别普通管理账户/SSH 端口；其余可采集项继续，必要时补 --user 或 --port")
+        if self.policy.port in self.policy.closed_ports:
+            self.add("检查目标冲突", FAIL, "当前识别的目标端口同时声明为关闭；请核对 --closed-port")
 
     def authentication(self):
+        if not self.policy.user or self.policy.port is None:
+            raise EvidenceError("认证上下文需要明确的账户和端口，当前无法自动识别")
         uid = self.system.run("id", "-u", self.policy.user).strip()
         if not uid.isdigit() or int(uid) == 0:
             self.add("管理账户", FAIL, "目标账户必须是非 root、非 UID 0 账户")
@@ -445,6 +491,8 @@ class Auditor:
                     key, sep, value = line.partition(" ")
                     if sep:
                         options[key] = value.strip()
+                shown = ("permitrootlogin", "passwordauthentication", "kbdinteractiveauthentication", "pubkeyauthentication", "authenticationmethods", "hostbasedauthentication", "gssapiauthentication")
+                self.report["observed"].setdefault("authentication", []).append({"user": user, "source": source, "values": {key: options[key] for key in shown if key in options}})
                 expected = {"permitrootlogin": "no", "passwordauthentication": "no", "kbdinteractiveauthentication": "no", "pubkeyauthentication": "yes"}
                 missing = [key for key in expected if key not in options]
                 wrong = [f"{key}={options[key]}" for key, value in expected.items() if key in options and options[key] != value]
@@ -465,17 +513,22 @@ class Auditor:
     def listeners(self):
         output = self.system.run("ss", "-tlnpH")
         found, extras = [], []
+        self.report["observed"]["ssh_listeners"] = []
         for line in output.splitlines():
             words = line.split()
             if len(words) < 5:
                 raise EvidenceError("无法完整解析 ss 监听输出")
             host, port = endpoint(words[3])
+            if re.search(r'"sshd(?:-session)?"', line) or port == self.policy.port and '"systemd"' in line:
+                self.report["observed"]["ssh_listeners"].append(words[3])
             if port in self.policy.closed_ports:
                 self.add(f"禁止端口 {port}", FAIL, f"仍有监听 {words[3]}")
             if port == self.policy.port:
                 found.append((host, line))
             elif re.search(r'"sshd(?:-session)?"', line):
                 extras.append(words[3])
+        if self.policy.port is None:
+            raise EvidenceError("已采集实际 SSH 监听；多端口或无唯一入口，未任意选择一个作为目标")
         if not found:
             self.add("目标端口监听", FAIL, f"TCP/{self.policy.port} 没有监听")
         elif not all(re.search(r'"(?:sshd(?:-session)?|systemd)"', line) for _, line in found):
@@ -486,11 +539,12 @@ class Auditor:
             if not any(item.name == f"禁止端口 {port}" for item in self.checks):
                 self.add(f"禁止端口 {port}", PASS, "无 TCP 监听")
         if extras:
-            self.add("额外 SSH 端口", FAIL, ", ".join(extras))
+            self.add("其他 SSH 端口", PASS if self.policy.mode == "inspect" else FAIL,
+                     ", ".join(extras) + ("；现状模式只展示，未声明这些端口必须关闭" if self.policy.mode == "inspect" else ""))
         socket = self.unit("ssh.socket")
         ports = {endpoint(line.rsplit(" (Stream)", 1)[0])[1] for line in socket.get("Listen", "").splitlines() if line.endswith(" (Stream)")}
         if ports - {self.policy.port}:
-            self.add("SSH socket 端口", FAIL, f"有效 socket 还有其他端口：{sorted(ports)}")
+            self.add("SSH socket 端口", PASS if self.policy.mode == "inspect" else FAIL, f"有效 socket 端口：{sorted(ports)}")
         families, dual_unknown = set(), False
         for version in (4, 6):
             family_output = self.system.run("ss", f"-{version}", "-tlnpeH")
@@ -511,11 +565,35 @@ class Auditor:
         missing = required - families
         result = UNKNOWN if missing == {4} and dual_unknown else FAIL if missing else PASS
         self.add("来源地址族监听", result,
-                 f"策略需要 IPv{sorted(required)}，内核证据覆盖 IPv{sorted(families)}；用 ss 的 v6only 标记核对双栈，不由当前 sysctl 推断已创建 socket")
+                 (f"策略需要 IPv{sorted(required)}，" if required else "未声明来源地址族目标，") + f"内核证据覆盖 IPv{sorted(families)}；用 ss 的 v6only 标记核对双栈，不由当前 sysctl 推断已创建 socket")
 
     def firewall(self):
         data = json.loads(self.system.run("nft", "-j", "-s", "list", "ruleset"))
-        self.checks.append(firewall_policy(data, self.policy))
+        if self.policy.mode == "policy":
+            if self.policy.port is None:
+                raise EvidenceError("白名单比较需要明确目标端口")
+            self.checks.append(firewall_policy(data, self.policy))
+            return
+        objects = data.get("nftables")
+        if not isinstance(objects, list):
+            raise EvidenceError("nft JSON 不完整")
+        tables = [f"{item['table'].get('family')} {item['table'].get('name')}" for item in objects if isinstance(item.get("table"), dict)]
+        chains = [item["chain"] for item in objects if isinstance(item.get("chain"), dict) and item["chain"].get("hook") == "input"]
+        sources, rule_count, unsupported = set(), 0, 0
+        for item in objects:
+            obj = item.get("rule")
+            if not isinstance(obj, dict) or obj.get("table") != self.policy.nft_table or obj.get("family") != "inet":
+                continue
+            rule_count += 1
+            try:
+                predicates, verdict = parse_rule(obj["expr"])
+                if verdict == "accept":
+                    sources.update(str(net) for key, nets in predicates if key == "source" for net in nets)
+            except (EvidenceError, ValueError, TypeError, KeyError):
+                unsupported += 1
+        self.report["observed"]["firewall"] = {"tables": tables, "input_chains": [{key: chain.get(key) for key in ("family", "table", "name", "prio", "policy")} for chain in chains],
+                                                "selected_table_rule_count": rule_count, "accept_source_literals": sorted(sources), "unparsed_rules": unsupported}
+        self.add("防火墙现状采集", PASS, f"读取到 {len(tables)} 张 nft 表、{len(chains)} 个 input 链；未指定 --allow，仅展示现状，不判定来源白名单合规")
 
     def persistence(self):
         socket = self.unit("ssh.socket")
@@ -615,7 +693,7 @@ class Auditor:
             raise EvidenceError("当前连接不是目标端口的外部会话")
         links = json.loads(self.system.run("ip", "-j", "address", "show"))
         locals_ = {ipaddress.ip_address(item["local"]) for link in links for item in link.get("addr_info", [])}
-        if ipaddress.ip_address(client) in locals_ or not any(ipaddress.ip_address(client) in ipaddress.ip_network(net) for net in self.policy.allows):
+        if ipaddress.ip_address(client) in locals_ or self.policy.mode == "policy" and not any(ipaddress.ip_address(client) in ipaddress.ip_network(net) for net in self.policy.allows):
             raise EvidenceError("当前来源是本机自连或不在目标白名单，不能证明目标外部通道")
         if os.environ.get("SUDO_USER") != self.policy.user:
             raise EvidenceError("请由目标用户在其 SSH 会话中直接 sudo 执行")
@@ -637,17 +715,19 @@ class Auditor:
         since = min(self.system.process_start(int(item)) for item in candidates)
         boot = self.system.read("/proc/sys/kernel/random/boot_id").strip().replace("-", "")
         logs = self.system.run("journalctl", "-b", "-u", "ssh", "-u", "sshd", "-u", "ssh@*", "--since", f"@{since:.6f}", "--no-pager", "-o", "json")
-        pattern = re.compile(r"^Accepted publickey for (\S+) from (\S+) port (\d+)(?:\s|$)")
+        pattern = re.compile(r"^Accepted (\S+) for (\S+) from (\S+) port (\d+)(?:\s|$)")
         for line in logs.splitlines():
             event = json.loads(line)
             if event.get("_BOOT_ID") != boot or str(event.get("_PID")) not in ancestors:
                 continue
             message = event.get("MESSAGE")
             match = pattern.search(message) if isinstance(message, str) else None
-            if match and match[1] == self.policy.user and ipaddress.ip_address(match[2]) == ipaddress.ip_address(client) and int(match[3]) == cp:
-                self.add("当前公钥与 sudo", PASS, "同 boot 的公钥日志、存活四元组和当前 sudo 进程链匹配；只证明本条通道")
+            if match and match[2] == self.policy.user and ipaddress.ip_address(match[3]) == ipaddress.ip_address(client) and int(match[4]) == cp:
+                self.report["observed"]["login_method"] = match[1]
+                self.add("当前认证与 sudo", PASS if match[1] == "publickey" else FAIL,
+                         f"当前会话认证方式={match[1]}；同 boot 日志、存活四元组和 sudo 进程链匹配；基线要求公钥")
                 return
-        raise EvidenceError("没有与当前连接进程链匹配的公钥日志")
+        raise EvidenceError("没有与当前连接进程链匹配的认证成功日志；不把其他 established 连接当作已登录证据")
 
     def migration(self):
         blockers = []
@@ -690,6 +770,7 @@ class Auditor:
 
     def audit(self):
         self.collect("会话采集", self.find_connection)
+        self.collect("自动识别", self.resolve_target)
         try:
             self.ownership()
         except (EvidenceError, ValueError, KeyError, TypeError) as exc:
@@ -712,15 +793,16 @@ class Auditor:
         self.report.setdefault("migration", {"status": "not-assessed", "blockers": [], "detail": "证据不足，未评估接管准备"})
         self.report["checks"] = [asdict(item) for item in self.checks]
         self.report["security_result"] = combine(self.checks)
-        self.report["scope"] = "本机显式策略与当前通道；不代替云安全组、拒绝来源外测或整机重启验收"
+        self.report["policy_result"] = self.report["security_result"] if self.policy.mode == "policy" else UNKNOWN
+        self.report["scope"] = ("本机显式策略与当前通道" if self.policy.mode == "policy" else "当前 SSH 现状及禁 root/禁密码/公钥基线；未指定来源策略，白名单合规未评估") + "；不代替云安全组、拒绝来源外测或整机重启验收"
         return self.report
 
 
 def arguments(argv=None):
-    parser = argparse.ArgumentParser(prog="stage0-audit.sh", description=__doc__, epilog="退出码：0=当前审计范围通过，1=明确不符合，2=证据/权限/支持范围不足。归属与重启记录另列。")
-    parser.add_argument("--port", type=int, required=True, help="目标 SSH 端口")
-    parser.add_argument("--user", required=True, help="目标非 root 管理用户")
-    parser.add_argument("--allow", action="append", required=True, help="预期来源 CIDR，可重复")
+    parser = argparse.ArgumentParser(prog="stage0-audit.sh", description=__doc__, epilog="直接 sudo bash stage0-audit.sh 自动检查当前 SSH；--allow 声明目标策略后才比较白名单。退出码：0=本次范围通过，1=不符合基线/目标，2=证据不足。")
+    parser.add_argument("--port", type=int, help="目标端口；默认从当前 SSH_CONNECTION 自动识别，无会话时只接受唯一监听")
+    parser.add_argument("--user", help="目标管理账户；默认从 SUDO_USER 自动识别")
+    parser.add_argument("--allow", action="append", help="可选的预期来源 CIDR；填写后进入策略比较模式，不自动把当前 IP 当白名单")
     parser.add_argument("--closed-port", action="append", type=int, default=[], help="必须关闭的 TCP 端口，可重复；不从 --old-port 推断")
     parser.add_argument("--source", action="append", default=[], help="补充 sshd 上下文来源 IP，可重复；Match 全覆盖仍需另验")
     parser.add_argument("--firewall-unit", action="append", default=[], help="实际防火墙加载服务，可重复；默认识别新旧服务名")
@@ -728,9 +810,9 @@ def arguments(argv=None):
     parser.add_argument("--nft-table", default="sshguard", help="实际 inet 表名")
     parser.add_argument("--format", choices=("text", "json"), default="text")
     options = parser.parse_args(argv)
-    if not 1 <= options.port <= 65535 or any(not 1 <= port <= 65535 or port == options.port for port in options.closed_port):
+    if options.port is not None and not 1 <= options.port <= 65535 or any(not 1 <= port <= 65535 or port == options.port for port in options.closed_port):
         parser.error("端口范围错误，或目标端口同时声明为关闭")
-    if options.user == "root" or not re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", options.user):
+    if options.user is not None and (options.user == "root" or not re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", options.user)):
         parser.error("--user 必须是合法的非 root 账户")
     if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_-]*", options.nft_table):
         parser.error("非法 nft 表名")
@@ -739,29 +821,38 @@ def arguments(argv=None):
     if not options.sshd_config.startswith("/"):
         parser.error("--sshd-config 必须是绝对路径")
     try:
-        allows = sorted({str(ipaddress.ip_network(item, strict=True)) for item in options.allow})
+        allows = sorted({str(ipaddress.ip_network(item, strict=True)) for item in options.allow or []})
         sources = [str(ipaddress.ip_address(item)) for item in options.source]
     except ValueError as exc:
         parser.error(str(exc))
     policy = Policy(options.port, options.user, allows, sorted(set(options.closed_port)), sources,
-                    options.firewall_unit, options.sshd_config, options.nft_table)
+                    options.firewall_unit, options.sshd_config, options.nft_table, "policy" if options.allow else "inspect")
     return options, policy
 
 
 def main(argv=None):
     options, policy = arguments(argv)
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
-        report = {"schema": 1, "read_only": True, "security_result": UNKNOWN,
+        report = {"schema": 1, "read_only": True, "mode": policy.mode, "policy": asdict(policy), "security_result": UNKNOWN, "policy_result": UNKNOWN,
                   "checks": [asdict(Check("完整读取权限", UNKNOWN, "请以目标普通用户登录后 sudo bash stage0-audit.sh；不必开放 root SSH 登录"))]}
     else:
         report = Auditor(policy).audit()
     if options.format == "json":
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
-        print("SSH 独立只读审计（不写状态、不接管配置）")
+        inspect = report.get("mode") == "inspect"
+        print("SSH 只读现状检查（自动识别，不写状态）" if inspect else "SSH 只读目标策略审计（不写状态、不接管配置）")
+        target = report.get("policy", {})
+        current = report.get("observed", {}).get("connection", {})
+        print(f"检查对象：账户={target.get('user') or '未识别'}，端口={target.get('port') or '未识别'}，当前登录来源={current.get('source', '未识别')}")
         for item in report["checks"]:
             print(f"[{LABELS[item['result']]}] {item['name']}：{item['detail']}")
-        print("安全效果：" + LABELS[report["security_result"]])
+        print(("现状基线结果：" if inspect else "目标策略结果：") + LABELS[report["security_result"]])
+        if inspect:
+            print("来源白名单目标：未指定，未判定合规；当前登录来源仅作事实，不自动生成 --allow")
+            firewall = report.get("observed", {}).get("firewall", {})
+            print("观察到的 nft 表：" + (", ".join(firewall.get("tables", [])) or "无/未采集"))
+            print("观察到的 accept 来源（非完整可达性证明）：" + (", ".join(firewall.get("accept_source_literals", [])) or "无/无法提取"))
         print("管理归属：" + report.get("ownership", {}).get("detail", "未采集"))
         migration = report.get("migration", {})
         print("迁移准备：" + ("存在阻断" if migration.get("status") == "blocked" else "未评估/未授权迁移"))

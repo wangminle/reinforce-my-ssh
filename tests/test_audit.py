@@ -90,6 +90,7 @@ class FakeSystem:
         self.bad_graph = False
         self.denied = None
         self.ipv6_only = False
+        self.login_method = "publickey"
 
     def read(self, path):
         if path not in self.files:
@@ -138,7 +139,7 @@ class FakeSystem:
                 return ""
             return 'LISTEN 0 128 0.0.0.0:2222 0.0.0.0:* users:(("sshd",pid=10,fd=4))\n'
         if args[0] == "journalctl":
-            return json.dumps({"_BOOT_ID": "1" * 32, "_PID": "9999" if self.bad_log_pid else "123", "MESSAGE": "Accepted publickey for deploy from 203.0.113.7 port 50000 ssh2"}) + "\n"
+            return json.dumps({"_BOOT_ID": "1" * 32, "_PID": "9999" if self.bad_log_pid else "123", "MESSAGE": f"Accepted {self.login_method} for deploy from 203.0.113.7 port 50000 ssh2"}) + "\n"
         raise AssertionError("非预期命令：" + str(args))
 
 
@@ -152,6 +153,123 @@ class AuditTests(unittest.TestCase):
 
     def report(self):
         return audit.Auditor(self.policy, self.system).audit()
+
+    def test_no_arguments_inspect_current_session_without_learning_policy(self):
+        _, policy = audit.arguments([])
+        before = copy.deepcopy(self.system.files)
+        report = audit.Auditor(policy, self.system).audit()
+        self.assertEqual(report["security_result"], audit.PASS, report)
+        self.assertEqual(report["policy_result"], audit.UNKNOWN)
+        self.assertEqual(report["mode"], "inspect")
+        self.assertEqual((policy.user, policy.port, policy.allows, policy.closed_ports), ("deploy", 2222, [], []))
+        self.assertEqual(report["observed"]["connection"]["source"], "203.0.113.7")
+        self.assertEqual(report["observed"]["login_method"], "publickey")
+        self.assertEqual(report["target_origin"], {"user": "SUDO_USER", "port": "SSH_CONNECTION"})
+        self.assertEqual(before, self.system.files)
+
+    def test_sudo_environment_recovers_connection_from_ancestor(self):
+        del os.environ["SSH_CONNECTION"]
+        self.system.files[f"/proc/{os.getpid()}/environ"] = "USER=root\0"
+        self.system.files["/proc/123/environ"] = "SSH_CONNECTION=203.0.113.7 50000 192.0.2.10 2222\0"
+        _, policy = audit.arguments([])
+        report = audit.Auditor(policy, self.system).audit()
+        self.assertEqual(report["security_result"], audit.PASS, report)
+        self.assertEqual(policy.port, 2222)
+
+    def test_port_22_is_not_implicitly_required_closed(self):
+        os.environ["SSH_CONNECTION"] = "203.0.113.7 50000 192.0.2.10 22"
+        _, policy = audit.arguments([])
+        auditor = audit.Auditor(policy, self.system)
+        auditor.find_connection()
+        auditor.resolve_target()
+        self.assertEqual((policy.port, policy.closed_ports), (22, []))
+
+    def test_explicit_target_wins_and_allow_enables_policy_comparison(self):
+        _, policy = audit.arguments(["--port", "2200", "--user", "other", "--allow", "203.0.113.0/24"])
+        auditor = audit.Auditor(policy, self.system)
+        auditor.find_connection()
+        auditor.resolve_target()
+        self.assertEqual((policy.port, policy.user, policy.mode), (2200, "other", "policy"))
+        self.assertEqual(auditor.report["target_origin"], {"user": "explicit", "port": "explicit"})
+        _, policy = audit.arguments(["--allow", "203.0.113.0/24", "--closed-port", "22"])
+        report = audit.Auditor(policy, self.system).audit()
+        self.assertEqual(report["policy_result"], audit.PASS, report)
+
+    def test_unique_listener_fallback_does_not_invent_session_evidence(self):
+        del os.environ["SSH_CONNECTION"]
+        _, policy = audit.arguments([])
+        report = audit.Auditor(policy, self.system).audit()
+        self.assertEqual(policy.port, 2222)
+        self.assertEqual(report["security_result"], audit.UNKNOWN)
+        self.assertNotIn("login_method", report["observed"])
+        self.assertEqual(report["target_origin"]["port"], "unique-live-listener")
+
+    def test_ambiguous_listener_and_root_console_do_not_guess_target(self):
+        del os.environ["SSH_CONNECTION"]
+        os.environ["SUDO_USER"] = "root"
+        os.environ["USER"] = "root"
+        self.system.units["ssh.socket"]["Listen"] = "0.0.0.0:22 (Stream)"
+        _, policy = audit.arguments([])
+        report = audit.Auditor(policy, self.system).audit()
+        self.assertIsNone(policy.port)
+        self.assertIsNone(policy.user)
+        self.assertEqual(report["security_result"], audit.UNKNOWN)
+        self.assertEqual(report["observed"]["port_candidates"], [22, 2222])
+
+    def test_inspect_firewall_collects_facts_without_whitelist_verdict(self):
+        self.system.nft["nftables"].insert(3, rule(PORT, {"accept": None}))
+        _, policy = audit.arguments([])
+        report = audit.Auditor(policy, self.system).audit()
+        self.assertEqual(report["policy_result"], audit.UNKNOWN)
+        self.assertEqual(report["observed"]["firewall"]["accept_source_literals"], ["203.0.113.0/24"])
+        self.assertFalse(any(item["name"] == "来源白名单" for item in report["checks"]))
+        self.assertEqual(self.report()["security_result"], audit.FAIL)
+
+    def test_password_login_is_reported_and_unrelated_log_is_not_evidence(self):
+        _, policy = audit.arguments([])
+        self.system.login_method = "password"
+        report = audit.Auditor(policy, self.system).audit()
+        self.assertEqual(report["observed"]["login_method"], "password")
+        self.assertEqual(report["security_result"], audit.FAIL)
+        self.system.bad_log_pid = True
+        report = audit.Auditor(policy, self.system).audit()
+        self.assertNotIn("login_method", report["observed"])
+        self.assertEqual(report["security_result"], audit.UNKNOWN)
+
+    def test_no_arguments_text_json_and_nonroot_have_clear_scope(self):
+        for fmt in ("text", "json"):
+            stdout = io.StringIO()
+            with patch.object(audit.os, "geteuid", return_value=0, create=True), patch.object(audit, "System", return_value=self.system), contextlib.redirect_stdout(stdout):
+                self.assertEqual(audit.main(["--format", fmt]), 0)
+            if fmt == "text":
+                self.assertIn("账户=deploy，端口=2222", stdout.getvalue())
+                self.assertIn("来源白名单目标：未指定，未判定合规", stdout.getvalue())
+            else:
+                self.assertEqual(json.loads(stdout.getvalue())["policy_result"], audit.UNKNOWN)
+        with patch.object(audit.os, "geteuid", return_value=1000, create=True), contextlib.redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(audit.main([]), 2)
+        self.assertIn("SSH 只读现状检查", stdout.getvalue())
+        self.assertIn("sudo bash stage0-audit.sh", stdout.getvalue())
+
+    def test_auto_detected_port_conflicting_with_closed_port_is_flagged(self):
+        _, policy = audit.arguments(["--closed-port", "2222"])
+        report = audit.Auditor(policy, self.system).audit()
+        self.assertTrue(any(item["name"] == "检查目标冲突" and item["result"] == audit.FAIL for item in report["checks"]))
+
+    def test_discovery_reads_live_listener_when_systemctl_is_unavailable(self):
+        del os.environ["SSH_CONNECTION"]
+        self.system.denied = "systemctl"
+        _, policy = audit.arguments([])
+        report = audit.Auditor(policy, self.system).audit()
+        self.assertEqual(policy.port, 2222)
+        self.assertEqual(report["security_result"], audit.UNKNOWN)
+
+    def test_extra_socket_port_is_observation_only_in_inspect_mode(self):
+        self.system.units["ssh.socket"]["Listen"] = "0.0.0.0:22 (Stream)"
+        _, policy = audit.arguments([])
+        inspected = audit.Auditor(policy, self.system).audit()
+        self.assertEqual(inspected["security_result"], audit.PASS, inspected)
+        self.assertEqual(self.report()["security_result"], audit.FAIL)
 
     def test_safe_legacy_is_not_failed_for_missing_new_state(self):
         before = copy.deepcopy(self.system.files)
