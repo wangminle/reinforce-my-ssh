@@ -610,12 +610,21 @@ for i,p in enumerate(paths):
 tmp=out+'/manifest.tmp'; json.dump({'files':entries},open(tmp,'w'),indent=2); os.replace(tmp,out+'/manifest.json')
 PY
   : > "$TX_DIR/units.conf" || die "无法记录单元状态"
-  local u en ac
+  local u en ac tables
   for u in ssh.socket ssh.service "$FW_NAME"; do
     en=$(systemctl is-enabled "$u" 2>/dev/null || true); ac=$(systemctl is-active "$u" 2>/dev/null || true)
-    printf '%s|%s|%s\n' "$u" "${en:-unknown}" "${ac:-unknown}" >> "$TX_DIR/units.conf" || die "单元状态写入失败"
+    case $en in
+      enabled|enabled-runtime|disabled|masked|not-found|static|indirect|generated|transient) ;;
+      *) die "无法记录 $u 的 enabled 状态: ${en:-空}" ;;
+    esac
+    case $ac in
+      active|inactive|failed) ;;
+      *) die "无法记录 $u 的 active 状态: ${ac:-空}" ;;
+    esac
+    printf '%s|%s|%s\n' "$u" "$en" "$ac" >> "$TX_DIR/units.conf" || die "单元状态写入失败"
   done
-  if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+  tables=$(nft list tables 2>/dev/null) || die "无法枚举 nft 表，拒绝推断原表不存在"
+  if grep -Fqx "table inet $NFT_TABLE" <<< "$tables"; then
     nft -s -y list table inet "$NFT_TABLE" > "$TX_DIR/runtime.nft" || die "内核 nft 备份失败"
   else
     : > "$TX_DIR/NFT_ABSENT" || die "nft 状态记录失败"

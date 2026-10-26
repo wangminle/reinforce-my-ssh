@@ -25,7 +25,7 @@ Windows PowerShell 可使用：
 
 输出可保存到 `plans/checkpoints/`。统一入口依次执行 `test_regressions.py` 和 `test_audit.py`，保留各自测试数量及跳过项。
 
-三阶段回归覆盖监听解析、双栈绑定、SSH 主进程/socket 切换顺序、三个阶段 nft 规范化、额外规则拒绝、原子加载失败、完整表恢复、父策略/摘要恢复、失败不提交、早期自动恢复安装失败、迟到任务清理、CIDR 等价写法、journal cursor/boot/PID 关联和同 boot 验证拒绝。
+三阶段回归覆盖监听解析、双栈绑定、SSH 主进程/socket 切换顺序、三个阶段 nft 规范化、额外规则拒绝、原子加载失败、完整表恢复、父策略/摘要恢复、失败不提交、早期自动恢复安装失败、迟到任务清理、CIDR 等价写法、journal cursor/boot/PID 关联和同 boot 验证拒绝。事务备份门禁另覆盖 nft 表枚举/备份失败，以及 systemctl active/enabled 状态为空或不受支持时在 pending 前拒绝。原生 nft 命名空间测试还核验带 table 前缀的真实枚举输出、目标表完整备份，以及不同 family/相似表名不被误认。
 
 独立审计回归覆盖安全旧配置无需新版状态即可通过、不安全受管配置仍失败、Match/权限/复杂 nft/加载器未知分类、规则顺序、boot 记录一致性与漂移、非法写入命令拒绝、上传提示。集成模式另用真实 nft JSON 和真实 v6only socket 验证审计解析。
 

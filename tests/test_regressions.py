@@ -284,6 +284,54 @@ preflight() { echo WRONG; exit 9; }
 do_apply
 ''', ok=False)
 
+    def tx_begin_failure(self, stage, mode):
+        return self.bash(stage, r'''
+SELF=stage-test.sh; STATE_ROOT=$WORK/state; POLICY_FILE=$STATE_ROOT/policy.conf
+STATE_FILE=$STATE_ROOT/state.conf; TX_ROOT=$STATE_ROOT/transactions
+STATE_STAGE=candidate-ready; STATE_TX=parent; STATE_CONFIG_SHA=parentsha
+PORT=2222; OLD_PORT=22; USERNAME=deploy; ALLOWS=(203.0.113.0/24)
+MANAGED_FILES=()
+rm -rf "$STATE_ROOT"; mkdir -p "$STATE_ROOT"; printf 'PORT=2222\n' > "$POLICY_FILE"
+nft() {
+  [[ $MODE != inventory ]] || return 1
+  if [[ $* == 'list tables' ]]; then
+    [[ $MODE != backup ]] || printf 'table inet sshguard\n'
+    return 0
+  fi
+  return 1
+}
+ss() { return 0; }
+systemctl() {
+  if [[ $1 == is-enabled ]]; then
+    [[ $MODE != enabled ]] || { printf 'linked\n'; return 0; }
+    printf 'enabled\n'; return 0
+  fi
+  if [[ $1 == is-active ]]; then
+    [[ $MODE != active ]] || return 1
+    printf 'active\n'; return 0
+  fi
+  return 0
+}
+tx_begin test-stage pending
+''', ok=False, env={"MODE": mode})
+
+    def test_tx_begin_rejects_nft_inventory_failures(self):
+        messages = {"inventory": "无法枚举 nft 表", "backup": "内核 nft 备份失败"}
+        for stage in (1, 2):
+            for mode, message in messages.items():
+                with self.subTest(stage=stage, mode=mode):
+                    output = self.tx_begin_failure(stage, mode)
+                    self.assertIn(message, output)
+                    self.assertFalse((self.work / "state" / "state.conf").exists())
+
+    def test_tx_begin_rejects_unsupported_unit_states(self):
+        for stage in (1, 2):
+            for mode in ("active", "enabled"):
+                with self.subTest(stage=stage, mode=mode):
+                    output = self.tx_begin_failure(stage, mode)
+                    self.assertIn(f"ssh.socket 的 {mode} 状态", output)
+                    self.assertFalse((self.work / "state" / "state.conf").exists())
+
     def test_initial_arm_failure_rolls_back_to_unconfigured(self):
         self.bash(1, r'''
 SELF=stage1.sh; STATE_ROOT=$WORK/state; POLICY_FILE=$STATE_ROOT/policy.conf
@@ -303,7 +351,7 @@ systemctl() {
     *) return 0;;
   esac
 }
-nft() { [[ $1 != list ]]; }; sshd() { return 0; }; ss() { return 0; }
+nft() { [[ $* == 'list tables' ]] || [[ $1 != list ]]; }; sshd() { return 0; }; ss() { return 0; }
 (do_apply) && exit 1
 grep -qx 'STAGE=unconfigured' "$STATE_FILE" || exit 2
 test ! -e "$POLICY_FILE" || exit 3
@@ -419,6 +467,37 @@ tx_restore demo 0
             self.assertEqual((tx / "ROLLED_BACK").exists(), not failure)
             if not failure:
                 self.assertIn(f"CONFIG_SHA={digest}", (self.work / "state.conf").read_text())
+
+    def test_native_tx_begin_distinguishes_existing_and_absent_table(self):
+        if not INTEGRATION:
+            self.skipTest("需要 --integration：真实 nft 事务备份")
+        for stage in (1, 2):
+            with self.subTest(stage=stage):
+                self.bash(stage, r'''
+SELF=stage-test.sh; STATE_ROOT=$WORK/native-$CASE_STAGE
+POLICY_FILE=$STATE_ROOT/policy.conf; STATE_FILE=$STATE_ROOT/state.conf
+TX_ROOT=$STATE_ROOT/transactions; MANAGED_FILES=()
+STATE_STAGE=candidate-ready; STATE_TX=parent; STATE_CONFIG_SHA=parentsha
+PORT=2222; OLD_PORT=22; USERNAME=deploy; ALLOWS=(203.0.113.0/24)
+systemctl() {
+  case $1 in
+    is-enabled) printf 'disabled\n';;
+    is-active) printf 'inactive\n';;
+    *) return 1;;
+  esac
+}
+# 同名不同 family 和前缀相同的表都不能误认成目标表。
+nft add table ip sshguard || exit 1
+nft add table inet sshguard-other || exit 2
+tx_begin test-stage pending || exit 3
+test -f "$TX_DIR/NFT_ABSENT" && test ! -e "$TX_DIR/runtime.nft" || exit 4
+nft add table inet sshguard || exit 5
+nft add chain inet sshguard sentinel || exit 6
+tx_begin test-stage pending || exit 7
+test ! -e "$TX_DIR/NFT_ABSENT" && test -s "$TX_DIR/runtime.nft" || exit 8
+nft -s -y list table inet sshguard > "$WORK/expected-$CASE_STAGE.nft" || exit 9
+cmp -s "$TX_DIR/runtime.nft" "$WORK/expected-$CASE_STAGE.nft" || exit 10
+''', integration=True, env={"CASE_STAGE": str(stage)})
 
     def test_native_nft_all_stages_and_atomic_failure(self):
         if not INTEGRATION:

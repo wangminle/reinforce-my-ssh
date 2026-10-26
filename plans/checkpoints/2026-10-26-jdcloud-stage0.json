@@ -1,0 +1,152 @@
+{
+  "schema": 1,
+  "policy": {
+    "port": 22,
+    "user": "fenix",
+    "allows": [],
+    "closed_ports": [],
+    "sources": [],
+    "firewall_units": [],
+    "sshd_config": "/etc/ssh/sshd_config",
+    "nft_table": "sshguard",
+    "mode": "inspect"
+  },
+  "read_only": true,
+  "mode": "inspect",
+  "observed": {
+    "connection": {
+      "source": "120.244.186.124",
+      "source_port": 9599,
+      "local": "172.30.0.5",
+      "port": 22
+    },
+    "authentication": [
+      {
+        "user": "fenix",
+        "source": "120.244.186.124",
+        "values": {
+          "permitrootlogin": "yes",
+          "passwordauthentication": "yes",
+          "kbdinteractiveauthentication": "no",
+          "pubkeyauthentication": "yes",
+          "authenticationmethods": "any",
+          "hostbasedauthentication": "no",
+          "gssapiauthentication": "no"
+        }
+      },
+      {
+        "user": "root",
+        "source": "120.244.186.124",
+        "values": {
+          "permitrootlogin": "yes",
+          "passwordauthentication": "yes",
+          "kbdinteractiveauthentication": "no",
+          "pubkeyauthentication": "yes",
+          "authenticationmethods": "any",
+          "hostbasedauthentication": "no",
+          "gssapiauthentication": "no"
+        }
+      }
+    ],
+    "ssh_listeners": [
+      "0.0.0.0:22",
+      "[::]:22"
+    ],
+    "firewall": {
+      "tables": [
+        "ip filter"
+      ],
+      "input_chains": [
+        {
+          "family": "ip",
+          "table": "filter",
+          "name": "INPUT",
+          "prio": 0,
+          "policy": "accept"
+        }
+      ],
+      "selected_table_rule_count": 0,
+      "accept_source_literals": [],
+      "unparsed_rules": 0
+    },
+    "login_method": "publickey"
+  },
+  "target_origin": {
+    "user": "SUDO_USER",
+    "port": "SSH_CONNECTION"
+  },
+  "ownership": {
+    "kind": "unmanaged",
+    "detail": "无新版管理记录，配置归属未确认"
+  },
+  "firewall_units": [],
+  "migration": {
+    "status": "blocked",
+    "blockers": [
+      "无新版管理记录；现有配置不能直接当作已完成新版阶段",
+      "/etc/ssh/sshd_config:59 非受管 kbdinteractiveauthentication（仅阻止直接接管）",
+      "/etc/ssh/sshd_config:116 非受管 permitrootlogin（仅阻止直接接管）",
+      "/etc/ssh/sshd_config:117 非受管 passwordauthentication（仅阻止直接接管）"
+    ],
+    "detail": "本审计不授权 apply，也不证明回滚备份已准备好"
+  },
+  "reboot": {
+    "status": "unknown",
+    "detail": "未取得可独立关联配置与跨启动的验证记录；自启检查不等于真实重启验证"
+  },
+  "checks": [
+    {
+      "name": "有效认证 fenix@120.244.186.124",
+      "result": "fail",
+      "detail": "permitrootlogin=yes; passwordauthentication=yes"
+    },
+    {
+      "name": "有效认证 root@120.244.186.124",
+      "result": "fail",
+      "detail": "permitrootlogin=yes; passwordauthentication=yes"
+    },
+    {
+      "name": "认证上下文覆盖",
+      "result": "pass",
+      "detail": "未发现活动 Match；Include 已遍历；sshd -t 通过"
+    },
+    {
+      "name": "目标端口监听",
+      "result": "pass",
+      "detail": "实际监听：0.0.0.0, ::；未要求固定两条 socket"
+    },
+    {
+      "name": "来源地址族监听",
+      "result": "pass",
+      "detail": "未声明来源地址族目标，内核证据覆盖 IPv[4, 6]；用 ss 的 v6only 标记核对双栈，不由当前 sysctl 推断已创建 socket"
+    },
+    {
+      "name": "防火墙现状采集",
+      "result": "pass",
+      "detail": "读取到 1 张 nft 表、1 个 input 链；未指定 --allow，仅展示现状，不判定来源白名单合规"
+    },
+    {
+      "name": "SSH 持久自启",
+      "result": "pass",
+      "detail": "ssh.socket 持久 enabled"
+    },
+    {
+      "name": "启动保护采集",
+      "result": "unknown",
+      "detail": "需要明确唯一防火墙加载单元；未发现或存在多个加载者"
+    },
+    {
+      "name": "主进程采集",
+      "result": "unknown",
+      "detail": "配置晚于主进程启动；缺少可靠的重载证据：/etc/ssh/sshd_config"
+    },
+    {
+      "name": "当前认证与 sudo",
+      "result": "pass",
+      "detail": "当前会话认证方式=publickey；同 boot 日志、存活四元组和 sudo 进程链匹配；基线要求公钥"
+    }
+  ],
+  "security_result": "fail",
+  "policy_result": "unknown",
+  "scope": "当前 SSH 现状及禁 root/禁密码/公钥基线；未指定来源策略，白名单合规未评估；不代替云安全组、拒绝来源外测或整机重启验收"
+}
