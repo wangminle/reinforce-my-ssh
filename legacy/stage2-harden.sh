@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# stage1-newport.sh — 建立候选 SSH 通道；外部公钥登录和 sudo 验证后才提交。
-# 支持 Ubuntu/Debian + systemd + ssh.socket。默认只读部署预检，不是通用安全审计。
+# stage2-harden.sh — 收紧认证并关闭旧入口；全新外部公钥登录和 sudo 验证后才提交。
+# 支持 Ubuntu/Debian + systemd + ssh.socket。默认复验受管候选状态。
 # 用法见 --help；设计与限制见 plans/DESIGN.md。
 set -uo pipefail
 
 SELF=${0##*/}
-STAGE_ID=stage1
+STAGE_ID=stage2
 SRC=$(cd "$(dirname "$0")" && pwd)
 STATE_ROOT=/var/lib/reinforce-my-ssh
 POLICY_FILE=$STATE_ROOT/policy.conf
@@ -20,6 +20,12 @@ FW_NAME=reinforce-my-ssh-firewall.service
 SOCKET_OVERRIDE=/etc/systemd/system/ssh.socket.d/00-reinforce-my-ssh.conf
 NFT_TABLE=sshguard
 MANAGED_FILES=("$SSHD_DROPIN" "$NFT_RULES" "$NFT_LOADER" "$FW_UNIT" "$SOCKET_OVERRIDE")
+CORE_MANAGED_FILES=("${MANAGED_FILES[@]}")
+SSHD_CONFIG=/etc/ssh/sshd_config
+SOCKET_DIR=/etc/systemd/system/ssh.socket.d
+UFW_DIR=/etc/ufw
+UFW_DEFAULT=/etc/default/ufw
+MIGRATION_PLAN=""
 
 PORT=""; OLD_PORT=22; USERNAME=""; CONF=""; RECOVERY_SECONDS=900; RESCUE_CONFIRMED=no
 ALLOWS=(); APPLY=0; CONFIRM=0; DO_ROLLBACK=0; ASSUME_YES=0; AUTO_RECOVERY=0; REQUEST_TX=""
@@ -36,28 +42,40 @@ die()  { fail "$1"; exit 1; }
 usage() {
   cat <<'USAGE'
 用法:
-  stage1-newport.sh --port <n> --user <name> --allow <cidr> [选项]       # 只读预检
-  stage1-newport.sh --port <n> --user <name> --allow <cidr> --apply      # 部署候选通道
-  stage1-newport.sh --confirm                                            # 从新外部会话中 sudo 执行
-  stage1-newport.sh --rollback [--transaction <id>]                       # 逆序回滚
+  stage2-harden.sh [--conf <file>]                                     # 只读预检
+  stage2-harden.sh --apply                                              # 收紧认证并关闭旧入口
+  stage2-harden.sh --confirm                                            # 从全新外部会话中 sudo 执行
+  stage2-harden.sh --rollback [--transaction <id>]                       # 回到 candidate-ready
 
 选项:
-  --old-port <n|none>       保留的旧 SSH 端口，默认 22
-  --allow <cidr>            来源白名单，可重复
+  --port/--user/--old-port/--allow  只允许核对已存策略，不能在第二阶段改策略
+  --old-port <n|none>       第一阶段保留、这一阶段关闭的旧端口
+  --allow <cidr>            已存来源白名单，可重复核对
   --conf <file>             严格 KEY=VALUE 配置文件
   --recovery-seconds <n>    未确认前自动恢复时限，默认 900
   --apply / --confirm       部署 / 外部验证后提交
   --yes                     跳过交互；仍需 RESCUE_CONFIRMED=yes
   --rollback                回滚当前阶段事务
   --transaction <id>        精确指定事务（自动恢复内部使用）
+  --guide                   从当前实际状态继续，自动执行可执行阶段并提供缺项指引
   -h, --help                显示帮助
 
 配置文件键: PORT, OLD_PORT, USER, ALLOW（可重复）, RECOVERY_SECONDS,
             RESCUE_CONFIRMED=yes（表示已实际演练独立于 sshd 的救援通道）。
-默认检查只判断部署前提/受管配置；已有旧方案请用独立 stage0-audit.sh。
+默认检查需要新版阶段记录；已有旧方案请用独立 stage0-audit.sh。
 普通用户 SSH 登录后 sudo 执行即可，不需要开放 root SSH 登录。
 USAGE
 }
+
+REPLAY_ARGS=("$@")
+GUIDE_ARGS=(); GUIDE_REQUESTED=0
+for guide_arg in "$@"; do
+  if [[ $guide_arg == --guide ]]; then GUIDE_REQUESTED=1; else GUIDE_ARGS+=("$guide_arg"); fi
+done
+if ((GUIDE_REQUESTED)); then
+  [[ -f $SRC/stage0-audit.sh ]] || die "缺少同目录 stage0-audit.sh，请同步四个脚本"
+  exec bash "$SRC/stage0-audit.sh" --guide "${GUIDE_ARGS[@]}"
+fi
 
 need_val() { (($2 >= 2)) || { fail "$1 缺少取值"; usage >&2; exit 2; }; }
 while (($#)); do
@@ -112,6 +130,30 @@ normalize_port() {
   local n=$((10#$1)); ((n >= 1 && n <= 65535)) || return 1
   printf '%d' "$n"
 }
+migration_paths() {
+  python3 - "$1" "$SSHD_CONFIG" "$SOCKET_DIR" "$UFW_DIR" "$UFW_DEFAULT" "${CORE_MANAGED_FILES[@]}" <<'PY'
+import json,os,sys
+plan=json.load(open(sys.argv[1])); main,socket,ufw,default=sys.argv[2:6]; core=set(sys.argv[6:])
+roots=[os.path.dirname(main),socket,ufw]
+if plan.get('schema')!=1 or not isinstance(plan.get('files'),list) or len(plan['files'])>128: raise SystemExit('迁移清单格式错误')
+paths=[]
+for item in plan['files']:
+ p=item['path']
+ if not isinstance(p,str) or '\n' in p or os.path.normpath(p)!=p or not os.path.isabs(p): raise SystemExit('非法迁移路径')
+ if p not in {default,os.path.join(os.path.dirname(socket),'ssh.socket')} and not any(p.startswith(root.rstrip('/')+'/') for root in roots): raise SystemExit('迁移路径超出 SSH/socket/UFW 范围: '+p)
+ if p in paths or p in core: raise SystemExit('迁移路径重复或与核心文件重叠')
+ paths.append(p)
+print('\n'.join(sorted(paths)))
+PY
+}
+load_migration() {
+  local plan=${1:-$STATE_ROOT/migration.json} paths
+  [[ -e $plan || -L $plan ]] || return 0
+  [[ -f $plan && ! -L $plan ]] || return 1
+  paths=$(migration_paths "$plan") || return 1
+  local extras=(); [[ -z $paths ]] || mapfile -t extras <<< "$paths"
+  MANAGED_FILES=("${CORE_MANAGED_FILES[@]}" "${extras[@]}" "$STATE_ROOT/migration.json")
+}
 normalize_params() {
   PORT=$(normalize_port "$PORT") || die "非法 --port: $PORT"
   if [[ $OLD_PORT != none ]]; then OLD_PORT=$(normalize_port "$OLD_PORT") || die "非法 --old-port"; fi
@@ -133,10 +175,12 @@ normalize_params() {
   mapfile -t ALLOWS < <(printf '%s\n' "${normalized[@]}" | sort -u)
 }
 load_state() {
+  # 回滚以事务中的已验证清单为准，不能被损坏的当前记录挡住。
+  if ((DO_ROLLBACK == 0)); then load_migration || die "迁移路径记录无效"; fi
   local f k v seen_stage=0 seen_tx=0 seen_sha=0
   if [[ ! -e $STATE_FILE ]]; then
-    for f in "${MANAGED_FILES[@]}"; do
-      [[ ! -e $f ]] || die "发现受管配置但状态文件缺失，拒绝当作 unconfigured: $f"
+    for f in "${CORE_MANAGED_FILES[@]}"; do
+      [[ ! -e $f ]] || die "发现受管配置但状态文件缺失，拒绝继续: $f"
     done
     return 0
   fi
@@ -153,7 +197,7 @@ load_state() {
   case $STATE_STAGE in unconfigured|candidate-pending|candidate-ready|hardening-pending|hardened|reboot-pending|verified) ;; *) die "未知阶段状态: $STATE_STAGE" ;; esac
   if [[ $STATE_STAGE == unconfigured ]]; then
     [[ -z $STATE_TX && -z $STATE_CONFIG_SHA ]] || die "unconfigured 状态包含事务或摘要，拒绝继续"
-    for f in "${MANAGED_FILES[@]}"; do [[ ! -e $f ]] || die "unconfigured 与受管文件矛盾: $f"; done
+    for f in "${CORE_MANAGED_FILES[@]}"; do [[ ! -e $f ]] || die "unconfigured 与受管文件矛盾: $f"; done
   else
     [[ -n $STATE_TX ]] || die "非 unconfigured 状态缺少当前事务"
     [[ $STATE_STAGE == candidate-pending || $STATE_STAGE == hardening-pending || $STATE_CONFIG_SHA =~ ^[0-9a-f]{64}$ ]] \
@@ -162,7 +206,15 @@ load_state() {
 }
 load_policy() {
   [[ $STATE_STAGE != unconfigured ]] || return 0
-  [[ -r $POLICY_FILE ]] || die "已有阶段状态但策略文件不可读: $POLICY_FILE"
+  local source=$POLICY_FILE requested
+  if ((DO_ROLLBACK)); then
+    requested=${REQUEST_TX:-$STATE_TX}
+    [[ $requested =~ ^[A-Za-z0-9_-]+$ ]] || die "回滚事务 ID 无效"
+    if [[ -f $TX_ROOT/$requested/policy.target && -r $TX_ROOT/$requested/policy.target ]]; then
+      source=$TX_ROOT/$requested/policy.target
+    fi
+  fi
+  [[ -r $source ]] || die "已有阶段状态但策略不可读；可能恢复尚未完成，停止 confirm。请从控制台核对事务日志及 policy.target: $source"
   local k v; local saved=("${ALLOWS[@]}"); local policy_allows=()
   while IFS='=' read -r k v; do
     case $k in
@@ -173,7 +225,7 @@ load_policy() {
       RECOVERY_SECONDS) ((RECOVERY_SET)) && [[ $RECOVERY_SECONDS != "$v" ]] && die "RECOVERY_SECONDS 与已存策略冲突"; RECOVERY_SECONDS=$v ;;
       RESCUE_CONFIRMED) RESCUE_CONFIRMED=$v ;;
     esac
-  done < "$POLICY_FILE"
+  done < "$source"
   if ((ALLOW_SET)); then
     local saved_normal policy_normal
     saved_normal=$(python3 -c 'import ipaddress,sys; print("\n".join(sorted({str(ipaddress.ip_network(x,strict=True)) for x in sys.argv[1:]})))' "${saved[@]}") || die "ALLOW 非法"
@@ -186,6 +238,9 @@ load_policy() {
 require_root() {
   ((EUID == 0)) && return 0
   fail "权限不足，未完成检查；请以目标普通用户登录后 sudo bash 执行，不必开放 root SSH 登录"
+  local command
+  printf -v command '%q ' sudo bash "$SRC/$SELF" "${REPLAY_ARGS[@]}"
+  fail "请在自己的终端执行：$command"
   exit 2
 }
 ensure_state_root() {
@@ -217,7 +272,10 @@ config_digest() {
     done
   } | sha256sum | awk '{print $1}'
 }
-all_ports() { if [[ $OLD_PORT == none ]]; then printf '%s\n' "$PORT"; else printf '%s\n%s\n' "$OLD_PORT" "$PORT"; fi; }
+all_ports() {
+  if [[ ${TARGET_STAGE:-hardened} == candidate && $OLD_PORT != none ]]; then printf '%s\n%s\n' "$OLD_PORT" "$PORT"
+  else printf '%s\n' "$PORT"; fi
+}
 port_set() { local p out=""; while IFS= read -r p; do out+="${out:+, }$p"; done < <(all_ports | sort -n -u); printf '{ %s }' "$out"; }
 ip_in_cidrs() { python3 - "$@" <<'PY'
 import ipaddress,sys
@@ -382,7 +440,7 @@ PY
 }
 assert_manageable() {
   local f
-  for f in "${MANAGED_FILES[@]}"; do
+  for f in "${CORE_MANAGED_FILES[@]}"; do
     [[ ! -e $f ]] && continue
     [[ -f $f ]] || { fail "受管路径不是普通文件: $f"; return 1; }
     grep -q 'Managed by reinforce-my-ssh' "$f" 2>/dev/null \
@@ -429,6 +487,7 @@ gen_nft_rules() {
 }
 gen_loader() { printf '#!/bin/sh\n# Managed by reinforce-my-ssh; do not edit\nexec /usr/sbin/nft -f %s\n' "$NFT_RULES" > "$1"; }
 gen_fw_unit() {
+  local plan=${MIGRATION_PLAN:-$STATE_ROOT/migration.json}
   cat > "$1" <<UNIT
 # Managed by reinforce-my-ssh; do not edit
 [Unit]
@@ -448,13 +507,18 @@ ExecReload=$NFT_LOADER
 [Install]
 WantedBy=sysinit.target
 UNIT
+  if [[ -f $plan ]] && python3 -c 'import json,sys; sys.exit(not json.load(open(sys.argv[1]))["ufw"])' "$plan"; then
+    printf '\n[Unit]\nRequires=ufw.service\nAfter=ufw.service\n' >> "$1"
+  fi
 }
 gen_sshd_dropin() {
-  local stage=$1 p
+  local stage=$2 p auth_plan=${MIGRATION_PLAN:-$STATE_ROOT/migration.json}
   {
     printf '# Managed by reinforce-my-ssh; do not edit\n'
     if [[ $stage == hardened ]]; then
       printf 'PermitRootLogin no\nPubkeyAuthentication yes\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nAuthenticationMethods publickey\n'
+    elif [[ -f $auth_plan ]]; then
+      python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); print("\n".join(k+" "+v for k,v in p["auth"].items()))' "$auth_plan" || return 1
     fi
     while IFS= read -r p; do printf 'Port %s\n' "$p"; done < <(all_ports | sort -n -u)
   } > "$1"
@@ -468,6 +532,7 @@ gen_socket_override() {
 }
 generate_files() {
   local d=$1 stage=$2
+  TARGET_STAGE=$stage
   mkdir -p "$d" || return 1
   gen_nft_rules "$d/nft" && gen_loader "$d/loader" && gen_fw_unit "$d/unit" \
     && gen_sshd_dropin "$d/sshd" "$stage" && gen_socket_override "$d/socket"
@@ -579,7 +644,7 @@ verify_runtime() {
     timeout 5 bash -c "exec 3<>/dev/tcp/::1/$p" 2>/dev/null || { fail "IPv6 回环不可连: $p"; bad=1; }
   done < <(all_ports | sort -n -u)
   if [[ $stage == hardened && $OLD_PORT != none ]] && port_any_listening "$OLD_PORT"; then
-    fail "旧端口 $OLD_PORT 仍有监听"; bad=1
+    fail "旧端口 $OLD_PORT 仍有监听（可能是独立 sshd 或其他进程）"; bad=1
   fi
   verify_nft_semantics "$d/nft" "$d/actual" || { fail "nft 规则语义与目标不一致"; bad=1; }
   systemctl is-active --quiet ssh.service && systemctl is-active --quiet ssh.socket && systemctl is-active --quiet "$FW_NAME" || { fail "SSH/firewall 单元未全部 active"; bad=1; }
@@ -596,6 +661,11 @@ tx_begin() {
   ensure_state_root
   TX_ID="$(date +%Y%m%d-%H%M%S-%N)-$$"; TX_DIR=$TX_ROOT/$TX_ID
   mkdir -m 0700 "$TX_DIR" || die "无法创建事务目录"
+  local backup_plan=${MIGRATION_PLAN:-$STATE_ROOT/migration.json}
+  if [[ -f $backup_plan ]]; then
+    load_migration "$backup_plan" || die "迁移备份路径无效"
+    cp -- "$backup_plan" "$TX_DIR/migration-plan.json" || die "迁移计划备份失败"
+  fi
   python3 - "$TX_DIR" "${MANAGED_FILES[@]}" <<'PY' || die "文件备份失败"
 import hashlib,json,os,shutil,stat,sys
 out=sys.argv[1]; paths=sys.argv[2:]; entries=[]; os.mkdir(out+'/files',0o700)
@@ -611,7 +681,11 @@ tmp=out+'/manifest.tmp'; json.dump({'files':entries},open(tmp,'w'),indent=2); os
 PY
   : > "$TX_DIR/units.conf" || die "无法记录单元状态"
   local u en ac tables
-  for u in ssh.socket ssh.service "$FW_NAME"; do
+  local snapshot_units=(ssh.socket ssh.service "$FW_NAME")
+  if [[ -f $TX_DIR/migration-plan.json ]] && python3 -c 'import json,sys; sys.exit(not json.load(open(sys.argv[1]))["legacy_unit"])' "$TX_DIR/migration-plan.json"; then
+    snapshot_units+=(ssh-firewall.service)
+  fi
+  for u in "${snapshot_units[@]}"; do
     en=$(systemctl is-enabled "$u" 2>/dev/null || true); ac=$(systemctl is-active "$u" 2>/dev/null || true)
     case $en in
       enabled|enabled-runtime|disabled|masked|not-found|static|indirect|generated|transient) ;;
@@ -637,6 +711,7 @@ PY
   printf '%s\n%s\n%s\n' "$STATE_STAGE" "$STATE_TX" "$STATE_CONFIG_SHA" > "$TX_DIR/parent" || die "父状态写入失败"
   cp "$POLICY_FILE" "$TX_DIR/policy.before" 2>/dev/null || [[ ! -e $POLICY_FILE ]] || die "策略备份失败"
   write_policy || die "目标策略写入失败"
+  install -m 0600 -- "$POLICY_FILE" "$TX_DIR/policy.target" || die "事务目标策略备份失败"
   write_state "$pending" "$TX_ID" "" || die "pending 状态写入失败"
   ok "事务 $TX_ID 已备份；尚未修改 SSH 配置"
 }
@@ -693,7 +768,7 @@ start_ssh_entry() {
   sshd -t && stop_ssh_entry && systemctl start ssh.socket && systemctl start ssh.service
 }
 restore_unit_state() {
-  local wanted=$1 u en ac current load
+  local wanted=$1 keep_active=${2:-0} u en ac current load
   while IFS='|' read -r u en ac; do
     [[ $u == "$wanted" ]] || continue
     load=$(systemctl show "$u" -p LoadState --value 2>/dev/null) || return 1
@@ -701,7 +776,9 @@ restore_unit_state() {
       current=$(systemctl is-active "$u" 2>/dev/null || true)
       [[ $current == inactive || $current == unknown ]] && return 0
     fi
-    if [[ $ac == active ]]; then systemctl restart "$u" >/dev/null 2>&1 || return 1
+    if [[ $ac == active ]]; then
+      if ((keep_active)) && systemctl is-active --quiet "$u"; then :
+      else systemctl restart "$u" >/dev/null 2>&1 || return 1; fi
     elif [[ $ac == inactive || $ac == failed ]]; then systemctl stop "$u" >/dev/null 2>&1 || return 1
     else fail "拒绝恢复未知 active 状态: $u=$ac"; return 1; fi
     current=$(systemctl is-enabled "$u" 2>/dev/null || true)
@@ -718,6 +795,13 @@ restore_unit_state() {
     return $?
   done < "$TX_DIR/units.conf"
   return 1
+}
+restore_compat_firewall() {
+  [[ -f $TX_DIR/migration-plan.json ]] || return 0
+  local flags
+  flags=$(python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); print(int(p["legacy_unit"]),int(p["ufw"]))' "$TX_DIR/migration-plan.json") || return 1
+  if [[ $flags == 1\ * ]]; then restore_unit_state ssh-firewall.service 1 || return 1; fi
+  if [[ $flags == *\ 1 ]]; then LC_ALL=C ufw reload || return 1; fi
 }
 policy_listeners() {
   python3 - "$1" "$PORT" "$OLD_PORT" <<'PY'
@@ -746,10 +830,17 @@ tx_restore() {
     candidate-pending|candidate-ready|hardening-pending|hardened) ;;
     *) die "请先撤销后续阶段，再回滚配置" ;;
   esac
+  load_migration "$TX_DIR/migration-plan.json" || die "事务迁移路径无效"
   local parent_lines=() parent_sha
   mapfile -t parent_lines < "$TX_DIR/parent"
   ((${#parent_lines[@]} == 3)) || { fail "父事务记录不完整"; return 1; }
   PARENT_STAGE=${parent_lines[0]}; PARENT_TX=${parent_lines[1]}; parent_sha=${parent_lines[2]}
+  # 旧事务首次由新版恢复时补留目标策略；失败重试不能依赖已恢复/删除的全局策略。
+  if [[ ! -e $TX_DIR/policy.target ]]; then
+    [[ -f $POLICY_FILE && -r $POLICY_FILE ]] \
+      && install -m 0600 -- "$POLICY_FILE" "$TX_DIR/policy.target" \
+      || { fail "缺少可重试的目标策略备份，尚未停止 SSH"; return 1; }
+  fi
   cancel_recovery || warn "恢复定时器清理失败，将继续恢复配置"
   stop_ssh_entry || { fail "无法安全停止 SSH 监听，拒绝继续恢复"; return 1; }
   local bad=0 fw_bad=0
@@ -781,7 +872,8 @@ PY
       && cp -- "$TX_DIR/policy.before" "$policy_tmp" && chmod 0600 "$policy_tmp" && mv -f "$policy_tmp" "$POLICY_FILE" \
       || { bad=1; fw_bad=1; }
   elif [[ $PARENT_STAGE == unconfigured ]]; then
-    rm -f "$POLICY_FILE" || { bad=1; fw_bad=1; }
+    # 保留到恢复复验完成；中途失败仍可正常进入 --rollback 重试。
+    :
   else
     fail "父阶段策略备份缺失"; bad=1; fw_bad=1
   fi
@@ -794,6 +886,9 @@ PY
       [[ -f $TX_DIR/NFT_ABSENT ]] || cat "$TX_DIR/runtime.nft"
     } > "$restore" && nft -f "$restore" || { bad=1; fw_bad=1; }
     rm -f "$restore"
+  fi
+  if ((fw_bad == 0)); then
+    restore_compat_firewall || { fail "原防火墙兼容配置恢复失败"; bad=1; fw_bad=1; }
   fi
   if [[ -f $TX_DIR/NFT_ABSENT ]]; then
     if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then fail "nft 表未撤销"; bad=1; fw_bad=1; fi
@@ -819,6 +914,9 @@ PY
     stop_ssh_entry || fail "停止新 SSH 接入失败，请立即使用独立救援通道"
     fail "回滚未完成；事务保留，可修复原因后重试: $TX_ID"; return 1
   fi
+  if [[ $PARENT_STAGE == unconfigured ]]; then
+    rm -f "$POLICY_FILE" || { fail "初始策略清理失败；目标策略备份保留，可重试"; return 1; }
+  fi
   : > "$TX_DIR/ROLLED_BACK" || { fail "无法写回滚标记"; return 1; }
   if ! write_state "$PARENT_STAGE" "$PARENT_TX" "$parent_sha"; then
     rm -f "$TX_DIR/ROLLED_BACK"
@@ -837,48 +935,67 @@ tx_commit() {
 abort_tx() { fail "$1；开始自动回滚"; tx_restore "$TX_ID" 0 || die "自动回滚失败，请使用控制台并指定事务 $TX_ID"; die "变更已撤回"; }
 
 do_apply() {
-  [[ $STATE_STAGE == unconfigured ]] || die "stage1 只能从 unconfigured 部署；当前 $STATE_STAGE"
+  [[ $STATE_STAGE == candidate-ready ]] || die "stage2 只能从 candidate-ready 部署；当前 $STATE_STAGE"
+  [[ $(config_digest) == "$STATE_CONFIG_SHA" ]] || die "父阶段配置摘要已变化，拒绝建立子事务"
   preflight || die "预检失败，未修改系统"
+  verify_runtime candidate || die "候选通道已漂移，请先恢复第一阶段"
+  local evidence_since=$TX_ROOT/$STATE_TX/confirmation.json
+  session_evidence "$evidence_since" || die "必须保持指定用户经新端口公钥登录的会话"
   confirm_rescue
   local d; d=$(mktemp -d) || die "无法创建临时目录"
-  generate_files "$d" candidate || { rm -rf "$d"; die "配置生成失败"; }
+  generate_files "$d" hardened || { rm -rf "$d"; die "配置生成失败"; }
   nft -c -f "$d/nft" || { rm -rf "$d"; die "nft 候选语法无效"; }
-  tx_begin stage1 candidate-pending
+  tx_begin stage2 hardening-pending
   arm_recovery || abort_tx "自动恢复定时器安装失败"
-  mkdir -p /etc/ssh/sshd_config.d /etc/nftables.d /etc/systemd/system/ssh.socket.d || abort_tx "配置目录创建失败"
-  put_file "$d/nft" "$NFT_RULES" 0644 && put_file "$d/loader" "$NFT_LOADER" 0755 && put_file "$d/unit" "$FW_UNIT" 0644 \
-    || { rm -rf "$d"; abort_tx "防火墙文件安装失败"; }
-  systemctl daemon-reload && systemctl restart "$FW_NAME" && verify_nft_semantics "$d/nft" "$d/check" \
-    || { rm -rf "$d"; abort_tx "防火墙加载或语义验证失败"; }
   put_file "$d/sshd" "$SSHD_DROPIN" 0644 && put_file "$d/socket" "$SOCKET_OVERRIDE" 0644 \
-    || { rm -rf "$d"; abort_tx "SSH 文件安装失败"; }
-  sshd -t && systemctl daemon-reload && systemctl enable ssh.socket "$FW_NAME" && start_ssh_entry \
-    || { rm -rf "$d"; abort_tx "SSH/socket 生效失败"; }
-  verify_runtime candidate || { rm -rf "$d"; abort_tx "候选通道验证失败"; }
+    || { rm -rf "$d"; abort_tx "认证或端口文件安装失败"; }
+  sshd -t && systemctl daemon-reload && start_ssh_entry \
+    || { rm -rf "$d"; abort_tx "认证/socket 生效失败"; }
+  if [[ $OLD_PORT != none ]] && port_any_listening "$OLD_PORT"; then
+    rm -rf "$d"; abort_tx "旧端口仍有监听，拒绝撤销其防火墙保护"
+  fi
+  put_file "$d/nft" "$NFT_RULES" 0644 && systemctl reload "$FW_NAME" && verify_nft_semantics "$d/nft" "$d/check" \
+    || { rm -rf "$d"; abort_tx "白名单收窄或验证失败"; }
+  verify_runtime hardened || { rm -rf "$d"; abort_tx "收口后的完整验证失败"; }
   record_confirmation_boundary || { rm -rf "$d"; abort_tx "确认日志边界记录失败"; }
   rm -rf "$d"
   cat <<DONE
 
-候选通道已部署，但阶段尚未完成，自动恢复时限为 ${RECOVERY_SECONDS} 秒。
-请保留当前旧会话，从另一台机器执行：
+认证和旧端口已收紧，但阶段尚未完成，自动恢复时限为 ${RECOVERY_SECONDS} 秒。
+请保留当前会话作为救援，从另一台机器建立一次全新的连接：
   ssh -p $PORT $USERNAME@<服务器地址>
-然后在新会话中执行：
+然后只在新会话中执行：
   sudo bash $SRC/$SELF --confirm
 事务: $TX_ID
 DONE
 }
-do_confirm() {
-  if [[ $STATE_STAGE == candidate-ready ]]; then
-    verify_runtime candidate && [[ $(config_digest) == "$STATE_CONFIG_SHA" ]] \
-      && { ok "第一阶段已经确认且复验通过"; return 0; }
-    die "第一阶段配置已漂移"
+confirmation_pending_hint() {
+  warn "本次拒绝确认未请求停止 SSH；事务仍待确认，原自动恢复计时不会因此取消。"
+  printf '请在客户端新开公钥连接（SERVER 换为地址或已配置私钥的 SSH 别名）：\n  '
+  printf '%q ' ssh -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -p "$PORT" "$USERNAME@SERVER"
+  printf '\n然后在该新会话 sudo 执行 --confirm；sudo 密码不等于 SSH 密码认证。\n'
+  local started remaining
+  if [[ -r $TX_DIR/started ]]; then
+    started=$(cat "$TX_DIR/started")
+    if [[ $started =~ ^[0-9]{1,12}$ ]]; then
+      remaining=$((10#$started + 10#$RECOVERY_SECONDS - $(date +%s)))
+      if ((remaining > 0)); then warn "自动恢复剩余约 $remaining 秒；不要在原密码会话反复确认。"
+      else warn "原恢复期限已到，恢复任务可能已排队；请核对事务日志和实际状态。"; fi
+    fi
   fi
-  [[ $STATE_STAGE == candidate-pending ]] || die "只有 candidate-pending 可以确认；当前 $STATE_STAGE"
+}
+do_confirm() {
+  if [[ $STATE_STAGE == hardened ]]; then
+    verify_runtime hardened && [[ $(config_digest) == "$STATE_CONFIG_SHA" ]] \
+      && { ok "第二阶段已经确认且复验通过"; return 0; }
+    die "第二阶段配置已漂移"
+  fi
+  [[ $STATE_STAGE == hardening-pending ]] || die "只有 hardening-pending 可以确认；当前 $STATE_STAGE"
   TX_ID=$STATE_TX; TX_DIR=$TX_ROOT/$TX_ID
-  verify_runtime candidate || die "候选配置或运行时验证失败"
-  session_evidence "$TX_DIR/confirmation.json" || die "外部登录/sudo 证据不足"
-  tx_commit candidate-ready || die "提交失败；以实际 state 和恢复定时器状态为准"
-  printf '\n第一阶段完成。现在可执行 stage2-harden.sh --apply。\n'
+  verify_runtime hardened || { confirmation_pending_hint; die "收口配置或运行时验证失败"; }
+  session_evidence "$TX_DIR/confirmation.json" || { confirmation_pending_hint; die "全新外部登录/sudo 证据不足"; }
+  tx_commit hardened || die "提交失败；以实际 state 和恢复定时器状态为准"
+  printf '\n第二阶段完成。继续向导：sudo bash %q --guide\n' "$SRC/stage0-audit.sh"
 }
 
 require_root
@@ -892,26 +1009,25 @@ if ((DO_ROLLBACK)); then
   tx_restore "${REQUEST_TX:-$STATE_TX}" "$AUTO_RECOVERY"
   exit $?
 fi
+if [[ $STATE_STAGE == unconfigured ]]; then
+  fail "新版管理状态未建立，stage2 未执行认证/端口复验；不代表服务器未加固"
+  printf '从现状进入部署向导：sudo bash %q --guide\n' "$SRC/stage0-audit.sh"
+  exit 2
+fi
 load_policy
 normalize_params
 if ((APPLY || CONFIRM)); then lock_all; load_state; load_policy; normalize_params; fi
-case $STATE_STAGE in unconfigured|candidate-pending|candidate-ready) ;; *) die "当前阶段 $STATE_STAGE 不允许运行 stage1" ;; esac
+case $STATE_STAGE in candidate-ready|hardening-pending|hardened) ;; *) die "当前阶段 $STATE_STAGE 不允许运行 stage2" ;; esac
 if ((CONFIRM)); then do_confirm; exit $?; fi
-if [[ $STATE_STAGE == candidate-pending ]]; then
-  ((APPLY)) || die "候选通道待外部确认；请在新会话执行 --confirm"
+if [[ $STATE_STAGE == hardening-pending ]]; then
+  ((APPLY)) || die "认证收口待外部确认；请在全新会话执行 --confirm"
   TX_ID=$STATE_TX; TX_DIR=$TX_ROOT/$TX_ID
-  verify_runtime candidate && ok "候选配置已部署，无需重复修改；请执行 --confirm"
+  verify_runtime hardened && ok "收口配置已部署，无需重复修改；请执行 --confirm"
   exit $?
 fi
-if [[ $STATE_STAGE == candidate-ready ]]; then
-  verify_runtime candidate || die "第一阶段配置已漂移"
-  [[ $(config_digest) == "$STATE_CONFIG_SHA" ]] || die "第一阶段配置摘要已变化"
-  ok "第一阶段已经完成且复验通过"; exit 0
+if [[ $STATE_STAGE == hardened ]]; then
+  verify_runtime hardened || die "第二阶段配置已漂移"
+  [[ $(config_digest) == "$STATE_CONFIG_SHA" ]] || die "第二阶段配置摘要已变化"
+  ok "第二阶段已经完成且复验通过"; exit 0
 fi
-if ((APPLY)); then
-  do_apply
-else
-  warn "当前为部署预检，不是已有服务器的安全审计；未纳管不等于未加固。独立审计：sudo bash $SRC/stage0-audit.sh --help"
-  preflight || { fail "部署前提检查未通过；安全效果未由本命令判定，未修改系统"; exit 2; }
-  ok "部署前提检查通过；尚未部署、未证明整机安全；使用 --apply 部署候选通道"
-fi
+if ((APPLY)); then do_apply; else preflight && verify_runtime candidate || exit 1; ok "只读预检通过；使用 --apply 收紧认证和端口"; fi

@@ -4,176 +4,124 @@
 
 ## English
 
-SSH hardening for Ubuntu/Debian: audit an existing server, establish a new port, tighten authentication, then verify persistence after a real reboot.
+Read-only, step-by-step **guidance** for SSH hardening on Ubuntu/Debian: check the current state, switch the port and public key, then lock down the firewall and authentication — with every change executed by you (or by an agent under your supervision), never by the tool.
+
+**The tool never writes to the system.** It does not modify SSH/firewall/systemd configuration, writes no state files, installs no timers, runs no commands on your behalf, and has no automatic rollback of any kind. It inspects state read-only, tells you the current step, prints the exact manual commands with why/verify/undo, and re-checks after you execute them. Recovery is always manual, from the backup you created in step 1.
+
+This is a direct response to the 2026-10-27 real lockout incident on a JD Cloud node caused by an earlier auto-execution design (transactional apply + timer-driven automatic rollback that stopped SSH when recovery failed). That legacy system is frozen under [`legacy/`](legacy/README.md) for forensics and remote old-transaction reference only and must never be run. Remote root cause is still unresolved ([incident record](plans/checkpoints/2026-10-27-lockout-incident.md), [BUG-016](task-list.md)); real-server acceptance of this new guidance flow is still pending, so treat any first run as a disposable-environment exercise.
 
 ### Scripts
 
 | Entry | Purpose |
 | --- | --- |
-| [stage0-audit.sh](stage0-audit.sh) | Independent, read-only audit. Reports security findings, management ownership, migration blockers and reboot evidence separately. |
-| [stage1-newport.sh](stage1-newport.sh) | Apply the source allowlist and create a candidate SSH port; retain the configured old port until stage2. |
-| [stage2-harden.sh](stage2-harden.sh) | Disable root, password and keyboard-interactive login; require public keys and close the old port. |
-| [stage3-reboot-check.sh](stage3-reboot-check.sh) | Record a baseline and verify after a real reboot. Does not change SSH/firewall settings or reboot the server. |
+| [stage0-check.sh](stage0-check.sh) | Read-only current-state check and flow positioning: session facts, listeners/services, effective sshd config, accounts and keys, nft/UFW, backups, legacy traces, reboot evidence; compares against declared goals and tells you which script to run next. |
+| [stage1-port-key.sh](stage1-port-key.sh) | Guidance for the port switch (open new → verify externally → close old), the key switch (non-root sudo account + public key) and sudo-user verification. |
+| [stage2-lockdown.sh](stage2-lockdown.sh) | Guidance for the nft source allowlist, disabling root/password/keyboard-interactive login, the final confirmation checklist, and post-reboot re-verification. |
 
-Stage0 can run independently; it does not enroll a server. Stages 1–3 use explicit state, policy and transaction records under `/var/lib/reinforce-my-ssh`. Deploy only the **four stage scripts** listed above: the audit implementation is embedded in stage0, with Python 3 still required. Old `stage1.sh` / `stage2.sh` / `stage3.sh` names remain optional compatibility entry points in the repository.
+Each script is a self-contained bash wrapper with an embedded Python implementation. They only read; the command whitelist is `ss`, `id`, `getent`, `sshd -t/-T`, `nft list/-j`, `ufw status` and read-only `systemctl`/`journalctl` queries — enforced at execution time and asserted by the test suite.
 
 ### Before you start
 
-- Use Ubuntu/Debian with systemd, `ssh.socket` (`Accept=no`), `ssh.service` (`KillMode=process`) and IPv4/IPv6 support. Requires Bash, Python 3, OpenSSH, nftables, iproute2 and sudo.
-- Log in as a non-root administrator, then use sudo. Direct root SSH login is unnecessary. Prepare the account, public key and cloud firewall rules yourself.
-- Keep your current session open and test an independent VNC/serial/agent rescue path. Deployment rejects conflicting unmanaged directives and active `Match` blocks; existing setups should be audited before considering migration.
+- Ubuntu/Debian with systemd; Bash and Python 3; run with `sudo` (non-root runs degrade to a sudo hint).
+- A non-root admin account, its public key, and cloud security-group rules to prepare yourself.
+- A rescue channel (VNC/serial console) that you have **actually logged into once** — the guide records this as `--rescue-confirmed`, and it gates the dangerous steps.
 
 ### Workflow
 
-Examples assume the repository is at `/opt/reinforce-my-ssh`. Replace `SERVER`, `deploy`, `2222` and the documentation CIDR `203.0.113.0/24` with your actual values. Run server commands from that directory.
-
-**Existing server: audit without changing configuration.**
-
-From your normal administrator's SSH session, start with no parameters:
+Examples assume the repository is at `/opt/reinforce-my-ssh`. Replace `SERVER`, `deploy`, `62207` and the documentation CIDR `203.0.113.0/24`.
 
 ```bash
-sudo bash stage0-audit.sh
-```
-
-It detects the sudo user, current SSH port and source, checks authentication and listeners, and collects firewall/startup evidence. The current source is a session fact, not an inferred allowlist. Root/password/public-key checks use the project's hardening baseline. Without `--allow`, source-policy compliance remains unassessed. If the session cannot be recovered or multiple ports remain ambiguous, supply `--user` / `--port` as needed.
-
-To compare against a declared allowlist and required closed port:
-
-```bash
-sudo bash stage0-audit.sh --port 2222 --user deploy \
+# 0) Where am I?
+sudo bash stage0-check.sh --port 62207 --user deploy \
   --allow 203.0.113.0/24 --closed-port 22
+
+# 1) Port + key + sudo user. Run, read the current step, execute it by hand, re-run.
+sudo bash stage1-port-key.sh --port 62207 --user deploy --host SERVER
+
+# 2) Allowlist + disable root/password + final confirmation + reboot proof.
+sudo bash stage2-lockdown.sh --port 62207 --user deploy \
+  --allow 203.0.113.0/24 --host SERVER --rescue-confirmed
 ```
 
-Audit exit codes: `0` passed within scope, `1` confirmed noncompliance, `2` insufficient evidence/permissions/support. Missing management records alone do not mean the server is insecure. Use `--format json` for structured output.
+The loop is always: run the script → it confirms what is already done and prints the current step (why / do / verify / undo) → you execute the commands → you re-run the script to verify → move on. Steps whose gates are unmet are reported as blocked and print no actionable commands.
 
-**New managed deployment:**
+**Hard gates (anti-lockout):** rescue-channel drill confirmed; full manual backup under `/var/backups/ssh-hardening/`; the new port must be proven by re-running stage1 **from a new public-key session on that port** (a password session does not count) before the old port may be closed; stage2 refuses allowlist commands while your current source IP is outside `--allow`; disabling password login requires a verified public-key session on the new port; cross-reboot persistence requires the current boot to be later than every hardening file.
+
+Exit codes: `0` stage goals fully met; `1` blocking anomaly (legacy pending transaction/recovery timer, invalid sshd config, allowlist lockout risk); `2` steps outstanding or `sudo` required; `130` interrupted. Add `--format json` for machine-readable output.
+
+### Agent execution
+
+An agent (e.g. Claude) can drive the steps from the JSON output, under operator supervision: execute only steps whose `blocked_by` is empty, re-run the script after every executed step, stop and print the manual `undo` commands on any failed verification, and never simulate the rescue drill or cloud-console changes. See the execution contract in [plans/DESIGN-v2.md](plans/DESIGN-v2.md).
+
+### Tests
 
 ```bash
-# Server: check deployment prerequisites, then create the candidate port.
-sudo bash stage1-newport.sh --port 2222 --user deploy --allow 203.0.113.0/24
-sudo bash stage1-newport.sh --port 2222 --user deploy --allow 203.0.113.0/24 --apply
-
-# Another client terminal: keep the original session open.
-ssh -p 2222 deploy@SERVER
-
-# New server session: return to the repository directory.
-cd /opt/reinforce-my-ssh
-sudo bash stage1-newport.sh --confirm
-sudo bash stage2-harden.sh --apply
-
-# Another client terminal: establish a fresh connection again.
-ssh -p 2222 deploy@SERVER
-
-# Fresh server session:
-cd /opt/reinforce-my-ssh
-sudo bash stage2-harden.sh --confirm
-sudo bash stage3-reboot-check.sh --apply
-
-# Reboot manually after checking rescue access, then reconnect and run:
-cd /opt/reinforce-my-ssh
-sudo bash stage3-reboot-check.sh --verify
+python3 tests/run-tests.py
 ```
 
-Stages 1 and 2 remain pending until confirmed from the required external public-key/sudo session. Transaction backups, a lock and automatic rollback protect pending changes; the default confirmation window is **900 seconds**. `--yes` still requires `RESCUE_CONFIRMED=yes` in the configuration. The old port defaults to 22; use `--old-port none` only when no old entry should be retained—it is not proof that 22 is closed.
+37 stub-based tests, no real system contact. They do not replace real-server acceptance.
 
-Rollback completed/pending stages in reverse order: stage3, stage2, stage1, each with `--rollback`; skip stages not entered. Stage3 rollback only clears verification state. Default stage1–3 invocations are deployment checks or managed-state verification, not a replacement for stage0.
-
-### Tests and documentation
-
-```bash
-python3 tests/run_tests.py
-sudo python3 tests/run_tests.py --integration
-```
-
-Integration tests use isolated nft namespaces and dedicated temporary systemd units. Full VM migration, cross-boot recovery and public-network acceptance remain pending; validate in a disposable VM before production use.
-
-[Full runbook](plans/DESIGN.md) · [Audit scope](plans/AUDIT-EXISTING.md) · [Names and compatibility](plans/SCRIPT-NAMES.md) · [Tests](tests/README.md) · [Task ledger](task-list.md) · [MIT license](LICENSE)
+[Design (v2)](plans/DESIGN-v2.md) · [Tests](tests/README.md) · [Legacy (do not run)](legacy/README.md) · [Checkpoints](plans/checkpoints/README.md) · [Task ledger](task-list.md) · [MIT license](LICENSE)
 
 ## 中文
 
 [Back to English](#english)
 
-面向 Ubuntu/Debian 的 SSH 加固工具：先审计现状，再建立新端口、收紧认证，最后通过真实重启验证持久性。
+面向 Ubuntu/Debian 的 SSH 加固**只读分步指导**：检查现状、切端口与公钥、收紧防火墙与认证——每一步都由你（或你监督下的智能体）手工执行，工具绝不代劳。
+
+**工具对系统零写入。** 不修改 SSH/防火墙/systemd 配置，不写状态文件，不装定时器，不代执行命令，不存在任何形式的自动回滚。它只读地检查现状、判断当前步骤、打印手工命令（含为什么/验证/撤销），并在你执行后重跑核对。恢复永远依赖第 1 步你亲手创建的备份，由人执行。
+
+本版是对 2026-10-27 京东云真实失联事故的直接回应：旧版"事务化自动执行 + 定时器自动回滚（恢复失败即停止 SSH）"设计已全部冻结在 [`legacy/`](legacy/README.md)，仅作取证与远端旧事务对照，禁止运行。远端根因仍未查明（[事故记录](plans/checkpoints/2026-10-27-lockout-incident.md)、[BUG-016](task-list.md)）；新版指导流程的真实整机验收仍待完成，首次使用请在可销毁环境演练。
 
 ### 脚本职责
 
 | 入口 | 功能 |
 | --- | --- |
-| [stage0-audit.sh](stage0-audit.sh) | 独立只读审计，分别报告安全效果、管理归属、迁移阻断和重启证据。 |
-| [stage1-newport.sh](stage1-newport.sh) | 加载来源白名单，建立候选新端口；按配置保留旧入口，直到 stage2 收口。 |
-| [stage2-harden.sh](stage2-harden.sh) | 禁止 root、密码和键盘交互登录，仅允许公钥，并关闭旧端口。 |
-| [stage3-reboot-check.sh](stage3-reboot-check.sh) | 记录基线，跨真实重启复验；不修改 SSH/防火墙配置，不代为重启。 |
+| [stage0-check.sh](stage0-check.sh) | 只读现状检查与流程定位：会话事实、监听/服务、sshd 有效配置、账户与公钥、nft/UFW、备份、旧版痕迹、重启证据；对照声明目标输出所在地步与下一步该跑的脚本。 |
+| [stage1-port-key.sh](stage1-port-key.sh) | 指导切端口（开新→外部验证→关旧）、切密钥（sudo 组非 root 账户 + 公钥）与 sudo 用户验证。 |
+| [stage2-lockdown.sh](stage2-lockdown.sh) | 指导 nft 来源白名单、禁 root/禁密码/禁键盘交互、最终确认清单与重启后复验。 |
 
-stage0 可独立执行，不会自动纳管服务器。stage1–3 的策略、状态和事务记录保存在 `/var/lib/reinforce-my-ssh`。部署只需上述 **四个 stage 脚本**：审计实现已内嵌 stage0，环境仍需 Python 3。旧的 `stage1.sh`、`stage2.sh`、`stage3.sh` 仅作为仓库中的可选兼容入口。
+三个脚本各自自包含（bash 包装 + 内嵌 Python）。只读命令白名单为 `ss`、`id`、`getent`、`sshd -t/-T`、`nft list/-j`、`ufw status` 与只读的 `systemctl`/`journalctl` 查询——执行层强制、测试断言。
 
 ### 使用前提
 
-- Ubuntu/Debian、systemd、`ssh.socket`（`Accept=no`）、`ssh.service`（`KillMode=process`），支持 IPv4/IPv6；依赖 Bash、Python 3、OpenSSH、nftables、iproute2 和 sudo。
-- 普通管理账户 SSH 登录后 sudo 执行即可，无需开放 root SSH 登录。账户、公钥和云防火墙规则需提前准备。
-- 保留当前会话，并实际演练独立的 VNC、串口或 Agent 救援通道。部署会拒绝冲突的非受管指令和活动 `Match`；已有加固方案应先审计，再决定是否迁移。
+- Ubuntu/Debian、systemd；Bash 与 Python 3；以 `sudo` 运行（非 root 会降级为 sudo 提示）。
+- 非 root 管理账户、其公钥、云安全组规则均需自行准备。
+- 一条**真实登录演练过**的救援通道（VNC/串口）；向导以 `--rescue-confirmed` 记录该事实，并以此作为危险步骤的门槛。
 
 ### 操作流程
 
-以下假设仓库位于 `/opt/reinforce-my-ssh`，服务器命令均在此目录执行。请替换 `SERVER`、账户、端口和示例网段 `203.0.113.0/24`。
-
-**已有服务器：只审计，不改配置。**
-
-普通管理账户 SSH 登录后，直接执行：
+以下假设仓库位于 `/opt/reinforce-my-ssh`。请替换 `SERVER`、账户、端口和示例网段 `203.0.113.0/24`。
 
 ```bash
-sudo bash stage0-audit.sh
-```
-
-自动识别 sudo 用户、当前 SSH 端口和来源，检查认证与监听，采集防火墙和开机保护证据。当前来源只是会话事实，不会自动成为白名单。禁 root、禁密码、公钥要求按项目加固基线检查；未指定 `--allow` 时不判定来源策略合规。无法恢复会话或多个端口无法唯一识别时，可补 `--user` / `--port`。
-
-需要比较明确的白名单和必须关闭的端口时，再填写：
-
-```bash
-sudo bash stage0-audit.sh --port 2222 --user deploy \
+# 0) 我在哪一步？
+sudo bash stage0-check.sh --port 62207 --user deploy \
   --allow 203.0.113.0/24 --closed-port 22
+
+# 1) 切端口 / 装公钥 / 验证 sudo 用户。运行→读当前步骤→手工执行→重跑核对。
+sudo bash stage1-port-key.sh --port 62207 --user deploy --host SERVER
+
+# 2) 白名单 + 禁 root/密码 + 最终确认 + 重启复验。
+sudo bash stage2-lockdown.sh --port 62207 --user deploy \
+  --allow 203.0.113.0/24 --host SERVER --rescue-confirmed
 ```
 
-审计退出码：`0` 为本次范围通过，`1` 为明确不符合，`2` 为权限、证据或支持范围不足。缺少新版管理记录本身不代表不安全；加 `--format json` 可输出结构化报告。
+循环永远是：运行脚本 → 它确认哪些步骤已完成并打印当前步骤（为什么/执行/验证/撤销）→ 你手工执行 → 重跑脚本核对 → 进入下一步。门槛未满足的步骤显示"被门槛阻塞"，不给可执行命令。
 
-**新建受管部署：**
+**硬门槛（防锁死）**：救援通道演练确认；`/var/backups/ssh-hardening/` 手工备份；新端口必须**从该端口的新公钥会话重跑 stage1** 证明可用（密码会话不算）才允许关旧端口；stage2 在"当前来源不在 `--allow` 内"时拒绝给出白名单命令；禁用密码前必须有已验证的新端口公钥会话；跨重启持久化要求"本次启动晚于全部加固文件修改"。
+
+退出码：`0` 本阶段目标全部达成；`1` 阻断性异常（旧版待确认事务/恢复定时器残留、sshd 配置损坏、白名单锁死风险）；`2` 步骤未完成或需要 sudo；`130` 中断。加 `--format json` 输出机器可读结构。
+
+### 智能体执行
+
+智能体（如 Claude）可在操作员监督下按 JSON 输出驱动执行：只执行 `blocked_by` 为空的步骤；每步执行后重跑脚本；任何验证失败即停止并打印手工 `undo` 命令；不得代拟救援演练与云控制台操作。执行契约见 [plans/DESIGN-v2.md](plans/DESIGN-v2.md)。
+
+### 测试
 
 ```bash
-# 服务器：先检查部署前提，再建立候选端口。
-sudo bash stage1-newport.sh --port 2222 --user deploy --allow 203.0.113.0/24
-sudo bash stage1-newport.sh --port 2222 --user deploy --allow 203.0.113.0/24 --apply
-
-# 客户端另开终端连接，保留原会话。
-ssh -p 2222 deploy@SERVER
-
-# 新服务器会话：回到仓库目录，确认第一阶段，再收紧认证。
-cd /opt/reinforce-my-ssh
-sudo bash stage1-newport.sh --confirm
-sudo bash stage2-harden.sh --apply
-
-# 客户端再次建立全新连接。
-ssh -p 2222 deploy@SERVER
-
-# 全新服务器会话：确认第二阶段，记录重启前基线。
-cd /opt/reinforce-my-ssh
-sudo bash stage2-harden.sh --confirm
-sudo bash stage3-reboot-check.sh --apply
-
-# 确认救援通道后自行重启，重新登录并执行：
-cd /opt/reinforce-my-ssh
-sudo bash stage3-reboot-check.sh --verify
+python3 tests/run-tests.py
 ```
 
-stage1/2 的 apply 只进入待确认状态，必须通过规定的外部公钥登录和 sudo 会话确认。事务备份、互斥锁和自动回滚保护待确认变更，默认确认窗口为 **900 秒**。无人值守使用 `--yes` 时，配置中仍须声明 `RESCUE_CONFIRMED=yes`。旧端口默认 22；只有无需保留旧入口时才使用 `--old-port none`，它不证明 22 已关闭。
+37 项桩件测试，不接触真实系统；不替代真实整机验收。
 
-回滚按 stage3 → stage2 → stage1 逆序执行，各加 `--rollback`，未进入的阶段跳过。stage3 只撤销验证状态。stage1–3 默认执行部署检查或受管复验，不能代替 stage0 的独立审计。
-
-### 测试与文档
-
-```bash
-python3 tests/run_tests.py
-sudo python3 tests/run_tests.py --integration
-```
-
-集成测试使用隔离 nft 网络命名空间和专用临时 systemd 单元。真实 VM 迁移、跨启动恢复和公网验收仍待完成；生产使用前请在可销毁 VM 中验收。
-
-[完整操作手册](plans/DESIGN.md) · [审计范围](plans/AUDIT-EXISTING.md) · [命名与兼容](plans/SCRIPT-NAMES.md) · [测试说明](tests/README.md) · [任务台账](task-list.md) · [MIT 许可证](LICENSE)
+[设计文档（v2）](plans/DESIGN-v2.md) · [测试说明](tests/README.md) · [legacy 冻结区（禁运行）](legacy/README.md) · [检查点索引](plans/checkpoints/README.md) · [任务台账](task-list.md) · [MIT 许可证](LICENSE)

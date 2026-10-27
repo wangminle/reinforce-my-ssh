@@ -21,6 +21,36 @@ SOCKET_DROPIN=/etc/systemd/system/ssh.socket.d/00-reinforce-my-ssh.conf
 FW_UNIT_NAME=reinforce-my-ssh-firewall.service
 NFT_TABLE=sshguard
 MANAGED_FILES=("$SSHD_DROPIN" "$NFT_RULES" "$NFT_LOADER" "$FW_UNIT" "$SOCKET_DROPIN")
+CORE_MANAGED_FILES=("${MANAGED_FILES[@]}")
+SSHD_CONFIG=/etc/ssh/sshd_config
+SOCKET_DIR=/etc/systemd/system/ssh.socket.d
+UFW_DIR=/etc/ufw
+UFW_DEFAULT=/etc/default/ufw
+STATE_ROOT=$STATE_DIR
+migration_paths() {
+  python3 - "$1" "$SSHD_CONFIG" "$SOCKET_DIR" "$UFW_DIR" "$UFW_DEFAULT" "${CORE_MANAGED_FILES[@]}" <<'PY'
+import json,os,sys
+plan=json.load(open(sys.argv[1])); main,socket,ufw,default=sys.argv[2:6]; core=set(sys.argv[6:])
+roots=[os.path.dirname(main),socket,ufw]
+if plan.get('schema')!=1 or not isinstance(plan.get('files'),list) or len(plan['files'])>128: raise SystemExit('迁移清单格式错误')
+paths=[]
+for item in plan['files']:
+ p=item['path']
+ if not isinstance(p,str) or '\n' in p or os.path.normpath(p)!=p or not os.path.isabs(p): raise SystemExit('非法迁移路径')
+ if p not in {default,os.path.join(os.path.dirname(socket),'ssh.socket')} and not any(p.startswith(root.rstrip('/')+'/') for root in roots): raise SystemExit('迁移路径超出 SSH/socket/UFW 范围: '+p)
+ if p in paths or p in core: raise SystemExit('迁移路径重复或与核心文件重叠')
+ paths.append(p)
+print('\n'.join(sorted(paths)))
+PY
+}
+load_migration() {
+  local plan=${1:-$STATE_ROOT/migration.json} paths
+  [[ -e $plan || -L $plan ]] || return 0
+  [[ -f $plan && ! -L $plan ]] || return 1
+  paths=$(migration_paths "$plan") || return 1
+  local extras=(); [[ -z $paths ]] || mapfile -t extras <<< "$paths"
+  MANAGED_FILES=("${CORE_MANAGED_FILES[@]}" "${extras[@]}" "$STATE_ROOT/migration.json")
+}
 
 if [[ -t 1 ]]; then
   C_RST=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'
@@ -46,6 +76,7 @@ usage() {
   --rollback    仅将 reboot-pending/verified 回退为 hardened，保留基线
 
 其他选项:
+  --guide       按当前状态继续整个流程，缺项时给出操作指令
   --yes         跳过 --apply 的交互确认
   -h, --help    显示本帮助
 
@@ -55,6 +86,17 @@ usage() {
 普通用户 SSH 登录后 sudo 执行即可，不需要开放 root SSH 登录。
 USAGE
 }
+
+REPLAY_ARGS=("$@")
+GUIDE_ARGS=(); GUIDE_REQUESTED=0
+for guide_arg in "$@"; do
+  if [[ $guide_arg == --guide ]]; then GUIDE_REQUESTED=1; else GUIDE_ARGS+=("$guide_arg"); fi
+done
+if ((GUIDE_REQUESTED)); then
+  guide_dir=$(cd "$(dirname "$0")" && pwd)
+  [[ -f $guide_dir/stage0-audit.sh ]] || die "缺少同目录 stage0-audit.sh，请同步四个脚本"
+  exec bash "$guide_dir/stage0-audit.sh" --guide "${GUIDE_ARGS[@]}"
+fi
 
 CLI_PORT=""; CLI_USERNAME=""; CLI_OLD_PORT=""; CONF=""
 PORT_SET=0; USER_SET=0; OLD_PORT_SET=0
@@ -82,11 +124,12 @@ done
 (( ! ASSUME_YES || APPLY )) || die "--yes 只能与 --apply 一起使用"
 if (( EUID != 0 )); then
   fail "权限不足，未完成复验；普通用户 SSH 登录后 sudo bash 执行即可"
+  printf '请执行：'; printf '%q ' sudo bash "$0" "${REPLAY_ARGS[@]}"; printf '\n'
   exit 2
 fi
 if [[ ! -f $POLICY_FILE || ! -r $POLICY_FILE || ! -f $STATE_FILE || ! -r $STATE_FILE ]]; then
   fail "新版策略/状态缺失或不可读，stage3 未执行重启复验；这不是服务器安全不合格结论"
-  inf "已有旧方案请用独立审计：sudo bash $(dirname "$0")/stage0-audit.sh --help"
+  printf '从现状进入部署向导：sudo bash %q --guide\n' "$(dirname "$0")/stage0-audit.sh"
   exit 2
 fi
 if (( APPLY || VERIFY_MODE || DO_ROLLBACK )); then
@@ -159,6 +202,9 @@ validate_policy() {  # validate_policy <关联数组名> <ALLOW 数组名>
   done
 }
 
+if (( ! DO_ROLLBACK )); then
+  load_migration "$STATE_ROOT/migration.json" || die "迁移路径记录无效"
+fi
 load_policy "$POLICY_FILE" POLICY POLICY_ALLOWS
 validate_policy POLICY POLICY_ALLOWS
 if (( PORT_SET )) && [[ "$CLI_PORT" != "${POLICY[PORT]}" ]]; then
@@ -249,7 +295,7 @@ compute_config_sha() {
 }
 
 if (( ! DO_ROLLBACK )); then
-  CURRENT_SHA=$(compute_config_sha) || die "无法采集五个受管文件的配置摘要"
+  CURRENT_SHA=$(compute_config_sha) || die "无法采集受管与迁移文件的配置摘要"
   [[ "$CURRENT_SHA" == "${STATE[CONFIG_SHA]}" ]] \
     || die "配置摘要已变化（state=${STATE[CONFIG_SHA]} current=$CURRENT_SHA）；verified/pending 已失效，请先由前序阶段重新登记配置"
 fi

@@ -1,0 +1,47 @@
+# Warning: table ip filter is managed by iptables-nft, do not touch!
+# Warning: table ip nat is managed by iptables-nft, do not touch!
+# Warning: table ip6 nat is managed by iptables-nft, do not touch!
+WARN: /tmp is world writable!
+Rules updated
+Rules updated (v6)
+WARN: /tmp is world writable!
+Rules updated
+Rules updated (v6)
+WARN: /tmp is world writable!
+Firewall is active and enabled on system startup
+WARN: /tmp is world writable!
+迁移计划：备份 12 个原配置；启用公钥，保留原 root/密码策略，接管端口/socket；协调 UFW 来源放行
+  候选认证按磁盘解析：root=yes，密码=yes，公钥=yes；stage2 再收紧
+  将调整 /tmp/reinforce-native-migration-ca5wyodz/ssh/sshd_config
+  将调整 /tmp/reinforce-native-migration-ca5wyodz/socket/override.conf
+  将备份 /tmp/reinforce-native-migration-ca5wyodz/root/etc/default/ufw
+  将备份 /tmp/reinforce-native-migration-ca5wyodz/root/etc/ufw/after.rules
+  将备份 /tmp/reinforce-native-migration-ca5wyodz/root/etc/ufw/after6.rules
+  将备份 /tmp/reinforce-native-migration-ca5wyodz/root/etc/ufw/before.rules
+  将备份 /tmp/reinforce-native-migration-ca5wyodz/root/etc/ufw/before6.rules
+  将备份 /tmp/reinforce-native-migration-ca5wyodz/root/etc/ufw/ufw.conf
+  将备份 /tmp/reinforce-native-migration-ca5wyodz/root/etc/ufw/user.rules
+  将备份 /tmp/reinforce-native-migration-ca5wyodz/root/etc/ufw/user6.rules
+  将备份 /tmp/reinforce-native-migration-ca5wyodz/root/etc/ufw/before.init
+  将备份 /tmp/reinforce-native-migration-ca5wyodz/root/etc/ufw/after.init
+[OK] 事务 20261027-023049-667420968-115225 已备份；尚未修改 SSH 配置
+WARN: /tmp is world writable!
+Rule inserted
+WARN: /tmp is world writable!
+Rule inserted (v6)
+-A ufw-user-input -s 203.0.113.7/32 -p tcp -m tcp --dport 62207 -j ACCEPT
+-A ufw6-user-input -s 2001:db8::1/128 -p tcp -m tcp --dport 62207 -j ACCEPT
+WARN: /tmp is world writable!
+443/tcp                    ALLOW       Anywhere                   # business-https
+443/tcp (v6)               ALLOW       Anywhere (v6)              # business-https
+WARN: /tmp is world writable!
+Firewall reloaded
+[OK] 事务 20261027-023049-667420968-115225 已完整回滚
+WARN: /tmp is world writable!
+443/tcp                    ALLOW       Anywhere                   # business-https
+443/tcp (v6)               ALLOW       Anywhere (v6)              # business-https
+-A INPUT -j reinforce-business
+NATIVE_MIGRATION_PASS
+# Warning: table ip filter is managed by iptables-nft, do not touch!
+# Warning: table ip nat is managed by iptables-nft, do not touch!
+# Warning: table ip6 nat is managed by iptables-nft, do not touch!

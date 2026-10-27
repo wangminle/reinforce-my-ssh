@@ -41,12 +41,13 @@
 
 支持范围主动收窄为 **Ubuntu/Debian + systemd + `Accept=no` 的 `ssh.socket` + `KillMode=process` 的 `ssh.service` + 可用的 IPv4/IPv6 双栈回环与通配监听**。切换时只停止 sshd 主进程，保留其已建立会话的子进程；其他 KillMode 在预检时拒绝。这不是任意 Linux、传统 `ssh.service` 独立监听、Socket 未启用、单栈或其他 init 系统的通用模板。
 
-前两阶段在修改前检查命令依赖、目标账户、sudo 组、`ssh.socket`、受管路径和 `sshd -t`，并要求当前远程来源位于 ALLOW 中。以下情况明确不受支持，应人工整理后重新预检，而不是让脚本猜测合并：
+前两阶段在修改前检查命令依赖、目标账户、sudo 组、`ssh.socket`、受管路径和 `sshd -t`，并要求当前远程来源位于 ALLOW 中。常规全局认证/端口指令、本地 socket 主文件及 drop-in 由 stage1 自动备份迁移，保留其他配置；候选阶段启用公钥并保留原 root/密码策略。标准 UFW 会添加候选来源规则而不关闭防火墙；相关文件进入事务。以下情况仍超出自动迁移范围，会报告具体原因且不写入：
 
 - `/etc/ssh/sshd_config` 及其 Include 中存在活动 `Match`；
-- 非受管文件中有 `Port`、`ListenAddress`、`PermitRootLogin`、`PubkeyAuthentication`、`PasswordAuthentication`、`KbdInteractiveAuthentication` 或 `AuthenticationMethods`；
 - 非绝对 Include、同一行多个 Include pattern、Include 递归过深或配置无法解析；
-- 受管路径已被非本工具文件占用，或路径不是普通文件；
+- 核心受管路径被其他文件占用、迁移文件/目录可被普通用户替换，或符号链接布局；
+- UFW 的 MANAGE_BUILTINS=yes、自定义可执行钩子，或 firewalld 动态管理器；
+- 旧 ssh-firewall 不是纯 oneshot，或有停止钩子/反向生命周期依赖；
 - 目标用户不存在、为 root/UID 0、不在 sudo 组；
 - 新旧端口相同、端口越界、CIDR 非规范网络地址或带主机位。
 
@@ -60,7 +61,7 @@
 
 | 阶段 | 修改内容 | 提交条件 | 完成状态 |
 |---|---|---|---|
-| stage1：候选通道 | 原子加载来源白名单；部署早期防火墙自启、`ssh.socket` 自启和新端口；默认同时保留旧端口 | 从外部经新端口以目标非 root 用户完成公钥登录，并在该会话真实执行 `sudo stage1-newport.sh --confirm` | `candidate-ready` |
+| stage1：候选通道 | 备份迁移旧全局 SSH/socket 配置、协调 UFW；原子加载来源白名单；部署早期防火墙自启、`ssh.socket` 自启和新端口；默认同时保留旧端口 | 从外部经新端口以目标非 root 用户完成公钥登录，并在该会话真实执行 `sudo stage1-newport.sh --confirm` | `candidate-ready` |
 | stage2：认证与端口收口 | 设置仅公钥、禁 root/密码/键盘交互；socket、sshd 和 nft 的端口集合只剩新端口 | 收口后另建一次全新的外部公钥登录，并只在该新会话执行 `sudo stage2-harden.sh --confirm` | `hardened` |
 | stage3：重启验证 | 不修改 SSH、nft、socket 或单元；记录 pre/post 基线和 boot 状态 | `boot_id` 跨重启且完整复验通过 | `verified` |
 
@@ -105,9 +106,18 @@ socket 显式配置 `BindIPv6Only=ipv6-only`，分别绑定 IPv4/IPv6 通配地�
 - `transactions/<TX_ID>/` 保存前两阶段的事务备份和提交/回滚事实；
 - `baselines/pre.*`、`baselines/post.*` 保存 stage3 基线。
 
-阶段提交时计算配置摘要，将策略和五个受管文件绑定到提交状态。stage2 开始子事务前先核对父摘要，stage3 在除 `--rollback` 外的路径先核对摘要；漂移会使后续流程失效并拒绝继续。回滚同时恢复父策略及摘要。不要手改受管文件来“修复”漂移，应查明原因并按阶段回滚、重新部署。
+阶段提交时计算配置摘要，将策略和五个核心受管文件绑定到提交状态；自动迁移时还绑定 migration.json 及其列出的主配置、drop-in、socket 与 UFW 文件。迁移清单也随每阶段事务备份，确保 stage2→stage1 连续回滚能恢复各自父状态。stage2 开始子事务前先核对父摘要，stage3 在除 `--rollback` 外的路径先核对摘要；漂移会使后续流程失效并拒绝继续。回滚同时恢复父策略及摘要。不要手改受管文件来“修复”漂移，应查明原因并按阶段回滚、重新部署。
 
 状态目录、事务目录和策略/状态文件按 root 私密数据保护；操作使用 `/run/lock/reinforce-my-ssh.lock` 互斥。事务 ID 含时间、纳秒和 PID，避免并发或同秒覆盖。
+
+
+### 3.5 自动迁移与防火墙共存
+
+stage1 默认只读生成清单。apply 先备份原文件、单元状态和原 nft 表，安装限时/跨启动恢复后才修改。迁移把常规全局受控指令保留为原文注释，沿用已有的受管文件 Include；没有匹配的 Include 时才前置插入，避免重复载入端口。候选文件启用公钥并承接 sshd 解析出的原 root/密码开关，stage2 再收紧；原多因素认证不会被静默放宽。输入在计划与应用之间变化时整体停止并恢复，不逐文件猜测。
+
+常规旧 ssh-firewall oneshot 只禁用开机重放，不执行其停止逻辑。原 active/enabled 状态纳入备份；需要回滚时恢复状态及原内核表。UFW 只为目标来源和候选端口 prepend allow，原业务规则保留；回滚恢复文件并 reload。新防火墙服务在 UFW 启用时 Requires/After ufw.service，之后才允许 SSH socket 启动。复杂 UFW 钩子或清理外部链的配置不在自动支持范围内。
+
+stage0 的采集结果与基线差距分离。密码会话可以完成采集，也可以启动 stage1；stage1/2 的确认仍要求部署后的外部新公钥会话及真实 sudo。未声明来源目标不自动推导白名单。
 
 ## 4. 状态机
 
@@ -142,7 +152,7 @@ unconfigured
 
 ```text
 --port <n>                 新 SSH 端口，1–65535
---old-port <n|none>        stage1 保留、stage2 关闭的旧端口；默认 22
+--old-port <n|none>        显式值优先；默认识别当前 SSH 端口，无会话时为 22
 --user <name>              已存在的非 root、非 UID 0 管理账户
 --allow <cidr>             来源网段，可重复；至少一个
 --conf <file>              严格 KEY=VALUE 配置文件
@@ -203,7 +213,7 @@ stage3-reboot-check.sh [--port <n>] [--user <name>] [--old-port <n|none>] [--con
 ### 6.1 准备
 
 1. 建立可销毁环境的演练或至少准备平台快照、维护窗口和明确回滚责任人。
-2. 确认系统是支持的 Ubuntu/Debian + systemd `ssh.socket` 布局；先人工处理活动 Match 和非受管端口/认证指令。
+2. 确认系统是支持的 Ubuntu/Debian + systemd `ssh.socket` 布局；先运行 stage1 的只读迁移计划；常规全局端口/认证指令由脚本备份迁移，活动 Match 等未支持布局会具体说明。
 3. 创建并验证非 root 管理账户、sudo 权限和公钥登录；不要等关闭 root 后才第一次试 sudo。
 4. 从真实管理网络确认来源 IP/网段，并核对云安全组、覆盖网络 ACL 和路由。`100.64.0.0/10` 之类地址范围本身不是可信身份；只放行实际需要的节点或网段。
 5. 实际登录一次独立于 sshd 的 VNC、串口或经确认独立的 Agent 救援通道，并验证能取得恢复所需权限。只有演练成功才设置 `RESCUE_CONFIRMED=yes`。
@@ -362,7 +372,7 @@ sudo nft list table inet sshguard
 | 新端口超时 | 可能来自云安全组、上游 ACL/路由、本机 nft 末尾 drop 或其他丢包；超时不能唯一归因安全组。核对真实来源、ALLOW、外层规则、路由和计数器。 |
 | 新端口 RST/connection refused | 可能无监听、socket 未启动、主机或上游主动 reject 等；RST 也不能唯一证明“包到主机但无监听”。结合 `ss`、socket 状态、路径上各层规则判断。 |
 | 防火墙失败且 SSH 不启动 | 这是 Requires 的失败关闭方向。从救援通道检查 loader、nft 语法/语义和 early boot 日志，不要为了临时连通直接移除依赖后长期运行。 |
-| 预检报活动 Match/非受管指令 | 在维护窗口人工整理 OpenSSH 配置并重跑 `sshd -t`；本工具不会猜测哪个值应覆盖。 |
+| 预检列出非受管指令/活动 Match | 常规全局指令属于自动迁移清单，无需先手删；活动 Match、复杂多因素等无法保证等价的布局仍不自动改写。 |
 | confirm 找不到四元组/存活 sshd | 必须在目标外部 SSH 会话直接 sudo 执行；检查是否经过会改变环境的跳转、`su`、tmux 或会话已断开。 |
 | confirm 找不到边界之后的公钥日志 | 核对目标用户、新端口、全新连接及 journal 中 ssh/sshd/ssh@ 的结构化日志；确认日志 PID 属于当前 sudo 的 sshd 进程链，cursor 与 boot 仍有效。TCP 可连不能替代公钥证据。 |
 | stage2 提示不是全新会话 | 关闭用于 apply 的旧认证会话以外的歧义，重新从外部发起连接，在新会话执行 confirm；不要复用 stage2 apply 之前的日志。 |
@@ -391,6 +401,7 @@ sudo nft list table inet sshguard
 | `/var/lib/reinforce-my-ssh/policy.conf` | 跨阶段权威目标策略 |
 | `/var/lib/reinforce-my-ssh/state.conf` | 状态机、当前事务、摘要和 boot/基线引用 |
 | `/var/lib/reinforce-my-ssh/transactions/<TX_ID>/` | manifest、文件备份、单元/nft/监听事实、started、confirmation.json、parent、恢复脚本及完成标记 |
+| `/var/lib/reinforce-my-ssh/transactions/<TX_ID>/policy.target` | 本事务目标策略备份，回滚重试专用；不作为 confirm 的权威策略替身 |
 | `/var/lib/reinforce-my-ssh/baselines/pre.*` | 重启前完整采集和 `META` |
 | `/var/lib/reinforce-my-ssh/baselines/post.*` | 重启后完整采集和 `META` |
 | `/etc/systemd/system/reinforce-my-ssh-<TX_ID>.{service,timer}` | pending 期间的事务专属自动恢复 |
@@ -399,7 +410,31 @@ sudo nft list table inet sshguard
 
 基线是诊断证据，不是可直接套用的配置备份；stage3 回滚会保留 pre/post 文件和引用。事务目录也不应被当作长期归档或任意选择的历史版本库。
 
-## 10. 验证范围与验收边界
+stage1 初次回滚在恢复复验通过后才清理全局策略；失败保留策略，回滚入口也可从当前事务的 policy.target 继续。旧事务首次由新版恢复时先备份现有策略；两者均丢失时须在控制台核对原事务，不猜测补状态。confirm 验证失败只拒绝提交并提示新公钥连接与剩余恢复窗口，原自动恢复继续计时，不能把随后后台恢复误认为 confirm 主动关闭 SSH。
+
+## 10. 状态引导与执行
+
+推荐入口为 `sudo bash stage0-audit.sh --guide`；stage1/2/3 的 `--guide` 也转入该入口，并按实际状态决定下一步。默认 stage0 只读输出检查与 next_step，不产生部署副作用。已有手工 `--apply/--confirm/--verify/--rollback` 契约保留。
+
+| 当前状态 | 向导动作 | 暂停位置 |
+| --- | --- | --- |
+| unconfigured / 无管理记录 | 询问缺少目标，stage1 --apply 备份迁移并建立候选通道 | 新外部公钥连接 |
+| candidate-pending | stage1 --confirm，通过后 stage2 --apply | 收口后的新外部公钥连接 |
+| candidate-ready | stage2 --apply | 收口后的新外部公钥连接 |
+| hardening-pending | stage2 --confirm，通过后 stage3 --apply | 管理员检查救援通道并自行重启 |
+| hardened | stage3 --apply | 管理员自行重启 |
+| reboot-pending / 同 boot | 只给重启及续跑命令 | 等待跨 boot |
+| reboot-pending / 跨 boot | stage3 --verify | 完整复验成功后完成 |
+| verified / 当前 boot | stage3 默认复验 | 完整复验成功后完成 |
+| verified / 其他 boot | stage3 --apply 开始新验证周期 | 等待再次跨 boot |
+
+每步后重新读取状态，预期状态不符或子进程非零立即停止，不将旧报告当作提交证据。已提交策略与显式目标冲突、损坏状态或受管配置缺状态时提示恢复，不能伪造状态跳过阶段。阶段脚本仍自行获取锁、校验摘要和确认真实外部会话；向导不绕过它们。
+
+执行需要明确 `--guide`。普通用户在真实终端 sudo 交接，缺少权限时给出完整命令。Python 通过 heredoc 加载源码，因此从 `/dev/tty` 读取交互并将真实终端传给子进程；无终端不把 EOF 当作确认。无人值守需 `--yes`，首次部署仍需配置的真实救援声明。输入配置只作为数据解析；子进程使用 argv，不经过 shell/eval。首次部署后的阶段采用权威策略，不再向 stage3 传入可能不完整的初始配置。
+
+默认检查退出码不变；向导 `0` 表示最终复验成功，`1` 表示阶段失败，`2` 表示需输入/权限/新会话/重启或阶段未完成，`130` 表示中断。`--host` 只用于重连提示，不用于远程执行。新会话和重启边界必须由操作者完成。
+
+## 11. 验证范围与验收边界
 
 stage1/stage2 的运行时检查覆盖受管文件逐字一致、`sshd -t`、sshd/socket 端口集合、IPv4/IPv6 通配监听和回环连接、nft 磁盘/内核语义、单元 active/enabled、Requires/After，以及 hardened 下目标用户和 root 的 `sshd -T -C` 上下文。stage3 的完整复验还包括旧端口无实际监听、IPv4/IPv6 回环和当前外部来源上下文、磁盘/内核/策略三方 nft 精确一致，以及基线采集状态。
 

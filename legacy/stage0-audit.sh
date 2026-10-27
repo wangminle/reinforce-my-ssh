@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # stage0-audit.sh — 独立只读审计；审计实现内嵌，无外部 Python 文件依赖。
-# 运行环境仍需 Python 3；本文件不部署、不接管、不写阶段状态。
+# 默认只读；--guide 调用同目录阶段脚本执行，权限/新会话/重启边界明确提示。
 set -euo pipefail
+REINFORCE_SSH_ENTRY=$(cd -- "$(dirname -- "$0")" && pwd)/${0##*/}
+export REINFORCE_SSH_ENTRY
 exec python3 - "$@" <<'REINFORCE_SSH_AUDIT_PY'
 #!/usr/bin/env python3
-"""独立只读 SSH 现状审计：不初始化 state，不接管配置，不执行任何部署动作。"""
+"""默认只读 SSH 现状审计；显式 --guide 按状态调用阶段脚本并提供续跑指引。"""
 import argparse
 from dataclasses import asdict, dataclass, field
 import glob
@@ -15,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -68,6 +71,7 @@ class System:
             or args == ("ip", "-j", "address", "show")
             or args[:2] == ("systemctl", "show")
             or args[:2] == ("systemctl", "is-enabled")
+            or args == ("ufw", "status", "verbose")
             or args == ("nft", "-j", "-s", "list", "ruleset")
             or (args[:6] == ("nft", "-s", "-y", "list", "table", "inet") and len(args) == 7)
             or args[:4] == ("systemd-analyze", "--man=no", "--generators=no", "verify")
@@ -365,6 +369,7 @@ class Auditor:
         self.checks, self.units = [], {}
         self.files, self.directives = [], []
         self.connection = None
+        self.collection_issues = []
         self.report = {"schema": 1, "policy": asdict(policy), "read_only": True, "mode": policy.mode, "observed": {}}
 
     def add(self, name, result, detail):
@@ -375,6 +380,8 @@ class Auditor:
             callback()
         except (EvidenceError, ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
             self.add(name, UNKNOWN, str(exc))
+            if name in {"会话采集", "自动识别", "认证采集", "监听采集", "防火墙采集"}:
+                self.collection_issues.append(name)
 
     def unit(self, name):
         if name not in self.units:
@@ -432,7 +439,7 @@ class Auditor:
         if not self.policy.user:
             for variable in ("SUDO_USER", "USER"):
                 candidate = os.environ.get(variable, "")
-                if candidate != "root" and re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", candidate):
+                if re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", candidate):
                     self.policy.user = candidate
                     origins["user"] = variable
                     break
@@ -471,16 +478,17 @@ class Auditor:
         if not self.policy.user or self.policy.port is None:
             raise EvidenceError("认证上下文需要明确的账户和端口，当前无法自动识别")
         uid = self.system.run("id", "-u", self.policy.user).strip()
-        if not uid.isdigit() or int(uid) == 0:
+        if not uid.isdigit():
+            raise EvidenceError("无法读取账户 UID")
+        if self.policy.user == "root" or int(uid) == 0:
             self.add("管理账户", FAIL, "目标账户必须是非 root、非 UID 0 账户")
-            return
         self.files, self.directives, uncertain = scan_config(self.system, self.policy.sshd_config)
         self.system.run("sshd", "-t", "-f", self.policy.sshd_config)
         sources = list(self.policy.sources)
         if self.connection:
             sources.append(self.connection[0])
         sources = list(dict.fromkeys(sources or ["127.0.0.1", "::1"]))
-        for user in (self.policy.user, "root"):
+        for user in dict.fromkeys((self.policy.user, "root")):
             for source in sources:
                 family = ipaddress.ip_address(source).version
                 local = self.connection[2] if self.connection and ipaddress.ip_address(self.connection[2]).version == family else ("127.0.0.1" if family == 4 else "::1")
@@ -505,7 +513,7 @@ class Auditor:
                     missing.append("authenticationmethods")
                 elif not all(all(part == "publickey" for part in path.split(",")) for path in method.split()):
                     wrong.append("authenticationmethods=" + method)
-                name = f"有效认证 {user}@{source}"
+                name = f"磁盘认证配置 {user}@{source}"
                 result = UNKNOWN if uncertain else FAIL if wrong else UNKNOWN if missing else PASS
                 self.add(name, result, "; ".join(wrong + ["缺少 " + key for key in missing]) or "禁 root/密码/键盘交互，只允许公钥；按 sshd 实际解析，文件名不参与判定")
         self.add("认证上下文覆盖", UNKNOWN if uncertain else PASS, "; ".join(uncertain) if uncertain else "未发现活动 Match；Include 已遍历；sshd -t 通过")
@@ -539,12 +547,12 @@ class Auditor:
             if not any(item.name == f"禁止端口 {port}" for item in self.checks):
                 self.add(f"禁止端口 {port}", PASS, "无 TCP 监听")
         if extras:
-            self.add("其他 SSH 端口", PASS if self.policy.mode == "inspect" else FAIL,
+            self.add("其他 SSH 端口", FAIL if self.policy.mode == "policy" else PASS,
                      ", ".join(extras) + ("；现状模式只展示，未声明这些端口必须关闭" if self.policy.mode == "inspect" else ""))
         socket = self.unit("ssh.socket")
         ports = {endpoint(line.rsplit(" (Stream)", 1)[0])[1] for line in socket.get("Listen", "").splitlines() if line.endswith(" (Stream)")}
         if ports - {self.policy.port}:
-            self.add("SSH socket 端口", PASS if self.policy.mode == "inspect" else FAIL, f"有效 socket 端口：{sorted(ports)}")
+            self.add("SSH socket 端口", FAIL if self.policy.mode == "policy" else PASS, f"有效 socket 端口：{sorted(ports)}")
         families, dual_unknown = set(), False
         for version in (4, 6):
             family_output = self.system.run("ss", f"-{version}", "-tlnpeH")
@@ -605,6 +613,10 @@ class Auditor:
             self.add("SSH 持久自启", PASS, "ssh.socket 持久 enabled")
         names = self.policy.firewall_units or ["reinforce-my-ssh-firewall.service", "ssh-firewall.service"]
         loaded = [name for name in names if self.unit(name).get("LoadState") == "loaded"]
+        if len(loaded) > 1:
+            persistent = [name for name in loaded if self.system.run("systemctl", "is-enabled", name).strip() != "disabled"]
+            if persistent:
+                loaded = persistent
         self.report["firewall_units"] = loaded
         if len(loaded) != 1:
             raise EvidenceError("需要明确唯一防火墙加载单元；未发现或存在多个加载者")
@@ -628,6 +640,23 @@ class Auditor:
         except EvidenceError as exc:
             self.add("启动图验证", FAIL if re.search(r"ordering cycle|cyclic", str(exc), re.I) else UNKNOWN, str(exc))
         self.collect("持久规则加载", lambda: self.loader(unit))
+
+    def firewall_managers(self):
+        managers = []
+        for name in ("ufw.service", "firewalld.service", "nftables.service"):
+            try:
+                unit = self.unit(name)
+                if unit.get("LoadState") == "loaded":
+                    managers.append({"unit": name, "active": unit.get("ActiveState", "unknown"),
+                                     "enabled": self.system.run("systemctl", "is-enabled", name).strip()})
+            except (EvidenceError, KeyError) as exc:
+                managers.append({"unit": name, "evidence": str(exc)})
+        self.report["observed"]["firewall_managers"] = managers
+        if any(item.get("unit") == "ufw.service" and item.get("active") == "active" for item in managers):
+            try:
+                self.report["observed"]["ufw_status"] = self.system.run("ufw", "status", "verbose")
+            except EvidenceError as exc:
+                self.report["observed"]["ufw_status"] = str(exc)
 
     def loader(self, unit):
         if unit.get("Type") != "oneshot" or any(unit.get(key, "") for key in ("ExecStartPre", "ExecStartPost", "ExecCondition")):
@@ -695,10 +724,11 @@ class Auditor:
         locals_ = {ipaddress.ip_address(item["local"]) for link in links for item in link.get("addr_info", [])}
         if ipaddress.ip_address(client) in locals_ or self.policy.mode == "policy" and not any(ipaddress.ip_address(client) in ipaddress.ip_network(net) for net in self.policy.allows):
             raise EvidenceError("当前来源是本机自连或不在目标白名单，不能证明目标外部通道")
-        if os.environ.get("SUDO_USER") != self.policy.user:
+        root_session = self.policy.user == "root" and not os.environ.get("SUDO_USER") and os.geteuid() == 0
+        if not root_session and os.environ.get("SUDO_USER") != self.policy.user:
             raise EvidenceError("请由目标用户在其 SSH 会话中直接 sudo 执行")
         uid = self.system.run("id", "-u", self.policy.user).strip()
-        if os.environ.get("SUDO_UID") != uid:
+        if not root_session and os.environ.get("SUDO_UID") != uid:
             raise EvidenceError("sudo UID 不匹配")
         pid, ancestors = os.getpid(), set()
         while pid > 1 and str(pid) not in ancestors:
@@ -725,21 +755,21 @@ class Auditor:
             if match and match[2] == self.policy.user and ipaddress.ip_address(match[3]) == ipaddress.ip_address(client) and int(match[4]) == cp:
                 self.report["observed"]["login_method"] = match[1]
                 self.add("当前认证与 sudo", PASS if match[1] == "publickey" else FAIL,
-                         f"当前会话认证方式={match[1]}；同 boot 日志、存活四元组和 sudo 进程链匹配；基线要求公钥")
+                         f"当前会话认证方式={match[1]}；同 boot 日志、存活四元组和进程链匹配；" + ("root 直接执行，未使用 sudo" if root_session else "sudo UID 匹配") + "；基线要求公钥")
                 return
         raise EvidenceError("没有与当前连接进程链匹配的认证成功日志；不把其他 established 连接当作已登录证据")
 
     def migration(self):
-        blockers = []
-        if self.report.get("ownership", {}).get("kind") != "managed-record":
-            blockers.append("无新版管理记录；现有配置不能直接当作已完成新版阶段")
+        changes, blockers = [], []
         controlled = {"port", "listenaddress", "permitrootlogin", "passwordauthentication", "kbdinteractiveauthentication", "pubkeyauthentication", "authenticationmethods"}
-        blockers += [f"{path}:{number} 非受管 {key}（仅阻止直接接管）" for path, number, key in self.directives if key in controlled and path != MANAGED[0]]
+        changes += [f"{path}:{number} {key} 将由 stage1 备份迁移" for path, number, key in self.directives if key in controlled and path != MANAGED[0]]
+        blockers += [f"{path}:{number} 活动 Match 暂不支持自动迁移" for path, number, key in self.directives if key == "match"]
         for path in ("/etc/systemd/system/ssh.socket.d/override.conf", "/etc/systemd/system/ssh-firewall.service"):
             if self.system.exists(path):
-                blockers.append(path + " 需要专门迁移备份及冲突处理")
-        self.report["migration"] = {"status": "blocked" if blockers else "not-assessed", "blockers": blockers,
-                                    "detail": "本审计不授权 apply，也不证明回滚备份已准备好"}
+                changes.append(path + " 纳入 stage1 迁移与回滚")
+        self.report["migration"] = {"status": "blocked" if blockers else "migration-planned" if changes else "new-deployment" if self.report.get("ownership", {}).get("kind") != "managed-record" else "managed",
+                                    "blockers": blockers, "changes": changes,
+                                    "detail": "无新版状态是首次部署正常起点；具体变更和备份由 stage1 预检生成，本报告不推进阶段"}
 
     def reboot(self):
         self.report["reboot"] = {"status": UNKNOWN, "detail": "未取得可独立关联配置与跨启动的验证记录；自启检查不等于真实重启验证"}
@@ -752,7 +782,15 @@ class Auditor:
             return
         digest = hashlib.sha256()
         digest.update(b"POLICY\n" + self.system.read(STATE_ROOT + "/policy.conf").encode())
-        for file in MANAGED:
+        files = list(MANAGED)
+        migration = STATE_ROOT + "/migration.json"
+        if self.system.exists(migration):
+            plan = json.loads(self.system.read(migration))
+            paths = [item["path"] for item in plan["files"]]
+            if plan.get("schema") != 1 or len(paths) != len(set(paths)) or any(os.path.normpath(path) != path or not path.startswith(("/etc/ssh/", "/etc/systemd/system/ssh.socket.d/", "/etc/ufw/")) and path not in {"/etc/default/ufw", "/etc/systemd/system/ssh.socket"} for path in paths):
+                raise EvidenceError("迁移路径记录无效")
+            files += sorted(paths) + [migration]
+        for file in files:
             digest.update(f"FILE {file}\n".encode() + self.system.read(file).encode())
         boot = self.system.read("/proc/sys/kernel/random/boot_id").strip()
         if state.get("CONFIG_SHA") != digest.hexdigest() or state.get("VERIFIED_BOOT") != boot or state.get("PENDING_BOOT") == boot:
@@ -771,6 +809,7 @@ class Auditor:
     def audit(self):
         self.collect("会话采集", self.find_connection)
         self.collect("自动识别", self.resolve_target)
+        self.collect("防火墙管理器", self.firewall_managers)
         try:
             self.ownership()
         except (EvidenceError, ValueError, KeyError, TypeError) as exc:
@@ -793,13 +832,342 @@ class Auditor:
         self.report.setdefault("migration", {"status": "not-assessed", "blockers": [], "detail": "证据不足，未评估接管准备"})
         self.report["checks"] = [asdict(item) for item in self.checks]
         self.report["security_result"] = combine(self.checks)
+        self.report["baseline_result"] = self.report["security_result"]
+        self.report["collection_result"] = UNKNOWN if self.collection_issues or not self.policy.user or self.policy.port is None else PASS
+        self.report["collection_issues"] = self.collection_issues
         self.report["policy_result"] = self.report["security_result"] if self.policy.mode == "policy" else UNKNOWN
         self.report["scope"] = ("本机显式策略与当前通道" if self.policy.mode == "policy" else "当前 SSH 现状及禁 root/禁密码/公钥基线；未指定来源策略，白名单合规未评估") + "；不代替云安全组、拒绝来源外测或整机重启验收"
         return self.report
 
 
+STAGE_SCRIPTS = {1: "stage1-newport.sh", 2: "stage2-harden.sh", 3: "stage3-reboot-check.sh"}
+
+
+def entry_path():
+    return Path(os.environ.get("REINFORCE_SSH_ENTRY", __file__)).resolve()
+
+
+def setup_values(text):
+    """只解析数据，不 source/eval 用户配置；与阶段 KEY=VALUE 契约一致。"""
+    if text and (not text.endswith("\n") or "\r" in text):
+        raise EvidenceError("配置需要纯 LF 且以换行结束")
+    values = {}
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        if not sep or key not in {"PORT", "OLD_PORT", "USER", "ALLOW", "RECOVERY_SECONDS", "RESCUE_CONFIRMED"}:
+            raise EvidenceError("配置行无法解析：" + line)
+        if key == "ALLOW":
+            values.setdefault(key, []).append(value)
+        elif key in values:
+            raise EvidenceError("配置键重复：" + key)
+        else:
+            values[key] = value
+    return validate_setup(values)
+
+
+def validate_setup(values):
+    result = dict(values)
+    for key in ("PORT", "OLD_PORT"):
+        if key in result:
+            value = str(result[key])
+            if key == "OLD_PORT" and value == "none":
+                continue
+            if not re.fullmatch(r"[0-9]{1,5}", value) or not 1 <= int(value) <= 65535:
+                raise EvidenceError(key + " 需要 1–65535 的端口")
+            result[key] = str(int(value))
+    if result.get("USER") is not None and (result["USER"] == "root" or not re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", result["USER"])):
+        raise EvidenceError("部署目标需要非 root 管理账户；stage0 采集 root 不代表使用 root 部署")
+    try:
+        if "ALLOW" in result:
+            result["ALLOW"] = sorted({str(ipaddress.ip_network(net, strict=True)) for net in result["ALLOW"]})
+    except ValueError as exc:
+        raise EvidenceError(str(exc)) from exc
+    if "RECOVERY_SECONDS" in result:
+        value = str(result["RECOVERY_SECONDS"])
+        if not value.isdigit() or not 60 <= int(value) <= 86400:
+            raise EvidenceError("确认窗口需要 60–86400 秒")
+        result["RECOVERY_SECONDS"] = str(int(value))
+    if "RESCUE_CONFIRMED" in result and result["RESCUE_CONFIRMED"] not in {"yes", "no"}:
+        raise EvidenceError("RESCUE_CONFIRMED 只能为 yes/no，不能用 --yes 代替实际救援演练")
+    return result
+
+
+def guide_goals(options, system):
+    values = setup_values(system.read(options.conf)) if options.conf else {}
+    for option, key in (("port", "PORT"), ("user", "USER"), ("old_port", "OLD_PORT"), ("recovery_seconds", "RECOVERY_SECONDS")):
+        if getattr(options, option) is not None:
+            values[key] = str(getattr(options, option))
+    if options.allow:
+        values["ALLOW"] = list(options.allow)
+    return validate_setup(values)
+
+
+def workflow_plan(system, entry, goals=None, host=None, connection=None, root=None):
+    """推导下一步，不执行；每次动作之后重新读取状态，阶段脚本仍是提交权威。"""
+    root = hasattr(os, "geteuid") and os.geteuid() == 0 if root is None else root
+    entry = Path(entry)
+    resume = ["sudo", "bash", str(entry), "--guide"] + (["--host", host] if host else [])
+    plan = {"state": "unknown", "can_execute": False, "commands": [shlex.join(resume)], "argv": [], "resume": resume}
+    if not root:
+        return {**plan, "status": "sudo-required", "detail": "需要完整读取权限；在自己的终端 sudo 继续，无需开放 root SSH 登录"}
+    try:
+        if system.exists(STATE_ROOT + "/state.conf"):
+            state = parse_kv(system.read(STATE_ROOT + "/state.conf"))
+            if not {"STAGE", "TX", "CONFIG_SHA"} <= state.keys():
+                raise EvidenceError("状态缺少 STAGE/TX/CONFIG_SHA")
+        else:
+            if any(system.exists(path) for path in MANAGED) or system.exists(STATE_ROOT + "/migration.json"):
+                raise EvidenceError("发现受管配置但状态缺失；需要从事务备份恢复，不能伪造阶段")
+            state = {"STAGE": "unconfigured", "TX": "", "CONFIG_SHA": ""}
+        stage = state["STAGE"]
+        if stage not in {"unconfigured", "candidate-pending", "candidate-ready", "hardening-pending", "hardened", "reboot-pending", "verified"}:
+            raise EvidenceError("未知阶段：" + stage)
+        if stage == "unconfigured":
+            if state["TX"] or state["CONFIG_SHA"]:
+                raise EvidenceError("unconfigured 含有未结束的事务记录")
+            policy = validate_setup(goals or {})
+        else:
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", state["TX"]):
+                raise EvidenceError("事务 ID 无效")
+            if stage not in {"candidate-pending", "hardening-pending"} and not re.fullmatch(r"[0-9a-f]{64}", state["CONFIG_SHA"]):
+                raise EvidenceError("已提交阶段缺少有效摘要")
+            policy = setup_values(system.read(STATE_ROOT + "/policy.conf"))
+            if not {"PORT", "OLD_PORT", "USER", "ALLOW", "RECOVERY_SECONDS", "RESCUE_CONFIRMED"} <= policy.keys() or not policy["ALLOW"]:
+                raise EvidenceError("权威策略不完整")
+            for key, value in (goals or {}).items():
+                if key != "RESCUE_CONFIRMED" and key in policy and policy[key] != value:
+                    raise EvidenceError("所给目标与已存策略冲突：" + key + "；省略该参数可沿用当前策略")
+        plan.update(state=stage, policy=policy)
+        if stage == "unconfigured":
+            number, action, detail = 1, "apply", "建立候选通道，自动备份迁移现有配置"
+        elif stage == "candidate-pending":
+            number, action, detail = 1, "confirm", "候选已部署；从部署后的新公钥会话确认"
+        elif stage == "candidate-ready":
+            number, action, detail = 2, "apply", "候选已确认；收紧 root/密码认证和旧端口"
+        elif stage == "hardening-pending":
+            number, action, detail = 2, "confirm", "认证已收紧；再次建立全新公钥会话确认"
+        elif stage == "hardened":
+            number, action, detail = 3, "apply", "记录重启前基线，不修改 SSH 或代为重启"
+        else:
+            boot = system.read("/proc/sys/kernel/random/boot_id").strip()
+            if not re.fullmatch(r"[0-9a-fA-F-]{36}", boot):
+                raise EvidenceError("无法读取当前 boot_id")
+            if stage == "reboot-pending":
+                if not re.fullmatch(r"[0-9a-fA-F-]{36}", state.get("PENDING_BOOT", "")):
+                    raise EvidenceError("缺少有效的重启前 boot_id")
+                if state["PENDING_BOOT"] == boot:
+                    return {**plan, "status": "reboot-required", "detail": "重启前基线已记录；确认救援通道后由管理员重启，重连再继续", "commands": ["sudo reboot", shlex.join(resume)]}
+                number, action, detail = 3, "verify", "已跨过重启；执行重启后完整验证"
+            elif state.get("VERIFIED_BOOT") == boot:
+                number, action, detail = 3, "check", "已有验证记录；复验当前状态后报告完成"
+            else:
+                number, action, detail = 3, "apply", "verified 属于其他启动；开始新一轮重启验证"
+        script = entry.parent / STAGE_SCRIPTS[number]
+        argv = ["bash", str(script)]
+        if number == 1 and action == "apply":
+            for key, flag in (("PORT", "--port"), ("USER", "--user"), ("OLD_PORT", "--old-port"), ("RECOVERY_SECONDS", "--recovery-seconds")):
+                if key in policy:
+                    argv += [flag, policy[key]]
+            for net in policy.get("ALLOW", []):
+                argv += ["--allow", net]
+        if action != "check":
+            argv.append("--" + action)
+        plan.update(status="ready", can_execute=True, number=number, action=action, detail=detail, argv=argv,
+                    commands=[shlex.join(["sudo", *argv]), shlex.join(resume)])
+        if stage == "unconfigured":
+            missing = [key for key in ("PORT", "USER", "ALLOW") if not policy.get(key)]
+            if missing:
+                plan.update(status="parameters-required", can_execute=False, missing=missing,
+                            detail="缺少目标 " + ", ".join(missing) + "；运行 --guide 可现场填写，无需手工改现有配置",
+                            commands=[shlex.join(resume)])
+        if stage in {"candidate-pending", "candidate-ready", "hardening-pending"}:
+            destination = policy["USER"] + "@" + (host or "SERVER")
+            ssh = ["ssh", "-o", "PreferredAuthentications=publickey", "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no", "-p", policy["PORT"], destination]
+            plan["connect"] = shlex.join(ssh)
+            matching = connection and str(connection[3]) == policy["PORT"] and os.environ.get("SUDO_USER") == policy["USER"]
+            if not matching:
+                plan.update(status="new-session-required", can_execute=False,
+                            commands=[plan["connect"], shlex.join(resume)],
+                            detail="请在客户端另开公钥连接，保留旧会话；在新会话 sudo 继续。SERVER 需替换为实际地址或用 --host 指定")
+        if not script.is_file():
+            plan.update(status="scripts-required", can_execute=False, detail="缺少同目录脚本 " + script.name + "；请同步四个 stage 文件")
+        if stage != "unconfigured":
+            rollback_number = 1 if stage.startswith("candidate") else 2 if stage in {"hardening-pending", "hardened"} else 3
+            plan["rollback"] = shlex.join(["sudo", "bash", str(entry.parent / STAGE_SCRIPTS[rollback_number]), "--rollback"])
+        return plan
+    except (EvidenceError, OSError, ValueError, KeyError, TypeError) as exc:
+        return {**plan, "status": "repair-required", "can_execute": False, "detail": str(exc),
+                "commands": [shlex.join(["sudo", "bash", str(entry)]), "sudo ls -la " + shlex.quote(STATE_ROOT + "/transactions")]}
+
+
+def print_workflow(plan):
+    print("\n当前进度：" + plan["state"] + "；下一步：" + plan["detail"])
+    if plan.get("connect"):
+        print("客户端新终端：" + plan["connect"])
+        print("新会话继续：" + shlex.join(plan["resume"]))
+    for command in plan["commands"]:
+        print("  " + command)
+    if plan.get("rollback"):
+        print("需要撤销本阶段时：" + plan["rollback"])
+
+
+class GuideTerminal:
+    """Python 源码通过 stdin heredoc 加载；交互与阶段子进程使用真正的终端。"""
+    def __init__(self):
+        self.reader = open("/dev/tty", "rb", buffering=0)
+        try:
+            self.writer = open("/dev/tty", "wb", buffering=0)
+        except OSError:
+            self.reader.close()
+            raise
+
+    def write(self, value):
+        self.writer.write(value.encode("utf-8"))
+
+    def flush(self):
+        self.writer.flush()
+
+    def readline(self):
+        return self.reader.readline().decode("utf-8", errors="replace")
+
+    def fileno(self):
+        return self.reader.fileno()
+
+    def close(self):
+        self.reader.close()
+        self.writer.close()
+
+
+class Workflow:
+    def __init__(self, options, system, entry, report, terminal=None, runner=None):
+        self.options, self.system, self.entry, self.report = options, system, Path(entry), report
+        self.terminal, self.runner = terminal, runner
+
+    def ask(self, prompt, default=None):
+        if self.terminal is None or self.options.yes:
+            raise EvidenceError("需要填写参数；可在交互终端运行 --guide，或显式提供目标参数")
+        self.terminal.write(prompt + (" [" + str(default) + "]" if default is not None else "") + "：")
+        self.terminal.flush()
+        answer = self.terminal.readline()
+        if not answer:
+            raise EvidenceError("没有收到输入，已停止；未把空输入当作授权")
+        return answer.strip() or default
+
+    def execute(self, argv):
+        print("执行：" + shlex.join(argv), flush=True)
+        if self.runner:
+            return self.runner(argv)
+        try:
+            return subprocess.call(argv, stdin=self.terminal if self.terminal is not None else subprocess.DEVNULL)
+        except OSError as exc:
+            print("命令无法运行：" + str(exc))
+            return 2
+
+    def show(self, plan, goals, connection):
+        if plan.get("connect") and not self.options.host and self.terminal is not None and not self.options.yes:
+            host = self.ask("客户端使用的服务器地址或 SSH 别名（留空则自行替换 SERVER）", "")
+            if host:
+                if not re.fullmatch(r"[A-Za-z0-9_.:\[\]-]+", host):
+                    raise EvidenceError("连接地址含不支持的字符；请重新运行并用 --host 指定")
+                self.options.host = host
+                plan = workflow_plan(self.system, self.entry, goals, host, connection, root=True)
+        print_workflow(plan)
+        return plan
+
+    def run(self, argv):
+        root = hasattr(os, "geteuid") and os.geteuid() == 0
+        if not root:
+            command = ["sudo", "--", "bash", str(self.entry), *argv]
+            print("需要管理员权限，请在自己的终端完成 sudo 验证：" + shlex.join(command))
+            if self.terminal is None or not shutil.which("sudo"):
+                print("请自行执行上述命令，或交给管理员；不需要给通用 bash 配置 NOPASSWD。")
+                return 2
+            code = self.execute(command)
+            if code:
+                print("命令未完成；请依据 sudo/阶段输出处理后重试，不启动后续阶段。")
+            return code
+        if self.terminal is None and not self.options.yes:
+            print("当前没有交互终端。请在 SSH 终端运行 sudo bash " + shlex.quote(str(self.entry)) + " --guide；本次未执行配置变更。")
+            return 2
+        goals = guide_goals(self.options, self.system)
+        for _ in range(8):
+            observer = Auditor(Policy(None, None, [], mode="inspect"), self.system)
+            observer.collect("会话采集", observer.find_connection)
+            plan = workflow_plan(self.system, self.entry, goals, self.options.host, observer.connection, root=True)
+            if plan["state"] == "unconfigured" and plan["status"] in {"ready", "parameters-required"}:
+                if not goals.get("PORT"):
+                    goals["PORT"] = self.ask("目标 SSH 端口（可保持当前端口）", self.report.get("policy", {}).get("port"))
+                if not goals.get("USER"):
+                    default = os.environ.get("SUDO_USER") or self.report.get("policy", {}).get("user")
+                    goals["USER"] = self.ask("目标非 root 管理账户", default if default != "root" else None)
+                if not goals.get("ALLOW"):
+                    source = self.report.get("observed", {}).get("connection", {}).get("source", "未知")
+                    print("当前来源 " + source + " 仅供参考，不会自动变成白名单。")
+                    goals["ALLOW"] = (self.ask("允许来源 CIDR，多个用空格分开") or "").split()
+                goals = validate_setup(goals)
+                plan = workflow_plan(self.system, self.entry, goals, self.options.host, observer.connection, root=True)
+            plan = self.show(plan, goals, observer.connection)
+            if not plan["can_execute"]:
+                return 2
+            command = list(plan["argv"])
+            if plan["action"] == "apply":
+                if self.options.yes and plan["state"] == "unconfigured" and goals.get("RESCUE_CONFIRMED") != "yes":
+                    raise EvidenceError("首次无人值守执行需在 --conf 中声明已经实际演练的 RESCUE_CONFIRMED=yes；或去掉 --yes 交互运行")
+                # 首次部署后权威策略已落盘；原输入可能只是部分配置，不能再传给
+                # 要求完整匹配的 stage3，也不能覆盖交互中已确认的救援事实。
+                if self.options.conf and plan["state"] == "unconfigured":
+                    command += ["--conf", self.options.conf]
+                if self.options.yes:
+                    command.append("--yes")
+            code = self.execute(command)
+            if code:
+                print("本步未完成，停止推进。按上方阶段输出处理后可重试：" + shlex.join(plan["resume"]))
+                # 失败可能发生在写入 pending 后，也可能已自动恢复；以当前状态给恢复命令。
+                print_workflow(workflow_plan(self.system, self.entry, goals, self.options.host, observer.connection, root=True))
+                if plan.get("connect"):
+                    print("若是会话确认问题，请真正重连：" + plan["connect"])
+                if plan.get("rollback"):
+                    print("需要撤销时：" + plan["rollback"])
+                missing = [package for tool, package in (("nft", "nftables"), ("sshd", "openssh-server"), ("ss", "iproute2"), ("ip", "iproute2")) if not shutil.which(tool)]
+                if missing:
+                    print("依赖缺失时由管理员安装（先核对包变更）：" + shlex.join(["sudo", "apt-get", "install", *sorted(set(missing))]))
+                if plan["number"] == 1 and plan.get("policy", {}).get("USER"):
+                    user = plan["policy"]["USER"]
+                    try:
+                        self.system.run("id", "-u", user)
+                    except EvidenceError:
+                        print("目标账户尚未准备，请由管理员在服务器依次执行：")
+                        print("  " + shlex.join(["sudo", "adduser", user]))
+                        print("  " + shlex.join(["sudo", "usermod", "-aG", "sudo", user]))
+                        print("随后安装该用户的客户端公钥并保留 sudo 密码，再运行向导；不要上传私钥或给通用 shell 配 NOPASSWD。")
+                return code
+            expected = {(1, "apply"): "candidate-pending", (1, "confirm"): "candidate-ready", (2, "apply"): "hardening-pending", (2, "confirm"): "hardened", (3, "apply"): "reboot-pending", (3, "verify"): "verified", (3, "check"): "verified"}[(plan["number"], plan["action"])]
+            after = workflow_plan(self.system, self.entry, goals, self.options.host, observer.connection, root=True)
+            if after["state"] != expected or after["status"] == "repair-required":
+                print("阶段未按预期推进或状态被其他会话改变；停止，重新运行 --guide 核对。")
+                self.show(after, goals, observer.connection)
+                return 2
+            if plan["number"] == 3 and plan["action"] in {"verify", "check"}:
+                print("流程完成：stage3 完整复验通过。")
+                return 0
+            if expected in {"candidate-pending", "hardening-pending", "reboot-pending"}:
+                self.show(after, goals, observer.connection)
+                return 2
+        print("状态推进次数异常，已停止，请重新检查实际状态。")
+        return 2
+
+
 def arguments(argv=None):
-    parser = argparse.ArgumentParser(prog="stage0-audit.sh", description=__doc__, epilog="直接 sudo bash stage0-audit.sh 自动检查当前 SSH；--allow 声明目标策略后才比较白名单。退出码：0=本次范围通过，1=不符合基线/目标，2=证据不足。")
+    parser = argparse.ArgumentParser(prog="stage0-audit.sh", description=__doc__, epilog="默认：0=采集完成，2=采集不完整。显式比较目标：0=通过，1=不符合，2=证据不足。--guide：0=全流程复验完成，1=阶段失败，2=需补输入/权限/新会话/重启或阶段未完成，130=中断。")
+    parser.add_argument("--check-baseline", action="store_true", help="显式比较禁 root/密码、公钥基线；默认只采集现状与展示差距")
+    parser.add_argument("--guide", action="store_true", help="按状态执行下一阶段；缺参数交互询问，遇新会话或重启时给出命令")
+    parser.add_argument("--host", help="客户端连接地址或 SSH 别名，只用于生成重连指引")
+    parser.add_argument("--old-port", help="执行向导中显式保留的旧端口（n/none）")
+    parser.add_argument("--conf", help="执行向导的阶段配置文件")
+    parser.add_argument("--recovery-seconds", type=int, help="执行向导的确认窗口")
+    parser.add_argument("--yes", action="store_true", help="执行向导不再询问；首次部署仍须配置 RESCUE_CONFIRMED=yes")
     parser.add_argument("--port", type=int, help="目标端口；默认从当前 SSH_CONNECTION 自动识别，无会话时只接受唯一监听")
     parser.add_argument("--user", help="目标管理账户；默认从 SUDO_USER 自动识别")
     parser.add_argument("--allow", action="append", help="可选的预期来源 CIDR；填写后进入策略比较模式，不自动把当前 IP 当白名单")
@@ -810,10 +1178,16 @@ def arguments(argv=None):
     parser.add_argument("--nft-table", default="sshguard", help="实际 inet 表名")
     parser.add_argument("--format", choices=("text", "json"), default="text")
     options = parser.parse_args(argv)
+    if options.guide and (options.format != "text" or options.check_baseline or options.closed_port or options.source or options.firewall_unit or options.sshd_config != "/etc/ssh/sshd_config" or options.nft_table != "sshguard"):
+        parser.error("--guide 使用 text，并采用实际部署布局；合规审计参数请单独运行")
+    if not options.guide and any((options.old_port, options.conf, options.recovery_seconds, options.yes)):
+        parser.error("--old-port/--conf/--recovery-seconds/--yes 用于 --guide")
+    if options.host and not re.fullmatch(r"[A-Za-z0-9_.:\[\]-]+", options.host):
+        parser.error("--host 需要主机地址或 SSH 别名，不能包含空白或控制字符")
     if options.port is not None and not 1 <= options.port <= 65535 or any(not 1 <= port <= 65535 or port == options.port for port in options.closed_port):
         parser.error("端口范围错误，或目标端口同时声明为关闭")
-    if options.user is not None and (options.user == "root" or not re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", options.user)):
-        parser.error("--user 必须是合法的非 root 账户")
+    if options.user is not None and not re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", options.user):
+        parser.error("--user 必须是合法账户；root 也可采集，其加固差距单列")
     if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_-]*", options.nft_table):
         parser.error("非法 nft 表名")
     if any(not re.fullmatch(r"[a-zA-Z0-9_.@:-]+\.service", unit) for unit in options.firewall_unit):
@@ -826,17 +1200,26 @@ def arguments(argv=None):
     except ValueError as exc:
         parser.error(str(exc))
     policy = Policy(options.port, options.user, allows, sorted(set(options.closed_port)), sources,
-                    options.firewall_unit, options.sshd_config, options.nft_table, "policy" if options.allow else "inspect")
+                    options.firewall_unit, options.sshd_config, options.nft_table, "policy" if options.allow else "baseline" if options.check_baseline or options.closed_port else "inspect")
     return options, policy
 
 
 def main(argv=None):
+    replay = list(sys.argv[1:] if argv is None else argv)
     options, policy = arguments(argv)
+    entry, system = entry_path(), System()
+    if options.guide:
+        # --port/--user/--allow 在向导中是部署目标；先采集当前连接的真实现状。
+        policy = Policy(None, None, [], mode="inspect")
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
-        report = {"schema": 1, "read_only": True, "mode": policy.mode, "policy": asdict(policy), "security_result": UNKNOWN, "policy_result": UNKNOWN,
+        report = {"schema": 1, "read_only": True, "mode": policy.mode, "policy": asdict(policy), "security_result": UNKNOWN, "collection_result": UNKNOWN, "baseline_result": UNKNOWN, "policy_result": UNKNOWN,
                   "checks": [asdict(Check("完整读取权限", UNKNOWN, "请以目标普通用户登录后 sudo bash stage0-audit.sh；不必开放 root SSH 登录"))]}
     else:
-        report = Auditor(policy).audit()
+        observer = Auditor(policy, system)
+        report = observer.audit()
+    connection = report.get("observed", {}).get("connection", {})
+    current = (connection["source"], connection["source_port"], connection["local"], connection["port"]) if connection else None
+    report["next_step"] = workflow_plan(system, entry, host=options.host, connection=current)
     if options.format == "json":
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
@@ -846,20 +1229,46 @@ def main(argv=None):
         current = report.get("observed", {}).get("connection", {})
         print(f"检查对象：账户={target.get('user') or '未识别'}，端口={target.get('port') or '未识别'}，当前登录来源={current.get('source', '未识别')}")
         for item in report["checks"]:
-            print(f"[{LABELS[item['result']]}] {item['name']}：{item['detail']}")
-        print(("现状基线结果：" if inspect else "目标策略结果：") + LABELS[report["security_result"]])
+            label = {PASS: "已核实", FAIL: "待加固", UNKNOWN: "未证实"}[item["result"]] if inspect else LABELS[item["result"]]
+            print(f"[{label}] {item['name']}：{item['detail']}")
+        print(("现状采集：" + ("完成" if report["collection_result"] == PASS else "部分完成，见采集缺口") + "；加固差距供后续阶段处理") if inspect else "目标检查结果：" + LABELS[report["security_result"]])
         if inspect:
             print("来源白名单目标：未指定，未判定合规；当前登录来源仅作事实，不自动生成 --allow")
             firewall = report.get("observed", {}).get("firewall", {})
             print("观察到的 nft 表：" + (", ".join(firewall.get("tables", [])) or "无/未采集"))
             print("观察到的 accept 来源（非完整可达性证明）：" + (", ".join(firewall.get("accept_source_literals", [])) or "无/无法提取"))
+            for manager in report.get("observed", {}).get("firewall_managers", []):
+                print("防火墙管理器：" + json.dumps(manager, ensure_ascii=False))
+            if report.get("observed", {}).get("ufw_status"):
+                print("UFW 现状：" + report["observed"]["ufw_status"].strip())
         print("管理归属：" + report.get("ownership", {}).get("detail", "未采集"))
         migration = report.get("migration", {})
-        print("迁移准备：" + ("存在阻断" if migration.get("status") == "blocked" else "未评估/未授权迁移"))
+        print("部署衔接：" + migration.get("status", "not-assessed"))
+        for item in migration.get("changes", []):
+            print("  - " + item)
         for item in migration.get("blockers", []):
             print("  - " + item)
         print("重启证据：" + report.get("reboot", {}).get("detail", "未采集"))
-    return {PASS: 0, FAIL: 1, UNKNOWN: 2}[report["security_result"]]
+        print_workflow(report["next_step"])
+    if options.guide:
+        terminal = None
+        try:
+            try:
+                terminal = GuideTerminal()
+            except OSError:
+                pass
+            return Workflow(options, system, entry, report, terminal).run(replay)
+        except (EvidenceError, OSError, ValueError) as exc:
+            print("向导暂停：" + str(exc))
+            print("继续执行：" + shlex.join(["sudo", "bash", str(entry), *replay]))
+            return 2
+        except KeyboardInterrupt:
+            print("\n已停止推进；重新运行 --guide 查看实际事务状态及回滚命令。")
+            return 130
+        finally:
+            if terminal is not None:
+                terminal.close()
+    return {PASS: 0, FAIL: 1, UNKNOWN: 2}[report["collection_result"] if policy.mode == "inspect" else report["security_result"]]
 
 
 if __name__ == "__main__":

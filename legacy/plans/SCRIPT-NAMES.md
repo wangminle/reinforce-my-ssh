@@ -2,14 +2,14 @@
 
 | 推荐入口 | 职责 | 旧入口 |
 | --- | --- | --- |
-| stage0-audit.sh | 独立只读审计：安全效果、管理归属、迁移准备和重启证据；实现内嵌，环境仍需 Python 3 | 原 audit.py 已合并，不再单独发布 |
+| stage0-audit.sh | 独立现状采集/可选目标审计：采集与加固差距分开，显示归属、迁移计划和重启证据；实现内嵌，环境仍需 Python 3 | 原 audit.py 已合并，不再单独发布 |
 | stage1-newport.sh | 建立候选新端口通道，保留配置允许的旧入口，外部公钥与 sudo 确认后提交 | stage1.sh |
 | stage2-harden.sh | 禁 root、密码和键盘交互，仅公钥认证，并关闭旧端口 | stage2.sh |
 | stage3-reboot-check.sh | 记录基线，跨重启复验；不部署配置、不代为重启 | stage3.sh |
 
 第二阶段不仅处理 root 登录，因此采用 harden；第三阶段专门验证跨重启状态，因此采用 reboot-check。
 
-stage0 是独立入口，可在已有旧方案或新版机器上随时执行。编号不表示新增了一个持久化阶段，也不会自动把部署状态推进到 stage1。
+stage0 默认是独立只读入口，可在已有旧方案或新版机器上随时执行，输出现状和下一步命令。编号不表示新增了一个持久化阶段。显式 `--guide` 则按实际状态调用阶段脚本，推进到需要新会话或重启的位置并给出续跑命令。
 
 ## 使用
 
@@ -17,6 +17,8 @@ stage0 是独立入口，可在已有旧方案或新版机器上随时执行。�
 
 ```bash
 sudo bash ./stage0-audit.sh
+# 执行向导：缺目标时询问，按实际进度执行；任一 stage 都可加 --guide
+sudo bash ./stage0-audit.sh --guide --host example-host
 # 可选：声明目标策略后比较白名单和应关闭的端口
 sudo bash ./stage0-audit.sh --allow 203.0.113.0/24 --closed-port 22
 sudo bash ./stage1-newport.sh --help

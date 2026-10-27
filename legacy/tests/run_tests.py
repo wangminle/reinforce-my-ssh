@@ -11,7 +11,7 @@ def main():
     parser.add_argument("--integration", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
-    for name in ("test_regressions.py", "test_audit.py"):
+    for name in ("test_regressions.py", "test_audit.py", "test_workflow.py"):
         command = [sys.executable, str(root / name)]
         if args.integration and name == "test_regressions.py":
             command.append("--integration")

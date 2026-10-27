@@ -204,7 +204,7 @@ class AuditTests(unittest.TestCase):
         self.assertNotIn("login_method", report["observed"])
         self.assertEqual(report["target_origin"]["port"], "unique-live-listener")
 
-    def test_ambiguous_listener_and_root_console_do_not_guess_target(self):
+    def test_ambiguous_listener_on_root_console_does_not_guess_port(self):
         del os.environ["SSH_CONNECTION"]
         os.environ["SUDO_USER"] = "root"
         os.environ["USER"] = "root"
@@ -212,7 +212,7 @@ class AuditTests(unittest.TestCase):
         _, policy = audit.arguments([])
         report = audit.Auditor(policy, self.system).audit()
         self.assertIsNone(policy.port)
-        self.assertIsNone(policy.user)
+        self.assertEqual(policy.user, "root")
         self.assertEqual(report["security_result"], audit.UNKNOWN)
         self.assertEqual(report["observed"]["port_candidates"], [22, 2222])
 
@@ -276,7 +276,7 @@ class AuditTests(unittest.TestCase):
         report = self.report()
         self.assertEqual(report["security_result"], audit.PASS, report)
         self.assertEqual(report["ownership"]["kind"], "legacy")
-        self.assertEqual(report["migration"]["status"], "blocked")
+        self.assertEqual(report["migration"]["status"], "migration-planned")
         self.assertEqual(report["reboot"]["status"], audit.UNKNOWN)
         self.assertEqual(before, self.system.files)
         self.assertTrue(all("--apply" not in command and "restart" not in command for command in self.system.calls))
@@ -385,10 +385,91 @@ class AuditTests(unittest.TestCase):
         result = subprocess.run(["bash", str(ROOT / "stage0-audit.sh"), *args, "--apply"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
 
+    def test_reboot_record_includes_migrated_files_and_detects_their_drift(self):
+        policy = audit.STATE_ROOT + "/policy.conf"
+        migration = audit.STATE_ROOT + "/migration.json"
+        extra = "/etc/ssh/sshd_config.d/legacy-retained.conf"
+        self.system.files[policy] = "registered policy\n"
+        for path in audit.MANAGED:
+            self.system.files[path] = "managed file\n"
+        self.system.files[extra] = "# migrated original\n"
+        self.system.files[migration] = json.dumps({"schema": 1, "files": [{"path": extra}]})
+        digest = hashlib.sha256(b"POLICY\nregistered policy\n")
+        for path in [*audit.MANAGED, extra, migration]:
+            digest.update(f"FILE {path}\n".encode() + self.system.files[path].encode())
+        sha = digest.hexdigest()
+        pre, post = audit.STATE_ROOT + "/baselines/pre.migrated", audit.STATE_ROOT + "/baselines/post.migrated"
+        old, current = "2" * 36, self.system.files["/proc/sys/kernel/random/boot_id"].strip()
+        self.system.files[audit.STATE_ROOT + "/state.conf"] = f"STAGE=verified\nTX=test\nCONFIG_SHA={sha}\nPENDING_BOOT={old}\nVERIFIED_BOOT={current}\nPRE_BASELINE={pre}\nPOST_BASELINE={post}\n"
+        for path, kind, boot in ((pre, "pre", old), (post, "post", current)):
+            self.system.files[path + "/META"] = f"KIND={kind}\nBOOT_ID={boot}\nCONFIG_SHA={sha}\nTX=test\nRESULT=complete\n"
+        self.assertEqual(self.report()["reboot"]["status"], "managed-record-consistent")
+        self.system.files[extra] += "# external drift\n"
+        self.assertEqual(self.report()["reboot"]["status"], audit.UNKNOWN)
+
     def test_mutating_commands_cannot_use_collector(self):
         for command in (("systemctl", "restart", "ssh.socket"), ("nft", "flush", "ruleset"), ("bash", "-c", "true")):
             with self.subTest(command=command), self.assertRaises(audit.EvidenceError):
                 audit.System().run(*command)
+
+    def test_password_and_open_auth_are_facts_in_default_mode(self):
+        self.system.login_method = "password"
+        self.system.options.update(permitrootlogin="yes", passwordauthentication="yes")
+        with patch.object(audit.os, "geteuid", return_value=0, create=True), patch.object(audit, "System", return_value=self.system):
+            for args, expected in (([], 0), (["--check-baseline"], 1), (["--allow", "203.0.113.0/24"], 1)):
+                with self.subTest(args=args), contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(audit.main(args), expected)
+                if not args:
+                    self.assertIn("现状采集：完成", output.getvalue())
+                    self.assertIn("[待加固]", output.getvalue())
+                    self.assertNotIn("现状基线结果：不符合", output.getvalue())
+
+    def test_incomplete_required_collection_remains_exit_two(self):
+        self.system.denied = "nft"
+        with patch.object(audit.os, "geteuid", return_value=0, create=True), patch.object(audit, "System", return_value=self.system), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(audit.main(["--format", "json"]), 2)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["collection_result"], audit.UNKNOWN)
+        self.assertIn("防火墙采集", report["collection_issues"])
+
+    def test_root_is_observed_without_becoming_a_valid_deployment_target(self):
+        os.environ.pop("SUDO_USER", None)
+        os.environ.pop("SUDO_UID", None)
+        os.environ["USER"] = "root"
+        original = self.system.run
+        def run(*args):
+            if args == ("id", "-u", "root"):
+                return "0\n"
+            if args[0] == "journalctl":
+                return original(*args).replace("for deploy", "for root")
+            return original(*args)
+        self.system.run = run
+        with patch.object(audit.os, "geteuid", return_value=0, create=True), patch.object(audit, "System", return_value=self.system), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(audit.main(["--format", "json"]), 0)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["policy"]["user"], "root")
+        self.assertEqual(report["collection_result"], audit.PASS)
+        self.assertEqual(report["baseline_result"], audit.FAIL)
+        self.assertEqual(report["observed"]["login_method"], "publickey")
+        self.assertEqual(len(report["observed"]["authentication"]), 1)
+
+    def test_absent_state_is_new_deployment_not_blocker(self):
+        _, policy = audit.arguments([])
+        auditor = audit.Auditor(policy, self.system)
+        auditor.ownership()
+        auditor.migration()
+        self.assertEqual(auditor.report["migration"]["blockers"], [])
+        self.assertNotEqual(auditor.report["migration"]["status"], "blocked")
+
+    def test_ufw_is_collected_separately_from_project_loader(self):
+        self.system.units["ufw.service"] = {"LoadState": "loaded", "ActiveState": "active"}
+        original = self.system.run
+        def run(*args):
+            return "Status: active\n22/tcp ALLOW IN Anywhere\n" if args == ("ufw", "status", "verbose") else original(*args)
+        self.system.run = run
+        report = self.report()
+        self.assertIn("Status: active", report["observed"]["ufw_status"])
+        self.assertTrue(any(item.get("unit") == "ufw.service" for item in report["observed"]["firewall_managers"]))
 
     def test_upload_includes_audit_without_unconditional_stage3(self):
         path = ROOT / "working-scripts" / "upload-ssh-apply-to-aliyun-1.sh"

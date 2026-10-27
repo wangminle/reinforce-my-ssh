@@ -1,12 +1,12 @@
 # 已有服务器的独立只读审计
 
-`stage0-audit.sh` 用于核验已经手工加固、使用旧 apply 方案或已经由新版管理的机器。它不要求 `/var/lib/reinforce-my-ssh` 已存在，不会创建或更新该目录，不会接管配置、安装文件、加载 nft、启停单元或重启服务器。
+`stage0-audit.sh` 默认用于核验已经手工加固、使用旧 apply 方案或已经由新版管理的机器。只读检查不要求 `/var/lib/reinforce-my-ssh` 已存在，不会创建或更新该目录，不会接管配置、安装文件、加载 nft、启停单元或重启服务器。显式 `--guide` 则进入执行向导，调用同目录阶段脚本。
 
 审计实现已内嵌在该文件中，环境仍需 Python 3，但无需分发外部 audit.py。四个工作脚本和旧入口关系见 [脚本命名](SCRIPT-NAMES.md)。
 
 ## 执行方式
 
-先用普通管理账户登录，在服务器中 sudo 执行，不需要开放 root SSH 登录：
+普通管理账户登录后在服务器中 sudo 执行，不需要开放 root SSH 登录。已有 root 会话也可直接采集，root 身份会单列为加固差距，不作为采集阻断：
 
 ```bash
 ssh example-host
@@ -15,7 +15,7 @@ sudo bash ~/ssh-apply/stage0-audit.sh
 
 默认是现状检查：从 `SUDO_USER` 识别账户，从当前或祖先进程环境中的 `SSH_CONNECTION` 识别端口和来源；没有会话时只在 SSH 监听端口唯一时选择该端口。无法唯一识别的部分报告证据不足，其余项目继续采集，可按提示补 `--user` 或 `--port`。控制台 root 不会被自动当作普通管理账户。
 
-检查当前用户及 root 的有效认证配置、实际监听、当前会话认证方式和 sudo 关联，并采集 nft、持久加载与启动依赖。认证按本项目禁 root/密码、仅公钥基线比较；白名单来源及应关闭端口属于操作者意图，不从当前配置反推。
+检查当前用户及 root 的有效认证配置、实际监听、当前会话认证方式和 sudo 关联，并采集 nft、持久加载与启动依赖。认证差距与采集完成分别报告。当前使用密码、root/密码仍开放，都作为后续阶段要处理的事实；不要求先手工改到合格。白名单和应关闭端口属于目标意图，不从当前配置反推。显式 `--check-baseline` 才按禁 root/密码、仅公钥基线决定退出码。
 
 如需按明确的目标白名单比较，再使用：
 
@@ -37,7 +37,7 @@ sudo bash ~/ssh-apply/stage0-audit.sh \
 
 - `--format json`：输出机器可读报告；重定向保存由操作者决定，脚本本身只输出 stdout。
 - `--source IP`：补充要采集的 sshd 来源上下文，可重复；默认优先当前 SSH 来源，无当前会话时采集回环样本。
-- `--firewall-unit custom.service`：指定实际加载器；默认识别新旧防火墙服务名。两个都存在时不会猜测唯一所有者。
+- `--firewall-unit custom.service`：指定实际加载器；默认识别新旧防火墙服务名。多个加载器都持久启用时保留未知；已迁移并禁用的旧 oneshot 不再与新服务争用归属。另采集 ufw/firewalld/nftables 服务；UFW 启用时读取实际状态。
 - `--nft-table name`：指定实际 inet 表名，默认 sshguard。
 - `--sshd-config /absolute/path`：指定磁盘解析入口；非默认入口与存活主进程的关联默认保留为未知。
 
@@ -49,16 +49,28 @@ sudo bash ~/ssh-apply/stage0-audit.sh \
 
 | 字段 | 含义 |
 | --- | --- |
-| 检查范围 mode | inspect 为默认现状基线检查；policy 为指定 --allow 后的目标策略审计 |
-| 安全效果 security_result | 本次检查范围内的通过、不符合或证据不足，不由配置文件名或纳管状态决定 |
+| 检查范围 mode | inspect 为默认现状采集；baseline 为显式 --check-baseline；policy 为指定 --allow 后的目标审计 |
+| 采集结果 collection_result | 必要采集是否完成；默认退出码只依据本字段，采集完成不等于安全达标 |
+| 基线差距 baseline_result / security_result | 当前检查的目标差距；security_result 保留为兼容字段，inspect 不按它决定采集成败 |
 | 白名单目标 policy_result | policy 模式等同本次审计结果；inspect 模式始终为 unknown，因未声明预期来源 |
 | 管理归属 ownership | 新版记录、旧方案痕迹、未纳管或未知；存在新版记录也不代表配置安全 |
-| 迁移准备 migration | 阻断列表或未评估；不代表允许执行 apply，也不代表迁移备份已经齐全 |
+| 部署衔接 migration | new-deployment、migration-planned、managed 或 blocked；未纳管本身不阻断，常规旧指令列为 stage1 待迁移项 |
 | 重启证据 reboot | 核对新版 pre/post 元数据与 boot/配置的一致性，或证据不足；本次不执行重启 |
+| 下一步 next_step | 根据实际阶段给出可执行动作、缺项、续跑与回滚命令；默认只输出，`--guide` 才执行 |
 
-退出码：0 为本次范围已证实通过；1 为至少一项已证实不符合；2 为没有明确不符合但存在权限、采集或支持范围不足。明确不符合与证据不足并存时返回 1，仍保留每一项证据。
+默认 inspect：0 为必要采集完成，2 为权限或必要采集不足；密码会话和加固差距不使采集失败。显式 baseline/policy：0 为目标通过，1 为存在明确不符合，2 为其余证据不足。重启或非支持加载器的未知项仍逐项显示，不冒充已验证。
 
 安全效果通过不代表公网、云安全组、拒绝来源外测或真实重启已完成；这些范围会在报告中说明，重启记录单独列出。无新版记录不会使安全效果自动失败。
+
+## 从检查进入执行
+
+在 SSH 交互终端运行 `sudo bash ~/ssh-apply/stage0-audit.sh --guide`。第一次会询问目标端口、非 root 管理账户和允许来源；已有权威策略则直接沿用。`--host` 可提供客户端使用的地址或别名，生成可复制的重连命令；不从服务器私网地址猜测公网入口。
+
+向导先采集现状，再按 state 调用 stage1/2/3，不要求先手工把现状改为安全基线。stage1/2 apply 后暂停，待新的外部公钥会话执行同一向导确认；确认后自动执行下一阶段。stage3 记录基线后提示管理员自行重启，跨 boot 后续跑执行 verify。确认仍由阶段脚本核验真实会话、公钥日志和 sudo，不因向导放宽。
+
+普通用户可直接 `bash stage0-audit.sh --guide`，有交互终端和 sudo 时转入 sudo 验证；不具备权限时打印原参数完整命令。缺依赖或目标账户时给出管理员安装/创建命令，不自行安装软件或创建账户。自定义 Match、复杂防火墙等不支持项仍显示具体原因，保留现场与重试/回滚入口。
+
+`--guide` 不与合规审计的 `--check-baseline`、`--source`、`--closed-port`、`--format json` 等混用；其 `--port/--user/--allow` 表示部署目标，采集仍使用当前真实会话。无人值守需 `--yes`、完整目标，首次部署配置仍须 `RESCUE_CONFIRMED=yes`。后续从持久策略恢复，无需重复输入。
 
 ## 如何核验及支持边界
 
@@ -79,4 +91,4 @@ sudo bash ~/ssh-apply/stage0-audit.sh \
 
 stage1 默认是部署前提检查；stage2/stage3 默认是受管状态复验。未纳管时它们不再把缺少新版阶段误写成服务器未加固，而是提示独立审计并返回非零。所有 apply、confirm 和 rollback 的保护仍保留。
 
-上传脚本现在同时上传 stage0-audit.sh，只说明上传完成，不再无条件建议所有机器执行 stage3。当前旧服务器不迁移的决定保持不变；本轮没有实现 adopt/迁移入口。
+上传脚本现在同时上传 stage0-audit.sh，只说明上传完成，不再无条件建议所有机器执行 stage3。stage1 现在会生成常规旧配置的只读迁移计划，apply 时统一备份、迁移和协调 UFW；不会因为缺少新版 state 或存在常规非受管指令而要求用户先删除配置。已有服务器是否实际迁移仍由操作者选择。

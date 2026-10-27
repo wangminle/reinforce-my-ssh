@@ -1,0 +1,84 @@
+test_allow_equivalent_cidr_and_leading_zero_window (__main__.Regression.test_allow_equivalent_cidr_and_leading_zero_window) ... ok
+test_candidate_regeneration_survives_new_process_and_stage2 (__main__.Regression.test_candidate_regeneration_survives_new_process_and_stage2) ... ok
+test_compat_firewall_restore_failure_can_be_retried (__main__.Regression.test_compat_firewall_restore_failure_can_be_retried) ... ok
+test_current_user_and_old_port_are_inferred_without_overriding_explicit_policy (__main__.Regression.test_current_user_and_old_port_are_inferred_without_overriding_explicit_policy) ... ok
+test_four_runtime_files_are_self_contained (__main__.Regression.test_four_runtime_files_are_self_contained) ... ok
+test_hardened_auth_generation_uses_stage_argument (__main__.Regression.test_hardened_auth_generation_uses_stage_argument) ... ok
+test_initial_arm_failure_rolls_back_to_unconfigured (__main__.Regression.test_initial_arm_failure_rolls_back_to_unconfigured) ... ok
+test_journal_boundary_current_boot_and_capture_failure (__main__.Regression.test_journal_boundary_current_boot_and_capture_failure) ... ok
+test_late_recovery_cleans_only_its_own_units (__main__.Regression.test_late_recovery_cleans_only_its_own_units) ... ok
+test_migrated_stage2_then_stage1_reverse_rollback (__main__.Regression.test_migrated_stage2_then_stage1_reverse_rollback) ... ok
+test_migration_enables_keys_without_closing_passwords_or_relaxing_mfa (__main__.Regression.test_migration_enables_keys_without_closing_passwords_or_relaxing_mfa) ... ok
+test_migration_input_drift_fails_before_any_file_is_changed (__main__.Regression.test_migration_input_drift_fails_before_any_file_is_changed) ... ok
+test_migration_paths_reject_escape_and_core_file_collision (__main__.Regression.test_migration_paths_reject_escape_and_core_file_collision) ... ok
+test_migration_plan_apply_and_full_rollback (__main__.Regression.test_migration_plan_apply_and_full_rollback) ... ok
+test_migration_rejects_unsafe_ufw_and_match_without_modification (__main__.Regression.test_migration_rejects_unsafe_ufw_and_match_without_modification) ... ok
+test_native_audit_dual_stack_socket_option (__main__.Regression.test_native_audit_dual_stack_socket_option) ... ok
+test_native_audit_nft_json (__main__.Regression.test_native_audit_nft_json) ... ok
+test_native_nft_all_stages_and_atomic_failure (__main__.Regression.test_native_nft_all_stages_and_atomic_failure) ... ok
+test_native_restore_removes_extra_chain (__main__.Regression.test_native_restore_removes_extra_chain) ... ok
+test_native_systemd_dual_stack_and_service_switch (__main__.Regression.test_native_systemd_dual_stack_and_service_switch) ... ok
+test_native_tx_begin_distinguishes_existing_and_absent_table (__main__.Regression.test_native_tx_begin_distinguishes_existing_and_absent_table) ... ok
+test_nft_equivalence_and_extra_rule_rejection (__main__.Regression.test_nft_equivalence_and_extra_rule_rejection) ... ok
+test_normalizers_identical (__main__.Regression.test_normalizers_identical) ... ok
+test_old_entry_names_delegate_and_stage0_preserves_arguments (__main__.Regression.test_old_entry_names_delegate_and_stage0_preserves_arguments) ... ok
+test_partial_recovery_install_cleanup_and_retry (__main__.Regression.test_partial_recovery_install_cleanup_and_retry) ... ok
+test_recovery_uses_stable_stage_id_after_rename (__main__.Regression.test_recovery_uses_stable_stage_id_after_rename) ... ok
+test_restore_absent_unit_does_not_stop_missing_unit (__main__.Regression.test_restore_absent_unit_does_not_stop_missing_unit) ... ok
+test_restore_policy_digest_and_failed_nft_never_commits (__main__.Regression.test_restore_policy_digest_and_failed_nft_never_commits) ... ok
+test_session_evidence_positive_and_unrelated_or_old_log_rejected (__main__.Regression.test_session_evidence_positive_and_unrelated_or_old_log_rejected) ... ok
+test_socket_output_and_bind_configuration (__main__.Regression.test_socket_output_and_bind_configuration) ... ok
+test_ssh_switch_order_and_failed_socket (__main__.Regression.test_ssh_switch_order_and_failed_socket) ... ok
+test_stage2_order_reload_firewall_and_boundary_after_checks (__main__.Regression.test_stage2_order_reload_firewall_and_boundary_after_checks) ... ok
+test_stage2_rejects_parent_digest_before_system_changes (__main__.Regression.test_stage2_rejects_parent_digest_before_system_changes) ... ok
+test_stage3_boot_gate (__main__.Regression.test_stage3_boot_gate) ... ok
+test_stage3_state_only_rollback_does_not_need_valid_migration_metadata (__main__.Regression.test_stage3_state_only_rollback_does_not_need_valid_migration_metadata) ... ok
+test_static (__main__.Regression.test_static) ... ok
+test_tx_begin_rejects_nft_inventory_failures (__main__.Regression.test_tx_begin_rejects_nft_inventory_failures) ... ok
+test_tx_begin_rejects_unsupported_unit_states (__main__.Regression.test_tx_begin_rejects_unsupported_unit_states) ... ok
+test_unmanaged_diagnostics_do_not_report_security_failure (__main__.Regression.test_unmanaged_diagnostics_do_not_report_security_failure) ... ok
+
+----------------------------------------------------------------------
+Ran 39 tests in 8.738s
+
+OK
+test_absent_state_is_new_deployment_not_blocker (__main__.AuditTests.test_absent_state_is_new_deployment_not_blocker) ... ok
+test_ambiguous_listener_on_root_console_does_not_guess_port (__main__.AuditTests.test_ambiguous_listener_on_root_console_does_not_guess_port) ... ok
+test_any_auth_requires_all_other_methods_disabled (__main__.AuditTests.test_any_auth_requires_all_other_methods_disabled) ... ok
+test_auto_detected_port_conflicting_with_closed_port_is_flagged (__main__.AuditTests.test_auto_detected_port_conflicting_with_closed_port_is_flagged) ... ok
+test_consistent_managed_reboot_record_and_drift (__main__.AuditTests.test_consistent_managed_reboot_record_and_drift) ... ok
+test_corrupt_ownership_does_not_taint_security (__main__.AuditTests.test_corrupt_ownership_does_not_taint_security) ... ok
+test_disabled_boot_cycle_and_complex_loader (__main__.AuditTests.test_disabled_boot_cycle_and_complex_loader) ... ok
+test_discovery_reads_live_listener_when_systemctl_is_unavailable (__main__.AuditTests.test_discovery_reads_live_listener_when_systemctl_is_unavailable) ... ok
+test_disk_later_than_process_and_wrong_log_pid_are_unknown (__main__.AuditTests.test_disk_later_than_process_and_wrong_log_pid_are_unknown) ... ok
+test_explicit_target_wins_and_allow_enables_policy_comparison (__main__.AuditTests.test_explicit_target_wins_and_allow_enables_policy_comparison) ... ok
+test_extra_socket_port_is_observation_only_in_inspect_mode (__main__.AuditTests.test_extra_socket_port_is_observation_only_in_inspect_mode) ... ok
+test_incomplete_required_collection_remains_exit_two (__main__.AuditTests.test_incomplete_required_collection_remains_exit_two) ... ok
+test_inspect_firewall_collects_facts_without_whitelist_verdict (__main__.AuditTests.test_inspect_firewall_collects_facts_without_whitelist_verdict) ... ok
+test_ipv6_dual_socket_is_equivalent_for_ipv4 (__main__.AuditTests.test_ipv6_dual_socket_is_equivalent_for_ipv4) ... ok
+test_match_is_unknown_not_blanket_security_failure (__main__.AuditTests.test_match_is_unknown_not_blanket_security_failure) ... ok
+test_mutating_commands_cannot_use_collector (__main__.AuditTests.test_mutating_commands_cannot_use_collector) ... ok
+test_no_arguments_inspect_current_session_without_learning_policy (__main__.AuditTests.test_no_arguments_inspect_current_session_without_learning_policy) ... ok
+test_no_arguments_text_json_and_nonroot_have_clear_scope (__main__.AuditTests.test_no_arguments_text_json_and_nonroot_have_clear_scope) ... ok
+test_nonroot_exit_two_and_invalid_apply_rejected (__main__.AuditTests.test_nonroot_exit_two_and_invalid_apply_rejected) ... ok
+test_old_loopback_without_interface_is_not_silently_accepted (__main__.AuditTests.test_old_loopback_without_interface_is_not_silently_accepted) ... ok
+test_password_and_open_auth_are_facts_in_default_mode (__main__.AuditTests.test_password_and_open_auth_are_facts_in_default_mode) ... ok
+test_password_login_is_reported_and_unrelated_log_is_not_evidence (__main__.AuditTests.test_password_login_is_reported_and_unrelated_log_is_not_evidence) ... ok
+test_permission_failure_is_unknown (__main__.AuditTests.test_permission_failure_is_unknown) ... ok
+test_port_22_is_not_implicitly_required_closed (__main__.AuditTests.test_port_22_is_not_implicitly_required_closed) ... ok
+test_reboot_record_includes_migrated_files_and_detects_their_drift (__main__.AuditTests.test_reboot_record_includes_migrated_files_and_detects_their_drift) ... ok
+test_root_is_observed_without_becoming_a_valid_deployment_target (__main__.AuditTests.test_root_is_observed_without_becoming_a_valid_deployment_target) ... ok
+test_safe_legacy_is_not_failed_for_missing_new_state (__main__.AuditTests.test_safe_legacy_is_not_failed_for_missing_new_state) ... ok
+test_sudo_environment_recovers_connection_from_ancestor (__main__.AuditTests.test_sudo_environment_recovers_connection_from_ancestor) ... ok
+test_ufw_is_collected_separately_from_project_loader (__main__.AuditTests.test_ufw_is_collected_separately_from_project_loader) ... ok
+test_unique_listener_fallback_does_not_invent_session_evidence (__main__.AuditTests.test_unique_listener_fallback_does_not_invent_session_evidence) ... ok
+test_unsafe_auth_fails_even_with_managed_record (__main__.AuditTests.test_unsafe_auth_fails_even_with_managed_record) ... ok
+test_unsafe_firewall_and_rule_order (__main__.AuditTests.test_unsafe_firewall_and_rule_order) ... ok
+test_unsafe_loader_prerequisite_and_hidden_post_command (__main__.AuditTests.test_unsafe_loader_prerequisite_and_hidden_post_command) ... ok
+test_unsupported_nft_and_other_chains_are_unknown (__main__.AuditTests.test_unsupported_nft_and_other_chains_are_unknown) ... ok
+test_upload_includes_audit_without_unconditional_stage3 (__main__.AuditTests.test_upload_includes_audit_without_unconditional_stage3) ... ok
+
+----------------------------------------------------------------------
+Ran 35 tests in 0.212s
+
+OK

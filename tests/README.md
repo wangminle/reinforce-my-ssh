@@ -1,34 +1,24 @@
-# 回归测试
-
-测试脚本只提取待测函数，不执行三个阶段脚本的完整 apply。默认测试使用临时目录和命令替身。
-
-主脚本采用 stage1-newport.sh、stage2-harden.sh、stage3-reboot-check.sh，独立审计入口为 stage0-audit.sh。回归同时验证旧入口兼容、参数和退出码透传，以及改名后事务阶段标识仍然稳定。
-
-生产部署只需这四个 shell 文件。stage0 的 Python 实现内嵌于文件中；tests/audit_source.py 仅为测试提取并加载它，不会分发到服务器。回归包含四文件独立目录运行检查，防止重新引入外部工作文件依赖。
-
-Linux / WSL 中运行：
+# tests/ —— 三个只读指导脚本的回归测试
 
 ```bash
-python3 tests/run_tests.py
-sudo python3 tests/run_tests.py --integration
+python3 tests/run-tests.py
 ```
 
-依赖：Python 3、Bash、ShellCheck；集成模式另需 root、nft、iproute2、systemd、unshare，且 systemd 必须是当前系统管理器。
+当前 37 项测试全部通过。测试**不接触真实系统**：通过 `tests/guide-support.py` 提取三个脚本内嵌的 Python 实现，并把 `System` 替换为内存桩件（`StubSystem`），因此文件系统、`ss`/`sshd`/`nft`/`systemctl`/`journalctl` 全部为预置输出。
 
-`--integration` 中的 nft 操作位于独立网络命名空间。systemd 检查创建带 `PrivateNetwork=yes` 的临时 `reinforce-test-*` 单元，使用独立的测试端口，结束时停止单元并清理文件。不操作真实 ssh.service/ssh.socket，不改变主机 nft 表、不执行重启。
+命名约定：仓库内脚本与辅助文件统一使用连字符风格（如 `stage0-check.sh`、`run-tests.py`，不使用空格或下划线分隔）。由于 `unittest` 的发现机制拒绝非标识符文件名（`VALID_MODULE_NAME`），`run-tests.py` 按路径用 `importlib` 显式加载 `test-*.py`，`test-guides.py` 同样以模块名导入 `guide-support`。
 
-Windows PowerShell 可使用：
+## 覆盖范围
 
-```powershell
-./tests/run_tests.ps1 -Distribution Debian -Integration
-```
+- **脚本完整性**：三个脚本 `bash -n` 通过；heredoc 内嵌边界唯一且完整。
+- **只读保证**：命令白名单逐项断言（`nft` 仅 `list/-j`、`sshd` 仅 `-t/-T`、`ufw` 仅 `status`、`systemctl` 仅查询子命令），并实测一遍完整探测流程，断言所有被执行命令都未越过白名单；源码级扫描禁止 `shell=True`/`os.system`/可写 systemctl 子命令。
+- **解析**：`SSH_CONNECTION`（含非法值报错）、journal 四元组公钥证据匹配、`ss -tlnpH` 的 sshd 归属与 `(Stream)` 后缀、socket `Listen` 解析、账户/公钥权限、nft `-j` 单元素集合折叠。
+- **白名单判定**：nft 通过 / 无来源限制 / 缺默认拒绝 / 来源超出声明 / ufw 变体 五条路径。
+- **stage1 步骤**：初始态与门槛（`1-backup`、`0-rescue`、`4-verify-new`）、监听但未持久化（warn）、新端口公钥会话满足硬门槛、**密码会话不满足硬门槛**、`--old-port none`。
+- **stage2 步骤**：前置阻塞、来源不在白名单的硬阻断、全部达成但未重启、跨重启复验完成、禁用密码前必须有已验证公钥会话。
+- **stage0 定位**：进行中 / 待跨重启验证 / 已通过跨重启验证三种位置、旧版待确认事务阻断（退出码 1）、非 root 退出码 2、JSON 结构。
+- **参数与输出**：非法端口/root 账户/缺失 `--allow`/端口冲突被拒；严格 CIDR 规范化；JSON 报告可序列化且退出码正确。
 
-输出可保存到 `plans/checkpoints/`。统一入口依次执行 `test_regressions.py` 和 `test_audit.py`，保留各自测试数量及跳过项。
+## 边界
 
-三阶段回归覆盖监听解析、双栈绑定、SSH 主进程/socket 切换顺序、三个阶段 nft 规范化、额外规则拒绝、原子加载失败、完整表恢复、父策略/摘要恢复、失败不提交、早期自动恢复安装失败、迟到任务清理、CIDR 等价写法、journal cursor/boot/PID 关联和同 boot 验证拒绝。事务备份门禁另覆盖 nft 表枚举/备份失败，以及 systemctl active/enabled 状态为空或不受支持时在 pending 前拒绝。原生 nft 命名空间测试还核验带 table 前缀的真实枚举输出、目标表完整备份，以及不同 family/相似表名不被误认。
-
-独立审计回归覆盖安全旧配置无需新版状态即可通过、不安全受管配置仍失败、Match/权限/复杂 nft/加载器未知分类、规则顺序、boot 记录一致性与漂移、非法写入命令拒绝、上传提示。集成模式另用真实 nft JSON 和真实 v6only socket 验证审计解析。
-
-默认现状检查另覆盖零参数执行、sudo 祖先环境恢复、当前 22 不自动列为关闭、显式参数优先、唯一监听回退、多端口/控制台不猜测、白名单不自动生成、密码认证与无关日志区分、text/JSON/普通权限输出及自动识别目标与关闭端口冲突。
-
-这些测试没有覆盖真实 SSH 认证、原有 SSH 子会话存活、真实虚拟机迁移、真实重启、跨启动恢复或公网路径。上述整机验收仍由台账 `CHK-001` 跟踪。
+桩件测试证明的是脚本的判定与只读契约，**不替代真实服务器验收**：真实整机迁移、外部连接成功/失败、跨重启持久化仍需在可销毁环境按 `plans/DESIGN-v2.md` 的验收边界执行（台账 CHK-001、BUG-016 范围）。

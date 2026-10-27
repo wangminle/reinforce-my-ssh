@@ -61,9 +61,254 @@ class Regression(unittest.TestCase):
                     result = subprocess.run([*command, str(path)], capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def migration_case(self, body, *, ok=True):
+        if os.geteuid() != 0:
+            self.skipTest("迁移文件权限检查需要 root 测试用户")
+        ssh = self.work / "ssh"
+        (ssh / "sshd_config.d").mkdir(parents=True)
+        socket = self.work / "socket"
+        socket.mkdir()
+        ufw = self.work / "ufw"
+        ufw.mkdir()
+        (ssh / "sshd_config").write_text(f"Include {ssh}/sshd_config.d/*.conf\nPort 22\nListenAddress 127.0.0.1\n")
+        (ssh / "sshd_config.d" / "99-old.conf").write_text("PermitRootLogin yes\nPasswordAuthentication yes\nKbdInteractiveAuthentication no\n")
+        (socket / "override.conf").write_text("[Unit]\nRequires=ssh-firewall.service other.service\n[Socket]\nListenStream=22\nBindIPv6Only=both\n")
+        (ufw / "user.rules").write_text("# original business rules\n")
+        (ufw / "user6.rules").write_text("# original IPv6 business rules\n")
+        (ufw / "ufw.conf").write_text("ENABLED=yes\n")
+        (self.work / "default-ufw").write_text("MANAGE_BUILTINS=no\n")
+        (self.work / "compute-stage3").write_text(function(3, "compute_config_sha"))
+        (self.work / "stage2-transactions").write_text("\n".join(function(2, name) for name in ("tx_begin", "tx_restore", "gen_sshd_dropin", "gen_fw_unit", "all_ports")))
+        return self.bash(1, r'''
+SSHD_CONFIG=$WORK/ssh/sshd_config; SSHD_DROPIN=$WORK/ssh/sshd_config.d/00-reinforce-my-ssh.conf
+SOCKET_DIR=$WORK/socket; SOCKET_OVERRIDE=$WORK/socket/00-reinforce-my-ssh.conf
+UFW_DIR=$WORK/ufw; UFW_DEFAULT=$WORK/default-ufw
+STATE_ROOT=$WORK/state; TX_ROOT=$STATE_ROOT/transactions
+STATE_FILE=$STATE_ROOT/state.conf; POLICY_FILE=$STATE_ROOT/policy.conf
+NFT_RULES=$WORK/nft; NFT_LOADER=$WORK/loader; FW_UNIT=$WORK/unit
+MANAGED_FILES=("$SSHD_DROPIN" "$NFT_RULES" "$NFT_LOADER" "$FW_UNIT" "$SOCKET_OVERRIDE")
+CORE_MANAGED_FILES=("${MANAGED_FILES[@]}")
+PORT=62207; OLD_PORT=22; USERNAME=deploy; ALLOWS=(203.0.113.7/32 2001:db8::1/128)
+sshd() {
+  if [[ $1 == -T ]]; then
+    printf 'permitrootlogin yes\npubkeyauthentication yes\npasswordauthentication yes\nkbdinteractiveauthentication no\nauthenticationmethods any\n'
+  fi
+  return 0
+}
+systemctl() {
+  printf '%s\n' "$*" >> "$WORK/systemctl-calls"
+  case $1 in
+    show)
+      case $4 in
+        LoadState) printf 'loaded\n';;
+        Type) printf 'oneshot\n';;
+      esac;;
+    is-enabled) printf 'enabled\n';;
+    is-active) [[ $2 != firewalld.service ]] || { printf 'inactive\n'; return 3; }; printf 'active\n';;
+  esac
+  return 0
+}
+ufw() {
+  printf '%s\n' "$*" >> "$WORK/ufw-calls"
+  case $1 in
+    status) printf 'Status: active\n';;
+    prepend) printf '# added candidate\n' >> "$UFW_DIR/user.rules";;
+    reload) grep -q 'original business rules' "$UFW_DIR/user.rules" || return 1;;
+    *) return 1;;
+  esac
+}
+nft() { [[ $* == 'list tables' || $1 != list ]]; }
+ss() { return 0; }
+''' + body, ok=ok, env={"TMPDIR": str(self.work)})
+
+    def test_migration_plan_apply_and_full_rollback(self):
+        self.migration_case(r'''
+cp "$SSHD_CONFIG" "$WORK/main.before"; cp "$SOCKET_DIR/override.conf" "$WORK/socket.before"
+prepare_migration || exit 1
+cmp -s "$SSHD_CONFIG" "$WORK/main.before" || exit 2
+gen_sshd_dropin "$WORK/candidate" candidate || exit 3
+grep -qx 'passwordauthentication yes' "$WORK/candidate" || exit 4
+tx_begin stage1 candidate-pending || exit 5
+test -f "$TX_DIR/migration-plan.json" || exit 6
+apply_migration && coordinate_firewall || exit 7
+cp "$WORK/candidate" "$SSHD_DROPIN"
+for f in "$NFT_RULES" "$NFT_LOADER" "$FW_UNIT" "$SOCKET_OVERRIDE"; do printf 'Managed by reinforce-my-ssh\n' > "$f"; done
+grep -q '^# reinforce-my-ssh migrated: PermitRootLogin yes' "$WORK/ssh/sshd_config.d/99-old.conf" || exit 8
+grep -qx 'Requires=other.service' "$SOCKET_DIR/override.conf" || exit 9
+grep -qx 'disable ssh-firewall.service' "$WORK/systemctl-calls" || exit 10
+! grep -q -- '--now' "$WORK/systemctl-calls" || exit 11
+grep -q 'prepend allow proto tcp from 203.0.113.7/32 to any port 62207' "$WORK/ufw-calls" || exit 12
+digest=$(config_digest) || exit 13
+source "$WORK/compute-stage3"
+test "$(compute_config_sha)" = "$digest" || exit 14
+cancel_recovery() { return 0; }; stop_ssh_entry() { return 0; }; restore_unit_state() { return 0; }
+tx_restore "$TX_ID" 0 || exit 15
+cmp -s "$SSHD_CONFIG" "$WORK/main.before" && cmp -s "$SOCKET_DIR/override.conf" "$WORK/socket.before" || exit 16
+test ! -e "$STATE_ROOT/migration.json" && test ! -e "$SSHD_DROPIN" || exit 17
+grep -qx '# original business rules' "$UFW_DIR/user.rules" || exit 18
+grep -qx 'STAGE=unconfigured' "$STATE_FILE" || exit 19
+''')
+
+    def test_migration_input_drift_fails_before_any_file_is_changed(self):
+        self.migration_case(r'''
+cp "$SSHD_CONFIG" "$WORK/main.before"
+prepare_migration || exit 1
+tx_begin stage1 candidate-pending || exit 2
+printf '# concurrent edit\n' >> "$WORK/ssh/sshd_config.d/99-old.conf"
+if apply_migration; then exit 3; fi
+cmp -s "$SSHD_CONFIG" "$WORK/main.before" || exit 4
+test ! -e "$STATE_ROOT/migration.json" || exit 5
+''')
+
+    def test_compat_firewall_restore_failure_can_be_retried(self):
+        self.migration_case(r'''
+prepare_migration && tx_begin stage1 candidate-pending && apply_migration && coordinate_firewall || exit 1
+# 正常路径拒绝损坏记录；回滚可使用事务中保存的清单恢复。
+printf 'corrupt metadata\n' > "$STATE_ROOT/migration.json"
+if (load_state); then exit 6; fi
+MANAGED_FILES=("${CORE_MANAGED_FILES[@]}")
+DO_ROLLBACK=1
+load_state || exit 7
+cancel_recovery() { return 0; }; restore_unit_state() { return 0; }
+stop_ssh_entry() { printf 'stop\n' >> "$WORK/stops"; }
+ufw() { [[ $RESTORE_FAIL == no ]]; }
+RESTORE_FAIL=yes
+if tx_restore "$TX_ID" 0; then exit 2; fi
+test ! -e "$TX_DIR/ROLLED_BACK" && test -s "$WORK/stops" || exit 3
+RESTORE_FAIL=no
+tx_restore "$TX_ID" 0 || exit 4
+test -f "$TX_DIR/ROLLED_BACK" && grep -qx 'STAGE=unconfigured' "$STATE_FILE" || exit 5
+''')
+
+    def test_migrated_stage2_then_stage1_reverse_rollback(self):
+        self.migration_case(r'''
+prepare_migration && tx_begin stage1 candidate-pending && apply_migration && coordinate_firewall || exit 1
+gen_sshd_dropin "$SSHD_DROPIN" candidate || exit 2
+for f in "$NFT_RULES" "$NFT_LOADER" "$FW_UNIT" "$SOCKET_OVERRIDE"; do printf 'Managed by reinforce-my-ssh\n' > "$f"; done
+parent=$TX_ID; parent_sha=$(config_digest) || exit 3
+write_state candidate-ready "$parent" "$parent_sha" || exit 4
+source "$WORK/stage2-transactions"
+STAGE_ID=stage2; MIGRATION_PLAN=''
+tx_begin stage2 hardening-pending || exit 5
+gen_sshd_dropin "$SSHD_DROPIN" hardened || exit 6
+cancel_recovery() { return 0; }; stop_ssh_entry() { return 0; }; restore_unit_state() { return 0; }
+tx_restore "$TX_ID" 0 || exit 7
+test "$STATE_TX" = "$parent" && test "$(config_digest)" = "$parent_sha" || exit 8
+grep -qx 'passwordauthentication yes' "$SSHD_DROPIN" || exit 9
+STAGE_ID=stage1
+tx_restore "$parent" 0 || exit 10
+test ! -e "$SSHD_DROPIN" && test ! -e "$STATE_ROOT/migration.json" || exit 11
+grep -qx '# original business rules' "$UFW_DIR/user.rules" || exit 12
+''')
+
+    def test_candidate_regeneration_survives_new_process_and_stage2(self):
+        self.migration_case(r'''
+prepare_migration && generate_files "$WORK/expected" candidate || exit 1
+tx_begin stage1 candidate-pending && apply_migration || exit 2
+# 新会话没有预检时的临时计划变量，只能读取持久迁移记录。
+MIGRATION_PLAN=''
+generate_files "$WORK/reopened" candidate || exit 3
+source "$WORK/stage2-transactions"
+TARGET_STAGE=candidate
+generate_files "$WORK/stage2" candidate || exit 4
+for file in sshd socket loader unit nft; do
+  cmp -s "$WORK/expected/$file" "$WORK/reopened/$file" || exit 5
+  cmp -s "$WORK/expected/$file" "$WORK/stage2/$file" || exit 6
+done
+''')
+
+    def test_current_user_and_old_port_are_inferred_without_overriding_explicit_policy(self):
+        self.bash(1, r'''
+id() { printf '1000\n'; }
+find_ssh_connection() { printf '203.0.113.7 5000 192.0.2.10 62207\n'; }
+PORT=2222; USERNAME=''; SUDO_USER=deploy; OLD_PORT_SET=0; ALLOWS=(203.0.113.7/32)
+normalize_params
+test "$USERNAME" = deploy && test "$OLD_PORT" = 62207 || exit 1
+OLD_PORT_SET=1; OLD_PORT=none
+normalize_params
+test "$OLD_PORT" = none || exit 2
+OLD_PORT_SET=0; PORT=62207
+normalize_params
+test "$OLD_PORT" = none || exit 3
+''')
+
+    def test_migration_paths_reject_escape_and_core_file_collision(self):
+        self.migration_case(r'''
+prepare_migration || exit 1
+cp "$MIGRATION_PLAN" "$WORK/plan.original"
+python3 - "$MIGRATION_PLAN" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1])); p['files'][0]['path']='/etc/passwd'; json.dump(p,open(sys.argv[1],'w'))
+PY
+if load_migration "$MIGRATION_PLAN"; then exit 2; fi
+cp "$WORK/plan.original" "$MIGRATION_PLAN"
+python3 - "$MIGRATION_PLAN" "$SSHD_DROPIN" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1])); p['files'][0]['path']=sys.argv[2]; json.dump(p,open(sys.argv[1],'w'))
+PY
+if load_migration "$MIGRATION_PLAN"; then exit 3; fi
+test ! -e "$STATE_FILE" || exit 4
+''')
+
+    def test_migration_rejects_unsafe_ufw_and_match_without_modification(self):
+        self.migration_case(r'''
+cp "$SSHD_CONFIG" "$WORK/main.before"
+printf 'MANAGE_BUILTINS=yes\n' > "$UFW_DEFAULT"
+if prepare_migration; then exit 1; fi
+printf 'MANAGE_BUILTINS=no\n' > "$UFW_DEFAULT"
+printf 'Match User other\n PasswordAuthentication yes\n' >> "$WORK/ssh/sshd_config.d/99-old.conf"
+if prepare_migration; then exit 2; fi
+cmp -s "$SSHD_CONFIG" "$WORK/main.before" && test ! -e "$STATE_FILE" || exit 3
+''')
+
+    def test_migration_enables_keys_without_closing_passwords_or_relaxing_mfa(self):
+        self.migration_case(r'''
+sshd() { printf 'permitrootlogin yes\npubkeyauthentication no\npasswordauthentication yes\nkbdinteractiveauthentication no\nauthenticationmethods %s\n' "$METHODS"; }
+METHODS=any
+prepare_migration && gen_sshd_dropin "$WORK/candidate" candidate || exit 1
+grep -qx 'pubkeyauthentication yes' "$WORK/candidate" || exit 2
+grep -qx 'passwordauthentication yes' "$WORK/candidate" || exit 3
+METHODS=publickey,password
+if prepare_migration; then exit 4; fi
+test ! -e "$STATE_FILE" || exit 5
+''')
+
+    def test_hardened_auth_generation_uses_stage_argument(self):
+        for stage in (1, 2):
+            self.bash(stage, r'''
+PORT=2222; OLD_PORT=none
+gen_sshd_dropin "$WORK/config" hardened || exit 1
+grep -qx 'PermitRootLogin no' "$WORK/config" || exit 2
+grep -qx 'PasswordAuthentication no' "$WORK/config" || exit 3
+grep -qx 'AuthenticationMethods publickey' "$WORK/config" || exit 4
+''')
+
+    def test_stage3_state_only_rollback_does_not_need_valid_migration_metadata(self):
+        if os.geteuid() != 0:
+            self.skipTest("stage3 完整入口权限检查需要 root")
+        state = self.work / "stage3-state"
+        state.mkdir()
+        (state / "policy.conf").write_text("PORT=2222\nOLD_PORT=22\nUSER=nobody\nALLOW=203.0.113.0/24\nRECOVERY_SECONDS=900\nRESCUE_CONFIRMED=yes\n")
+        (state / "state.conf").write_text("STAGE=verified\nTX=parent\nCONFIG_SHA=" + "a" * 64 + "\nPENDING_BOOT=\nVERIFIED_BOOT=\n")
+        (state / "migration.json").write_text("corrupt metadata\n")
+        source = (ROOT / STAGE_FILES[3]).read_text().replace("STATE_DIR=/var/lib/reinforce-my-ssh", "STATE_DIR=" + str(state))
+        source = source.replace("/run/lock/reinforce-my-ssh.lock", str(self.work / "lock"))
+        script = self.work / "stage3.sh"
+        script.write_text(source)
+        result = subprocess.run(["bash", str(script), "--rollback"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("STAGE=hardened", (state / "state.conf").read_text())
+        self.assertEqual((state / "migration.json").read_text(), "corrupt metadata\n")
+        result = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("迁移路径记录无效", result.stdout + result.stderr)
+
     def test_normalizers_identical(self):
         self.assertEqual(function(1, "normalize_nft"), function(2, "normalize_nft"))
         self.assertEqual(function(1, "normalize_nft"), function(3, "normalize_nft"))
+        for name in ("migration_paths", "load_migration"):
+            self.assertEqual(function(1, name), function(2, name))
+            self.assertEqual(function(1, name), function(3, name))
 
     def test_old_entry_names_delegate_and_stage0_preserves_arguments(self):
         for stage, canonical in STAGE_FILES.items():
@@ -467,6 +712,75 @@ tx_restore demo 0
             self.assertEqual((tx / "ROLLED_BACK").exists(), not failure)
             if not failure:
                 self.assertIn(f"CONFIG_SHA={digest}", (self.work / "state.conf").read_text())
+
+    def test_initial_rollback_failure_keeps_policy_and_retry_entry(self):
+        tx, _ = self.restore_fixture()
+        (tx / "stage").write_text("stage1\n")
+        (tx / "parent").write_text("unconfigured\n\n\n")
+        (tx / "policy.before").unlink()
+        profile = "PORT=2222\nOLD_PORT=22\nUSER=deploy\nALLOW=203.0.113.0/24\nRECOVERY_SECONDS=900\nRESCUE_CONFIRMED=yes\n"
+        (self.work / "policy.conf").write_text(profile)
+        self.bash(1, r'''
+SELF=stage1.sh; STATE_ROOT=$WORK; STATE_FILE=$WORK/state.conf; POLICY_FILE=$WORK/policy.conf
+TX_ROOT=$WORK/transactions; STATE_TX=demo; STATE_STAGE=candidate-pending; DO_ROLLBACK=1
+PORT=2222; OLD_PORT=22; MANAGED_FILES=("$WORK/managed"); CORE_MANAGED_FILES=("${MANAGED_FILES[@]}")
+cancel_recovery() { return 0; }; stop_ssh_entry() { echo stop >> "$WORK/stops"; }
+systemctl() { [[ $1 != show ]] || printf 'loaded\n'; return 0; }
+restore_unit_state() { return 0; }; sshd() { return 0; }; ss() { return 0; }
+nft() { return 1; }; verify_nft_semantics() { return 1; }
+if tx_restore demo 0; then exit 5; fi
+[[ -r $POLICY_FILE ]] || exit 6
+load_policy || exit 7
+[[ $PORT == 2222 && $USERNAME == deploy ]] || exit 8
+test ! -e "$TX_DIR/ROLLED_BACK" || exit 9
+nft() { return 0; }; verify_nft_semantics() { return 0; }
+tx_restore demo 0 || exit 10
+grep -qx 'STAGE=unconfigured' "$STATE_FILE" || exit 11
+test ! -e "$POLICY_FILE" && test -r "$TX_DIR/policy.target"
+''')
+
+    def test_rollback_loads_transaction_policy_after_global_policy_is_lost(self):
+        tx, _ = self.restore_fixture()
+        profile = "PORT=2222\nOLD_PORT=22\nUSER=deploy\nALLOW=203.0.113.0/24\nRECOVERY_SECONDS=900\nRESCUE_CONFIRMED=yes\n"
+        (tx / "policy.target").write_text(profile)
+        (self.work / "policy.conf").unlink()
+        for stage in (1, 2):
+            self.bash(stage, r'''
+STATE_STAGE=candidate-pending; STATE_TX=demo; TX_ROOT=$WORK/transactions
+POLICY_FILE=$WORK/policy.conf; DO_ROLLBACK=1
+load_policy || exit 1
+[[ $PORT == 2222 && $OLD_PORT == 22 && $USERNAME == deploy && ${ALLOWS[*]} == 203.0.113.0/24 ]] || exit 2
+''')
+
+    def test_confirm_never_stops_ssh_on_success_or_rejected_evidence(self):
+        for stage, pending, ready in ((1, "candidate-pending", "candidate-ready"), (2, "hardening-pending", "hardened")):
+            for failure in (False, True):
+                output = self.bash(stage, rf'''
+STATE_STAGE={pending}; STATE_TX=demo; TX_ROOT=$WORK
+STATE_ROOT=$WORK; STATE_FILE=$WORK/state.conf
+mkdir -p "$WORK/demo"
+rm -f "$STATE_FILE"
+date +%s > "$WORK/demo/started"
+PORT=62207; USERNAME=deploy
+recovery_paths() {{ RECOVERY_UNIT=$WORK/recovery.service; RECOVERY_TIMER=$WORK/recovery.timer; }}
+touch "$WORK/recovery.service" "$WORK/recovery.timer"
+verify_runtime() {{ return 0; }}
+session_evidence() {{ [[ $EVIDENCE_FAIL != yes ]]; }}
+config_digest() {{ printf '%064d\n' 1; }}
+stop_ssh_entry() {{ echo FORBIDDEN_STOP; exit 90; }}
+tx_restore() {{ echo FORBIDDEN_ROLLBACK; exit 91; }}
+systemctl() {{
+  case "$*" in
+    "disable --now reinforce-my-ssh-demo.timer"|"disable reinforce-my-ssh-demo.service"|daemon-reload) return 0;;
+    *) echo FORBIDDEN_SYSTEMCTL; exit 92;;
+  esac
+}}
+do_confirm
+grep -qx 'STAGE={ready}' "$STATE_FILE"
+''', ok=not failure, env={"EVIDENCE_FAIL": "yes" if failure else "no"})
+                self.assertNotIn("FORBIDDEN", output)
+                if failure:
+                    self.assertIn("原自动恢复计时", output)
 
     def test_native_tx_begin_distinguishes_existing_and_absent_table(self):
         if not INTEGRATION:
