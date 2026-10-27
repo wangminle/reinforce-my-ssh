@@ -4,7 +4,7 @@
 python3 tests/run-tests.py
 ```
 
-当前 37 项测试全部通过。测试**不接触真实系统**：通过 `tests/guide-support.py` 提取三个脚本内嵌的 Python 实现，并把 `System` 替换为内存桩件（`StubSystem`），因此文件系统、`ss`/`sshd`/`nft`/`systemctl`/`journalctl` 全部为预置输出。
+当前 55 项测试全部通过。测试**不接触真实系统**：通过 `tests/guide-support.py` 提取三个脚本内嵌的 Python 实现，并把 `System` 替换为内存桩件（`StubSystem`），因此文件系统、`ss`/`sshd`/`nft`/`systemctl`/`journalctl` 全部为预置输出。
 
 命名约定：仓库内脚本与辅助文件统一使用连字符风格（如 `stage0-check.sh`、`run-tests.py`，不使用空格或下划线分隔）。由于 `unittest` 的发现机制拒绝非标识符文件名（`VALID_MODULE_NAME`），`run-tests.py` 按路径用 `importlib` 显式加载 `test-*.py`，`test-guides.py` 同样以模块名导入 `guide-support`。
 
@@ -17,6 +17,8 @@ python3 tests/run-tests.py
 - **stage1 步骤**：初始态与门槛（`1-backup`、`0-rescue`、`4-verify-new`）、监听但未持久化（warn）、新端口公钥会话满足硬门槛、**密码会话不满足硬门槛**、`--old-port none`。
 - **stage2 步骤**：前置阻塞、来源不在白名单的硬阻断、全部达成但未重启、跨重启复验完成、禁用密码前必须有已验证公钥会话。
 - **stage0 定位**：进行中 / 待跨重启验证 / 已通过跨重启验证三种位置、旧版待确认事务阻断（退出码 1）、非 root 退出码 2、JSON 结构。
+- **Tailscale 拓扑**：`tailscale0` 的 IFF_UP 检测（含 `operstate=unknown`）、IPv4/IPv6 地址识别；`--tailnet` 下的接口放行判定（`iifname tailscale0 accept` + 默认拒绝）、缺少接口时的目标不达标、缺少 tailnet 接口时 stage2 前置阻塞、stage1 仅在声明时增加接入步骤。
+- **socket 激活与规则顺序**：`ss` 中归属 systemd 的监听不被当作“无监听”；UFW 宽泛 ALLOW 与 tailnet→deny 的顺序按首条匹配判定；续跑命令保留 `--tailnet`。
 - **参数与输出**：非法端口/root 账户/缺失 `--allow`/端口冲突被拒；严格 CIDR 规范化；JSON 报告可序列化且退出码正确。
 
 ## 边界

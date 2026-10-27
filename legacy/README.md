@@ -12,7 +12,7 @@
 
 2026-10-27 京东云真实节点发生失联事故（台账 [[BUG-016]]，根因未查明）：确认被拒、策略文件不可读、随后 SSH 与 VNC 均不可达。本地已复现同族缺陷 [[BUG-015]]（初次回滚在复验前删除 policy.conf，恢复失败后停止 SSH 且回滚入口无法重试）。事故记录见 `../plans/checkpoints/2026-10-27-lockout-incident.md`。
 
-结论：把"人的判断"外包给定时器和自动回滚，在只有 SSH 一条活路的机器上，任何未建模的故障都会把保护机制变成自我锁死。新版工具改为**纯只读的分步指导**，见仓库根目录的 `stage0-check.sh`、`stage1-port-key.sh`、`stage2-lockdown.sh` 与 `../plans/DESIGN.md`。
+结论：把"人的判断"外包给定时器和自动回滚，在只有 SSH 一条活路的机器上，任何未建模的故障都会把保护机制变成自我锁死。新版工具改为**纯只读的分步指导**，见仓库根目录的 `stage0-check.sh`、`stage1-port-key.sh`、`stage2-lockdown.sh` 与 `../plans/DESIGN-v2.md`。
 
 ## 为什么保留
 
@@ -27,8 +27,9 @@
 | `stage0-audit.sh` | 旧版只读审计 + `--guide` 代执行入口（审计引擎有参考价值，代执行已废弃） |
 | `stage1-newport.sh` / `stage2-harden.sh` | 旧版事务化 apply/confirm/rollback（含自动恢复定时器，废弃） |
 | `stage3-reboot-check.sh` | 旧版重启基线验证（本身只读，但其状态文件依赖旧事务体系） |
-| `stage1.sh` / `stage2.sh` / `stage3.sh` | 更早文件名的兼容入口，仅转发 |
 | `tests/` | 旧体系回归测试（相对路径按本目录布局仍可运行，仅供存档验证） |
 | `plans/` | 旧体系设计与验收文档 |
+
+2026-10-27：按用户要求删除 `stage1.sh` / `stage2.sh` / `stage3.sh` 三个兼容转发入口——它们只是五行 `exec` 包装，远端从未部署，没有取证价值。`tests/test_regressions.py` 中引用这些文件名的用例属于历史记录，随本目录存档，不再作为有效回归。
 
 本目录不随新部署分发；上传/部署清单只包含根目录的三个指导脚本。

@@ -49,6 +49,8 @@ The loop is always: run the script → it confirms what is already done and prin
 
 Exit codes: `0` stage goals fully met; `1` blocking anomaly (legacy pending transaction/recovery timer, invalid sshd config, allowlist lockout risk); `2` steps outstanding or `sudo` required; `130` interrupted. Add `--format json` for machine-readable output.
 
+**Tailscale topology (optional).** When management goes through a tailnet, add `--tailnet` to all three scripts. stage0 then reports `tailscale0`; stage1 adds a "join the tailnet" step; stage2 accepts `iifname "tailscale0" accept` instead of source CIDRs and adds a step to close the public SSH entry. Tailscale SSH is terminated by `tailscaled` and never touches sshd, so it is a rescue/management path but **not** evidence that sshd hardening works. DERP/STUN ports (443/tcp, 3478/udp) are a separate rule domain and must not be folded into the SSH allowlist.
+
 ### Agent execution
 
 An agent (e.g. Claude) can drive the steps from the JSON output, under operator supervision: execute only steps whose `blocked_by` is empty, re-run the script after every executed step, stop and print the manual `undo` commands on any failed verification, and never simulate the rescue drill or cloud-console changes. See the execution contract in [plans/DESIGN-v2.md](plans/DESIGN-v2.md).
@@ -59,7 +61,7 @@ An agent (e.g. Claude) can drive the steps from the JSON output, under operator 
 python3 tests/run-tests.py
 ```
 
-37 stub-based tests, no real system contact. They do not replace real-server acceptance.
+55 stub-based tests, no real system contact. They do not replace real-server acceptance.
 
 [Design (v2)](plans/DESIGN-v2.md) · [Tests](tests/README.md) · [Legacy (do not run)](legacy/README.md) · [Checkpoints](plans/checkpoints/README.md) · [Task ledger](task-list.md) · [MIT license](LICENSE)
 
@@ -112,6 +114,8 @@ sudo bash stage2-lockdown.sh --port 62207 --user deploy \
 
 退出码：`0` 本阶段目标全部达成；`1` 阻断性异常（旧版待确认事务/恢复定时器残留、sshd 配置损坏、白名单锁死风险）；`2` 步骤未完成或需要 sudo；`130` 中断。加 `--format json` 输出机器可读结构。
 
+**Tailscale 拓扑（可选）**：管理通路走 tailnet 时，三个脚本都加 `--tailnet`。stage0 会报告 `tailscale0`；stage1 增加"接入 tailnet"步骤；stage2 改用 `iifname "tailscale0" accept` 替代来源 CIDR，并增加"关闭公网 SSH 入口"步骤。Tailscale SSH 由 `tailscaled` 终结、不经过 sshd，因此只能算救援/管理通路，**不能**作为 sshd 加固通过的证据；DERP/STUN（443/tcp、3478/udp）属于独立规则域，不要并入 SSH 白名单。
+
 ### 智能体执行
 
 智能体（如 Claude）可在操作员监督下按 JSON 输出驱动执行：只执行 `blocked_by` 为空的步骤；每步执行后重跑脚本；任何验证失败即停止并打印手工 `undo` 命令；不得代拟救援演练与云控制台操作。执行契约见 [plans/DESIGN-v2.md](plans/DESIGN-v2.md)。
@@ -122,6 +126,6 @@ sudo bash stage2-lockdown.sh --port 62207 --user deploy \
 python3 tests/run-tests.py
 ```
 
-37 项桩件测试，不接触真实系统；不替代真实整机验收。
+55 项桩件测试，不接触真实系统；不替代真实整机验收。
 
 [设计文档（v2）](plans/DESIGN-v2.md) · [测试说明](tests/README.md) · [legacy 冻结区（禁运行）](legacy/README.md) · [检查点索引](plans/checkpoints/README.md) · [任务台账](task-list.md) · [MIT 许可证](LICENSE)

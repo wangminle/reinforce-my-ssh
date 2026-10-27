@@ -57,6 +57,9 @@ SSHD_CONFIG_D = "/etc/ssh/sshd_config.d"
 SOCKET_DROPIN_DIR = "/etc/systemd/system/ssh.socket.d"
 NEWPORT_DROPIN = SSHD_CONFIG_D + "/10-newport.conf"
 NEWPORT_SOCKET_DROPIN = SOCKET_DROPIN_DIR + "/10-newport.conf"
+TAILSCALE_IFACE = "/sys/class/net/tailscale0"
+CGNAT = ipaddress.ip_network("100.64.0.0/10")
+TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
 
 DONE, TODO, BLOCKED, WARN, UNKNOWN = "done", "todo", "blocked", "warn", "unknown"
 STATUS_LABEL = {DONE: "已完成", TODO: "未完成", BLOCKED: "被门槛阻塞", WARN: "需注意", UNKNOWN: "无法证实"}
@@ -396,6 +399,35 @@ def firewall_summary(system):
 
 # ---------------------------------------------------------------- 参数
 
+def tailnet_facts(system):
+    """tailscale0 存在且 IFF_UP；TUN 的 operstate 常为 unknown，故以 flags 位为准。"""
+    facts = {"interface": TAILSCALE_IFACE, "present": False, "state": None, "flags": None, "up": False}
+    if not system.exists(TAILSCALE_IFACE):
+        return facts
+    facts["present"] = True
+    try:
+        facts["state"] = system.read(TAILSCALE_IFACE + "/operstate").strip()
+    except EvidenceError:
+        pass
+    try:
+        facts["flags"] = int(system.read(TAILSCALE_IFACE + "/flags").strip(), 16)
+    except (EvidenceError, ValueError):
+        pass
+    if facts["flags"] is not None:
+        facts["up"] = bool(facts["flags"] & 0x1)
+    else:
+        facts["up"] = facts["state"] in ("up", "unknown")
+    return facts
+
+
+def is_tailnet_address(value):
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return address in CGNAT or address in TAILSCALE_V6
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         prog=SCRIPT,
@@ -406,6 +438,7 @@ def parse_args(argv):
     parser.add_argument("--old-port", help="旧端口；默认从当前会话或现有监听推断；无旧端口用 none")
     parser.add_argument("--host", help="客户端连接地址或 SSH 别名，仅用于生成提示命令")
     parser.add_argument("--rescue-confirmed", action="store_true", help="已实际演练 VNC/串口救援登录（硬门槛）")
+    parser.add_argument("--tailnet", action="store_true", help="管理通路经 Tailscale tailnet；增加接入与验证步骤")
     parser.add_argument("--backup-dir", default=BACKUP_ROOT, help="备份约定目录（默认 " + BACKUP_ROOT + "）")
     parser.add_argument("--format", choices=("text", "json"), default="text")
     options = parser.parse_args(argv)
@@ -493,6 +526,31 @@ def build_steps(system, options, ctx):
          ["重跑本脚本：本步骤应为“已完成”；账户权限异常会单独提示并给出 chmod/chown 命令"],
          ["sudo deluser --remove-home " + user + "  # 仅在决定放弃该账户时执行"])
 
+    if options.tailnet:
+        tn = ctx["tailnet"]
+        if tn.get("up"):
+            tn_status, tn_note = DONE, "tailscale0 已 up：节点已加入 tailnet"
+        elif tn.get("present"):
+            tn_status, tn_note = TODO, "tailscale0 存在但状态为 %s：tailscaled 未就绪" % (tn.get("state") or "不可读")
+        else:
+            tn_status, tn_note = TODO, "未发现 tailscale0：尚未加入 tailnet"
+        step("2b-tailnet", "接入 Tailscale tailnet（管理/救援通路）",
+             tn_status, tn_note,
+             "tailnet 提供一条独立于 sshd 的管理通路，可在关闭公网端口后继续管理，也是 VNC/串口之外的备份救援路径。"
+             "但它不能替代救援演练，也不能作为 sshd 加固的证据：Tailscale SSH 由 tailscaled 终结认证，不经过 sshd。",
+             ["# 服务器（Ubuntu/Debian，安装方式以官方当前说明为准）：",
+              "sudo apt-get update && sudo apt-get install -y tailscale",
+              "sudo tailscale up   # 按提示完成登录；需要验证 sshd 路径时不要加 --ssh",
+              "# 管理台 Machines 页对本节点禁用 key expiry（默认 180 天后节点会被登出）",
+              "# 客户端（另一台已入 tailnet 的设备）：",
+              "ssh -p " + (str(old_port) if isinstance(old_port, int) else "22") + " " + user + "@<本节点 tailnet 地址>   # 地址用 tailscale ip -4 查询；新端口在第 4 步再验证"],
+             ["服务器：tailscale status 显示本节点；tailscale ip -4 返回 100.64.0.0/10 内的地址",
+              "服务器：tailscale0 已启用（IFF_UP；TUN 的 operstate 可能显示 unknown）",
+              "客户端：经 tailnet 用公钥登录成功（此时用当前/旧端口；新端口的公钥证明在第 4 步）"],
+             ["sudo tailscale down    # 临时下线，保留登录状态",
+              "sudo tailscale logout  # 完全退出 tailnet（之后需要重新授权）"],
+             blocked_by=[] if backup_ok else ["1-backup"])
+
     new_listening = port in ctx["listeners"]
     disk_has_new = port in ctx["disk_ports"]
     if new_listening and disk_has_new:
@@ -561,9 +619,15 @@ def build_steps(system, options, ctx):
     session = ctx["connection"]
     auth = ctx["auth"]
     if session and session["port"] == port and auth == "publickey":
-        verify_status, verify_note = DONE, "当前会话即新端口 %d 的公钥登录（journal 已匹配四元组），硬门槛已满足" % port
+        path = "经 tailnet 接口" if is_tailnet_address(session["source"]) else "经公网接口"
+        verify_status, verify_note = DONE, "当前会话即新端口 %d 的公钥登录（%s，journal 已匹配四元组），硬门槛已满足" % (port, path)
     elif session and session["port"] == port and auth is None:
-        verify_status, verify_note = UNKNOWN, "当前会话在新端口 %d 上，但认证方式无法从 journal 证实；请核对 journal 或重试" % port
+        if is_tailnet_address(session["source"]):
+            verify_status, verify_note = UNKNOWN, ("当前会话来自 tailnet 且在新端口 %d 上，但 journal 没有 sshd 公钥认证记录："
+                                                    "可能是 Tailscale SSH（由 tailscaled 终结，不经过 sshd），不能作为 sshd 路径的验证证据；"
+                                                    "请改用该账户公钥登录 sshd 后重跑" % port)
+        else:
+            verify_status, verify_note = UNKNOWN, "当前会话在新端口 %d 上，但认证方式无法从 journal 证实；请核对 journal 或重试" % port
     else:
         verify_status, verify_note = TODO, "当前会话不在新端口 %d 上（或非公钥认证）" % port
     step("4-verify-new", "从新端口外部公钥登录验证（硬门槛）",
@@ -575,7 +639,8 @@ def build_steps(system, options, ctx):
           "sudo bash " + entry_dir() + "/" + SCRIPT + " --port " + str(port) + " --user " + user
           + ((" --old-port " + str(old_port)) if isinstance(old_port, int) else " --old-port none")
           + ((" --host " + shlex.quote(options.host)) if options.host else "")
-          + (" --rescue-confirmed" if rescue else "")],
+          + (" --rescue-confirmed" if rescue else "")
+          + (" --tailnet" if options.tailnet else "")],
          ["同一命令下，本步骤状态变为“已完成”（脚本核对当前会话端口与 journal 公钥证据）"],
          ["无需撤销；登录尝试是只读操作"],
          blocked_by=[] if new_listening else ["3-new-port"])
@@ -591,6 +656,9 @@ def build_steps(system, options, ctx):
         old_close_status, old_close_note, old_close_evidence = TODO, "端口 %d 仍在监听或仍在磁盘配置中" % old_port, "listeners=%s" % ctx["listeners"]
 
     old_close_why = "完成端口切换的最后一步：确认新入口被外部证实可用（第 4 步）之后，才移除旧入口。保持至少一条已验证会话开着直到这一步结束。"
+    if options.tailnet:
+        old_close_why += (" 已声明 --tailnet：如果最终只保留 tailnet 入口，公网侧的彻底关闭由 stage2 的 1b-close-public 负责；"
+                          "本步仍按端口切换处理，不要在 tailnet 路径未被验证前先行切断公网。")
     if old_port is None:
         old_close_do = ["# 先指明旧端口（当前会话或现有监听无法唯一识别）：",
                         "sudo bash " + entry_dir() + "/" + SCRIPT + " --port " + str(port) + " --user " + user + " --old-port <旧端口>",
@@ -647,12 +715,17 @@ def resolve_context(system, options):
     ctx = {}
     ctx["connection"] = find_connection(system)
     ctx["auth"] = session_auth(system, ctx["connection"], options.user)
-    ctx["listeners"] = sshd_listeners(system)
     ctx["socket"] = socket_state(system)
+    ports = set(sshd_listeners(system))
+    if ctx["socket"]["active"] == "active":
+        # socket 激活时监听由 systemd 持有，ss 里没有 sshd 进程归属
+        ports.update(ctx["socket"]["listen_ports"])
+    ctx["listeners"] = sorted(ports)
     ctx["disk_ports"] = disk_port_directives(system)
     ctx["account"] = account_facts(system, options.user)
     ctx["backup"] = backup_facts(system, options.backup_dir)
     ctx["firewall"] = firewall_summary(system)
+    ctx["tailnet"] = tailnet_facts(system)
     ctx["match_blocks"] = match_blocks(system)
     valid, error = sshd_valid(system)
     ctx["sshd_valid"] = valid
@@ -685,6 +758,11 @@ def render_text(ctx, options, steps):
     else:
         print("当前会话：未检测到 SSH 连接（请从真实 SSH 会话运行本脚本）")
     print("布局：%s" % ("ssh.socket 激活" if ctx["socket"]["active"] == "active" else "传统 sshd 服务"))
+    tailnet = ctx.get("tailnet", {})
+    if tailnet.get("present"):
+        print("tailscale0：%s（Tailscale SSH 不经过 sshd，不能作为 sshd 验证证据）" % (tailnet.get("state") or "状态不可读"))
+    elif options.tailnet:
+        print("tailscale0：未发现（已声明 --tailnet，请先完成 2b-tailnet）")
     print("\n步骤清单：")
     for item in steps:
         print("  [%s] %s —— %s" % (STATUS_LABEL[item["status"]], item["title"], item["evidence"]))
@@ -694,6 +772,8 @@ def render_text(ctx, options, steps):
         command = "sudo bash %s/%s --port %d --user %s" % (entry_dir(), STAGE2, options.port, options.user)
         if options.host:
             command += " --host " + shlex.quote(options.host)
+        if options.tailnet:
+            command += " --tailnet"
         print("  " + command)
     else:
         print("\n当前步骤：%s（%s）" % (current["title"], STATUS_LABEL[current["status"]]))
@@ -736,10 +816,12 @@ def main(argv=None):
     report = {
         "schema": 1, "script": SCRIPT, "read_only": True,
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "goals": {"port": options.port, "user": options.user, "old_port": ctx["old_port"], "host": options.host},
+        "goals": {"port": options.port, "user": options.user, "old_port": ctx["old_port"],
+                  "host": options.host, "tailnet": options.tailnet},
         "rescue_confirmed": options.rescue_confirmed,
         "layout": "socket" if ctx["socket"]["active"] == "active" else "service",
         "session": ctx["connection"], "session_auth": ctx["auth"],
+        "tailnet": ctx["tailnet"],
         "listeners": ctx["listeners"], "disk_ports": sorted(ctx["disk_ports"]),
         "steps": steps, "complete": complete,
         "next_step": next((item["id"] for item in steps if item["status"] != DONE), None),

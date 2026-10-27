@@ -32,16 +32,25 @@ MUTATING_VERBS = {"start", "stop", "restart", "reload", "enable", "disable", "ma
 
 def make_stub(module, *, session_port=22, session_source="203.0.113.9", journal_method="publickey",
               listeners=None, socket_active=True, disk_ports=(), account=True, backup=False,
-              auth=None, allowlist_rules=None, ufw_active=False, legacy_pending=False,
-              timer_active=False, btime=1000000000, hardening_mtime=None, sshd_config_valid=True):
+              auth=None, allowlist_rules=None, ufw_active=False, ufw_text=None, legacy_pending=False,
+              timer_active=False, btime=1000000000, hardening_mtime=None, sshd_config_valid=True,
+              tailnet=False, tailnet_state="up", tailnet_flags=None, bind_address="0.0.0.0",
+              listener_process="sshd"):
     system = bind_stub(module, StubSystem())
     listen_ports = sorted(set(listeners if listeners is not None else [session_port, 22]))
 
     ss = "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n"
     for port in listen_ports:
-        ss += 'LISTEN 0 4096 0.0.0.0:%d 0.0.0.0:* users:(("sshd",pid=700,fd=3))\n' % port
+        ss += 'LISTEN 0 4096 %s:%d 0.0.0.0:* users:(("%s",pid=1,fd=3))\n' % (bind_address, port, listener_process)
     ss += 'LISTEN 0 4096 127.0.0.1:631 0.0.0.0:* users:(("cupsd",pid=900,fd=3))\n'
     system.can("ss -tlnpH", ss)
+
+    if tailnet:
+        system.touch_file("/sys/class/net/tailscale0")
+        system.set_read("/sys/class/net/tailscale0/operstate", tailnet_state + "\n")
+        if tailnet_flags is None:
+            tailnet_flags = 0x1003 if tailnet_state == "up" else 0x1002
+        system.set_read("/sys/class/net/tailscale0/flags", "0x%x\n" % tailnet_flags)
 
     if socket_active:
         listen_lines = "".join("0.0.0.0:%d (Stream)\n" % p for p in listen_ports)
@@ -80,7 +89,8 @@ def make_stub(module, *, session_port=22, session_source="203.0.113.9", journal_
     system.can("nft -j list ruleset", packet_nft(allowlist_rules or []))
     system.can("nft list tables", "table inet sshguard\n")
     if ufw_active:
-        system.can("ufw status verbose", "Status: active\n\nTo Action From\n-- ----- ----\n62207/tcp ALLOW 203.0.113.0/24\n62207/tcp DENY Anywhere\n")
+        system.can("ufw status verbose", ufw_text or
+                   "Status: active\n\nTo Action From\n-- ----- ----\n62207/tcp ALLOW 203.0.113.0/24\n62207/tcp DENY Anywhere\n")
     else:
         system.can("ufw status verbose", "Status: inactive\n")
 
@@ -298,6 +308,39 @@ class TestStage1Steps(unittest.TestCase):
         self.assertEqual(steps["3-new-port"]["status"], "warn")
         self.assertIn("重启后会丢失", steps["3-new-port"]["evidence"])
 
+    def test_tailnet_step_only_when_declared(self):
+        _, _, _, plain = self.steps()
+        self.assertNotIn("2b-tailnet", plain)
+        _, _, _, declared = self.steps(extra=["--tailnet"], tailnet=True)
+        self.assertEqual(declared["2b-tailnet"]["status"], "done")
+
+    def test_tailnet_step_reports_missing_interface(self):
+        _, _, _, steps = self.steps(extra=["--tailnet"], tailnet=False)
+        self.assertEqual(steps["2b-tailnet"]["status"], "todo")
+        self.assertIn("未发现 tailscale0", steps["2b-tailnet"]["evidence"])
+
+    def test_tailnet_operstate_unknown_with_flags_up(self):
+        _, _, _, steps = self.steps(extra=["--tailnet"], tailnet=True,
+                                    tailnet_state="unknown", tailnet_flags=0x1003)
+        self.assertEqual(steps["2b-tailnet"]["status"], "done")
+
+    def test_tailnet_flags_down_is_not_ready(self):
+        _, _, _, steps = self.steps(extra=["--tailnet"], tailnet=True,
+                                    tailnet_state="up", tailnet_flags=0x1002)
+        self.assertEqual(steps["2b-tailnet"]["status"], "todo")
+
+    def test_tailnet_step_verifies_via_current_port(self):
+        _, _, _, steps = self.steps(extra=["--tailnet"], tailnet=True)
+        joined = "\n".join(steps["2b-tailnet"]["do"] + steps["2b-tailnet"]["verify"])
+        self.assertIn("-p 22", joined)
+        self.assertNotIn("62207", joined)
+        self.assertIn("第 4 步", joined)
+
+    def test_verify_resume_command_keeps_tailnet(self):
+        _, _, _, steps = self.steps(session_port=22, extra=["--tailnet"], tailnet=True)
+        joined = "\n".join(steps["4-verify-new"]["do"])
+        self.assertIn("--tailnet", joined)
+
 
 class TestStage2Steps(unittest.TestCase):
     def build(self, **kwargs):
@@ -344,6 +387,84 @@ class TestStage2Steps(unittest.TestCase):
         self.assertNotEqual(steps["0-preconditions"]["status"], "done")
         self.assertEqual(steps["2-auth"]["status"], "blocked")
 
+    def test_tailnet_declared_without_allow_uses_interface_rule(self):
+        _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
+                                    session_port=62207, listeners=[62207], backup=True,
+                                    extra=["--tailnet"])
+        self.assertNotEqual(steps["1-allowlist"]["status"], "blocked")
+        self.assertTrue(any('iifname "tailscale0"' in line for line in steps["1-allowlist"]["do"]))
+        self.assertEqual(steps["1b-close-public"]["status"], "unknown")
+        self.assertIn("0.0.0.0", steps["1b-close-public"]["evidence"])
+
+    def test_socket_activated_listener_is_not_mistaken_for_closed(self):
+        _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
+                                    session_port=62207, listeners=[62207], backup=True,
+                                    listener_process="systemd", extra=["--tailnet"])
+        self.assertEqual(steps["1b-close-public"]["status"], "unknown")
+        self.assertIn("0.0.0.0", steps["1b-close-public"]["evidence"])
+
+    def test_ufw_broad_allow_keeps_public_open(self):
+        text = ("Status: active\n\nTo Action From\n-- ----- ----\n"
+                "62207/tcp on tailscale0 ALLOW Anywhere\n"
+                "62207/tcp ALLOW Anywhere\n"
+                "62207/tcp DENY Anywhere\n")
+        _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
+                                    session_port=62207, listeners=[62207], backup=True,
+                                    ufw_active=True, ufw_text=text, extra=["--tailnet"])
+        self.assertEqual(steps["1b-close-public"]["status"], "todo")
+        self.assertIn("公网仍可进入", steps["1b-close-public"]["evidence"])
+
+    def test_ufw_tailnet_then_deny_closes_public(self):
+        text = ("Status: active\n\nTo Action From\n-- ----- ----\n"
+                "62207/tcp on tailscale0 ALLOW Anywhere\n"
+                "62207/tcp DENY Anywhere\n")
+        _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
+                                    session_port=62207, listeners=[62207], backup=True,
+                                    ufw_active=True, ufw_text=text, extra=["--tailnet"])
+        self.assertEqual(steps["1b-close-public"]["status"], "done")
+
+    def test_tailnet_ipv6_session_is_accepted(self):
+        _, _, _, steps = self.build(session_source="fd7a:115c:a1e0::1", tailnet=True, allow=[],
+                                    session_port=62207, listeners=[62207], backup=True,
+                                    extra=["--tailnet"])
+        self.assertNotEqual(steps["1-allowlist"]["status"], "blocked")
+
+    def test_tailnet_ipv6_binding_is_not_public(self):
+        _, _, _, steps = self.build(session_source="fd7a:115c:a1e0::1", tailnet=True, allow=[],
+                                    session_port=62207, listeners=[62207], backup=True,
+                                    bind_address="fd7a:115c:a1e0::1", extra=["--tailnet"])
+        self.assertEqual(steps["1b-close-public"]["status"], "done")
+
+    def test_nft_negated_tailscale_drop_closes_public(self):
+        rules = [("accept", None, None, ("established", "related")),
+                 ("accept", 62207, None, None, "tailscale0"),
+                 ("drop", 62207, None, None, "tailscale0", True)]
+        _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
+                                    session_port=62207, listeners=[62207], backup=True,
+                                    allowlist_rules=rules, extra=["--tailnet"])
+        self.assertEqual(steps["1b-close-public"]["status"], "done")
+
+    def test_resume_commands_keep_tailnet_flag(self):
+        _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
+                                    session_port=62207, listeners=[62207], backup=True,
+                                    journal_method=None, extra=["--tailnet"])
+        self.assertTrue(any("--tailnet" in line for line in steps["4-reboot-verify"]["do"]))
+        self.assertTrue(any("--tailnet" in line for line in steps["0-preconditions"]["do"]))
+
+    def test_tailnet_requires_interface(self):
+        _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=False, allow=[],
+                                    session_port=62207, listeners=[62207], backup=True,
+                                    extra=["--tailnet"])
+        self.assertEqual(steps["0-preconditions"]["status"], "blocked")
+        self.assertIn("Tailscale 已接入", steps["0-preconditions"]["evidence"])
+
+    def test_tailnet_binding_marks_public_closed(self):
+        _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
+                                    session_port=62207, listeners=[62207], backup=True,
+                                    bind_address="100.64.1.5", extra=["--tailnet"])
+        self.assertEqual(steps["1b-close-public"]["status"], "done")
+        self.assertIn("回环/tailnet", steps["1b-close-public"]["evidence"])
+
 
 class TestStage0Assessment(unittest.TestCase):
     def run_stage0(self, argv, **kwargs):
@@ -368,6 +489,22 @@ class TestStage0Assessment(unittest.TestCase):
                                           auth=HARDENED_AUTH, allowlist_rules=ALLOW_RULES, hardening_mtime=999999999)
         self.assertIn("已完成并通过跨重启验证", output)
         self.assertEqual(code, 0)
+
+    def test_tailnet_declared_accepts_interface_rule(self):
+        rules = [("accept", None, None, ("established", "related")),
+                 ("accept", 62207, None, None, "tailscale0"),
+                 ("drop", 62207, None, None)]
+        code, output, _ = self.run_stage0(["--port", "62207", "--user", "fenix", "--tailnet"],
+                                          session_port=62207, listeners=[62207], disk_ports=(62207,), backup=True,
+                                          auth=HARDENED_AUTH, allowlist_rules=rules, tailnet=True)
+        self.assertIn("tailscale0 放行", output)
+        self.assertIn("tailscale0：up", output)
+        self.assertEqual(code, 0)
+
+    def test_tailnet_declared_without_interface_is_fail(self):
+        code, output, _ = self.run_stage0(["--port", "62207", "--user", "fenix", "--tailnet"], tailnet=False)
+        self.assertIn("未发现 tailscale0", output)
+        self.assertIn("[未达标] Tailscale 接入", output)
 
     def test_legacy_pending_blocks_with_exit_1(self):
         code, output, _ = self.run_stage0([], legacy_pending=True)

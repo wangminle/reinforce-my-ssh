@@ -57,6 +57,9 @@ LEGACY_SCHEME_TRACES = (
 SSHD_CONFIG = "/etc/ssh/sshd_config"
 SSHD_CONFIG_D = "/etc/ssh/sshd_config.d"
 SOCKET_DROPIN_DIR = "/etc/systemd/system/ssh.socket.d"
+TAILSCALE_IFACE = "/sys/class/net/tailscale0"
+CGNAT = ipaddress.ip_network("100.64.0.0/10")
+TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
 
 PASS, FAIL, WARN, UNKNOWN = "pass", "fail", "warn", "unknown"
 LABELS = {PASS: "已达标", FAIL: "未达标", WARN: "需注意", UNKNOWN: "无法证实"}
@@ -400,7 +403,8 @@ def literal_values(value):
 
 def rule_digest(rule):
     verdict = None
-    dports, saddrs, ct_state, iif_lo = set(), set(), set(), False
+    dports, saddrs, ct_state, iifs = set(), set(), set(), set()
+    iif_negated = False
     for expr in rule.get("expr", []):
         if "accept" in expr:
             verdict = "accept"
@@ -422,12 +426,14 @@ def rule_digest(rule):
             if isinstance(left, dict) and "ct" in left and left["ct"].get("key") == "state":
                 ct_state.update(str(v) for v in literal_values(right))
             if isinstance(left, dict) and "meta" in left and left["meta"].get("key") == "iifname":
-                if any(v in ("lo", '"lo"') for v in literal_values(right)):
-                    iif_lo = True
+                iifs.update(v.strip('"') for v in literal_values(right) if isinstance(v, str))
+                if node.get("op") == "!=":
+                    iif_negated = True
     if verdict is None and not dports and not saddrs:
         return None
     return {"verdict": verdict, "dports": sorted(dports), "saddrs": sorted(saddrs),
-            "ct_state": sorted(ct_state), "loopback": iif_lo}
+            "ct_state": sorted(ct_state), "iifs": sorted(iifs), "iif_negated": iif_negated,
+            "loopback": "lo" in iifs}
 
 
 def ufw_status(system):
@@ -439,18 +445,25 @@ def ufw_status(system):
     return {"available": True, "active": active, "text": text.strip()}
 
 
-def allowlist_assessment(nft_summary, ufw, port, allows):
-    """指导级判断：目标端口是否已被来源白名单约束。只做字面量比较，不确定就报 unknown。"""
-    if not allows:
+def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
+    """指导级判断：目标端口是否已被来源白名单约束。只做字面量比较，不确定就报 unknown。
+
+    tailnet=True 时额外承认 iifname "tailscale0" 的接口放行（它同时覆盖 v4/v6，
+    但只证明“经 tailnet 进入”，不证明 Tailscale SSH 与 sshd 的关系）。
+    """
+    if not allows and not tailnet:
         return {"status": UNKNOWN, "detail": "未声明 --allow，不判定白名单合规"}
     networks = [ipaddress.ip_network(item) for item in allows]
     port_s = str(port)
-    offenders, restricting_drop, saw_accept = [], False, False
+    offenders, restricting_drop, saw_accept, tailnet_accept = [], False, False, False
     for rule in nft_summary.get("rules", []):
         if port_s not in rule["dports"]:
             continue
         if rule["verdict"] == "accept":
             saw_accept = True
+            if tailnet and "tailscale0" in rule.get("iifs", []) and not rule.get("iif_negated"):
+                tailnet_accept = True
+                continue
             if not rule["saddrs"]:
                 offenders.append(rule["location"] + "：accept dport " + port_s + " 无来源限制")
             for literal in rule["saddrs"]:
@@ -466,12 +479,15 @@ def allowlist_assessment(nft_summary, ufw, port, allows):
     policy_drop = any("policy=drop" in item for item in nft_summary.get("input_policy", []))
     if ufw.get("active"):
         for line in ufw.get("text", "").splitlines():
-            m = re.match(r"^%s(/tcp)?\s+(ALLOW|DENY|REJECT)\s*(\S*)" % re.escape(port_s), line.strip())
+            m = re.match(r"^%s(/tcp)?(?:\s+on\s+(\S+))?\s+(ALLOW|DENY|REJECT)\s*(\S*)" % re.escape(port_s), line.strip())
             if not m:
                 continue
-            if m.group(2) == "ALLOW":
+            iface, verdict, literal = m.group(2), m.group(3), m.group(4)
+            if verdict == "ALLOW":
                 saw_accept = True
-                literal = m.group(3)
+                if tailnet and iface == "tailscale0":
+                    tailnet_accept = True
+                    continue
                 if literal not in ("Anywhere", "/ ::/0", "::/0", "0.0.0.0/0"):
                     try:
                         net = ipaddress.ip_network(literal.split()[0])
@@ -485,6 +501,8 @@ def allowlist_assessment(nft_summary, ufw, port, allows):
                 restricting_drop = True
     if offenders:
         return {"status": FAIL, "detail": "；".join(offenders[:4])}
+    if tailnet_accept and (restricting_drop or policy_drop):
+        return {"status": PASS, "detail": "iifname tailscale0 放行 + 默认拒绝；这只证明 tailnet 路径，Tailscale SSH 与 sshd 仍需分开验证"}
     if saw_accept and (restricting_drop or policy_drop):
         return {"status": PASS, "detail": "运行规则字面量比较：目标端口仅对声明白名单放行且存在默认拒绝；集合/区间写法请人工复核证据"}
     if saw_accept:
@@ -522,6 +540,41 @@ def legacy_facts(system):
                              + "发现旧版自动恢复定时器残留：%s。它会无人值守改写 SSH/防火墙，必须先人工核对并清理。"
                              % ", ".join(item["unit"] + "(" + item["active"] + ")" for item in facts["recovery_timers"]))
     return facts
+
+
+# ---------------------------------------------------------------- Tailscale 拓扑
+
+def tailnet_facts(system):
+    """tailscale0 存在且 IFF_UP，说明 tailscaled 已启动；只看只读属性，不调用 tailscale CLI。
+
+    TUN 接口的 operstate 常见为 unknown，因此以 /sys/class/net/<if>/flags 的 IFF_UP 位为准；
+    该位只说明接口已启用，不能证明节点仍处于登录状态。
+    """
+    facts = {"interface": TAILSCALE_IFACE, "present": False, "state": None, "flags": None, "up": False}
+    if not system.exists(TAILSCALE_IFACE):
+        return facts
+    facts["present"] = True
+    try:
+        facts["state"] = system.read(TAILSCALE_IFACE + "/operstate").strip()
+    except EvidenceError:
+        pass
+    try:
+        facts["flags"] = int(system.read(TAILSCALE_IFACE + "/flags").strip(), 16)
+    except (EvidenceError, ValueError):
+        pass
+    if facts["flags"] is not None:
+        facts["up"] = bool(facts["flags"] & 0x1)
+    else:
+        facts["up"] = facts["state"] in ("up", "unknown")
+    return facts
+
+
+def is_tailnet_address(value):
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return address in CGNAT or address in TAILSCALE_V6
 
 
 # ---------------------------------------------------------------- 备份与重启证据
@@ -589,6 +642,8 @@ def parse_args(argv):
     parser.add_argument("--allow", action="append", default=[], help="允许来源 CIDR，可重复；声明后才判定白名单")
     parser.add_argument("--closed-port", action="append", type=int, default=[], help="必须关闭的端口（通常是旧端口），可重复")
     parser.add_argument("--host", help="客户端连接地址或 SSH 别名，仅用于生成提示命令")
+    parser.add_argument("--tailnet", action="store_true",
+                        help="管理通路经 Tailscale tailnet；白名单判定承认 iifname tailscale0 放行")
     parser.add_argument("--backup-dir", default=BACKUP_ROOT, help="备份约定目录（默认 " + BACKUP_ROOT + "）")
     parser.add_argument("--format", choices=("text", "json"), default="text")
     options = parser.parse_args(argv)
@@ -674,9 +729,18 @@ def assess(facts, options):
         else:
             add("公钥认证可用", FAIL, "PubkeyAuthentication=%s AuthenticationMethods=%s" % (pubkey, methods))
 
-    if options.allow:
+    if options.allow or options.tailnet:
         wl = facts.get("allowlist", {})
         add("来源白名单", wl.get("status", UNKNOWN), wl.get("detail", "未评估"))
+
+    tailnet = facts.get("tailnet", {})
+    if options.tailnet:
+        if tailnet.get("up"):
+            add("Tailscale 接入", PASS, "tailscale0 已 up：经 tailnet 的管理通路可用")
+        elif tailnet.get("present"):
+            add("Tailscale 接入", FAIL, "tailscale0 存在但状态为 %s：tailscaled 未就绪" % (tailnet.get("state") or "不可读"))
+        else:
+            add("Tailscale 接入", FAIL, "未发现 tailscale0：本机尚未加入 tailnet")
 
     backup = facts.get("backup", {})
     if backup.get("has_sshd_config"):
@@ -736,12 +800,16 @@ def assess(facts, options):
         goals_user or "deploy")
     if options.host:
         stage1_cmd += " --host " + shlex.quote(options.host)
+    if options.tailnet:
+        stage1_cmd += " --tailnet"
     stage2_cmd = "sudo bash %s/%s --port %s --user %s" % (
         entry_dir(), STAGE2,
         goals_port if goals_port is not None else "NEW_PORT",
         goals_user or "deploy")
     for cidr in options.allow:
         stage2_cmd += " --allow " + shlex.quote(cidr)
+    if options.tailnet:
+        stage2_cmd += " --tailnet"
     if options.host:
         stage2_cmd += " --host " + shlex.quote(options.host)
 
@@ -794,13 +862,18 @@ def collect(system, options):
         if connection:
             user = facts["session"]["sudo_user"] or "root"
             facts["session"]["auth"] = session_auth(system, connection, user)
+            facts["session"]["tailnet"] = is_tailnet_address(connection["source"])
     attempt("会话采集", session)
 
     def services():
         load, active, listen = socket_listen_ports(system)
         facts["socket"] = {"load": load, "active": active, "listen_ports": listen}
         facts["ssh_service"] = dict(zip(("active", "enabled"), unit_state(system, "ssh.service")))
-        facts["listeners"] = {"sshd_ports": sshd_listeners(system)}
+        ports = set(sshd_listeners(system))
+        if active == "active":
+            # socket 激活时监听由 systemd 持有，ss 里没有 sshd 进程归属
+            ports.update(listen)
+        facts["listeners"] = {"sshd_ports": sorted(ports)}
     attempt("监听采集", services)
 
     def config():
@@ -839,9 +912,14 @@ def collect(system, options):
     def firewall():
         facts["nft"] = nft_ruleset_summary(system)
         facts["ufw"] = ufw_status(system)
-        if options.allow and options.port is not None:
-            facts["allowlist"] = allowlist_assessment(facts["nft"], facts["ufw"], options.port, options.allow)
+        if (options.allow or options.tailnet) and options.port is not None:
+            facts["allowlist"] = allowlist_assessment(
+                facts["nft"], facts["ufw"], options.port, options.allow, tailnet=options.tailnet)
     attempt("防火墙采集", firewall)
+
+    def tailnet():
+        facts["tailnet"] = tailnet_facts(system)
+    attempt("Tailscale 采集", tailnet)
 
     def backup():
         facts["backup"] = backup_facts(system, options.backup_dir)
@@ -868,7 +946,8 @@ def render_text(facts, options, items, position, next_step):
     connection = session.get("connection")
     print("\n-- 当前会话 --")
     if connection:
-        print("连接：%s:%d -> 本机 %s:%d" % (connection["source"], connection["source_port"], connection["local"], connection["port"]))
+        print("连接：%s:%d -> 本机 %s:%d%s" % (connection["source"], connection["source_port"], connection["local"],
+                                          connection["port"], "（经 tailnet）" if session.get("tailnet") else ""))
     else:
         print("连接：未检测到 SSH 会话（本机终端或环境不可读）")
     print("sudo 用户：%s；认证方式：%s" % (session.get("sudo_user") or "未识别", session.get("auth") or "未证实"))
@@ -920,6 +999,13 @@ def render_text(facts, options, items, position, next_step):
     ufw = facts.get("ufw", {})
     if ufw.get("available"):
         print("UFW：%s" % ("active" if ufw.get("active") else "inactive"))
+    print("\n-- Tailscale（只读检测）--")
+    tailnet = facts.get("tailnet", {})
+    if tailnet.get("present"):
+        print("tailscale0：%s" % (tailnet.get("state") or "状态不可读"))
+    else:
+        print("tailscale0：未发现（本机未加入 tailnet）")
+    print("说明：Tailscale SSH 由 tailscaled 终结认证、不经过 sshd；可作救援/管理通道，但不能作为 sshd 加固通过的证据。")
     print("\n-- 备份 / 旧版痕迹 / 重启 --")
     backup = facts.get("backup", {})
     if backup.get("latest"):
@@ -972,7 +1058,7 @@ def main(argv=None):
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "running_as_root": is_root(),
         "goals": {"port": options.port, "user": options.user, "allow": options.allow,
-                  "closed_port": options.closed_port, "host": options.host},
+                  "closed_port": options.closed_port, "host": options.host, "tailnet": options.tailnet},
         "facts": facts,
         "assessment": items,
         "position": position,

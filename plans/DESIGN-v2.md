@@ -24,7 +24,7 @@
 | --- | --- |
 | `stage0-check.sh` | 只读现状检查与流程定位：会话事实、监听/服务、sshd 有效配置、账户与公钥、nft/UFW、备份、旧版痕迹、重启证据；对照声明的目标（`--port/--user/--allow/--closed-port`）输出所处位置与下一步该跑哪个脚本 |
 | `stage1-port-key.sh` | 指导：切端口（开新端口→外部验证→关旧端口）、切密钥（sudo 组非 root 账户 + 公钥）、验证 sudo 用户 |
-| `stage2-lockdown.sh` | 指导：nft 来源白名单、禁 root/禁密码/禁键盘交互、最终确认清单、重启后复验 |
+| `stage2-lockdown.sh` | 指导：nft 来源白名单、禁 root/禁密码/禁键盘交互、最终确认清单、重启后复验；`--tailnet` 时改用接口放行并可关闭公网入口 |
 
 三个脚本各自自包含（bash 包装 + 内嵌 Python heredoc），只依赖 Bash、Python 3 与系统自带的 `ss`/`sshd`/`nft`/`ufw`/`systemctl`/`journalctl`。需要完整读取权限（`sudo`）；非 root 运行会降级并打印 sudo 命令（退出码 2）。
 
@@ -63,6 +63,20 @@
 5. **禁用密码前置**：必须已有新端口公钥会话验证通过。
 6. **重启持久化**：只有"启动时间晚于全部加固文件修改 + 运行态全部达标"才计为跨重启验证。
 
+### 5.1 Tailscale 拓扑（可选）
+
+管理通路是否经过 tailnet 不改变加固目标，只改变"白名单写什么、新入口用什么证据、最终还暴露什么"。三个脚本都接受 `--tailnet`；不声明时行为与默认流程完全一致。
+
+| 场景 | 白名单 | 新入口证据 | 终态 |
+| --- | --- | --- | --- |
+| 不入 tailnet | `--allow` 来源 CIDR | 该端口上的公钥会话重跑 stage1 | 公网端口仅白名单可达 |
+| 加入 tailnet | `iifname "tailscale0" accept`（stage2 自动生成） | 经 tailnet 到 **sshd** 的新端口公钥会话 | 推荐再用 `1b-close-public` 关闭公网入口 |
+| tailnet + DERP | 同上 | 同上 | 443/tcp、3478/udp 属独立规则域，不并入 SSH 白名单 |
+
+只读检测读取 `/sys/class/net/tailscale0`：存在且 `flags` 的 IFF_UP 位为 1 即视为可用（TUN 的 `operstate` 常为 `unknown`，只在读不到 flags 时回退）。地址识别同时覆盖 `100.64.0.0/10` 与 `fd7a:115c:a1e0::/48`。不调用 `tailscale` CLI，也不推断 Tailscale SSH 是否启用。
+
+**证据边界**：Tailscale SSH 由 `tailscaled` 终结认证，不经过 sshd。它可以作为救援/管理通路，但**不能**作为 sshd 加固通过的证据；stage1 在第 4 步会明确区分"经 tailnet 到 sshd"与"Tailscale SSH"。`--tailnet` 只改变指导内容，不写任何系统状态。
+
 ## 6. 输出约定
 
 文本模式面向人：步骤清单（已完成/未完成/被门槛阻塞）+ 当前步骤的"为什么/执行/验证/手工撤销"。JSON 模式面向智能体：
@@ -100,5 +114,5 @@
 
 ## 9. 验证范围与验收边界
 
-- 桩件回归：`python3 tests/run-tests.py`，37 项全部通过（解析、判定、门槛、退出码、只读契约）。
+- 桩件回归：`python3 tests/run-tests.py`，55 项全部通过（解析、判定、门槛、退出码、只读契约、Tailscale 拓扑、socket 激活与防火墙规则顺序）。
 - 未闭环（不得省略）：在可销毁整机上完成真实迁移与故障注入——外部连接成功/失败、白名单外来源拒绝、救援通道真实可用、跨重启复验；京东云节点的远端根因与旧事务处置（[[BUG-016]]、[[CHK-013]]）。桩件测试不替代整机验收。

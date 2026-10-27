@@ -127,13 +127,19 @@ def bind_stub(module, stub):
 
 
 def packet_nft(rules):
-    """把简写的规则列表渲染为 nft -j 输出；rules 元素形如 (verdict, dport, saddr, ct)。"""
+    """渲染 nft -j 输出；rules 元素形如 (verdict, dport, saddr, ct[, iif[, negate]])。"""
     items = [{"table": {"family": "inet", "name": "sshguard"}},
              {"chain": {"family": "inet", "table": "sshguard", "name": "ssh_allow", "hook": "input", "policy": "accept"}}]
-    for verdict, dport, saddr, ct in rules:
+    for rule in rules:
+        verdict, dport, saddr, ct = rule[:4]
+        iif = rule[4] if len(rule) > 4 else None
+        negate = bool(rule[5]) if len(rule) > 5 else False
         expr = []
         if ct:
             expr.append({"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": {"set": list(ct)}}})
+        if iif:
+            expr.append({"match": {"op": "!=" if negate else "==",
+                                   "left": {"meta": {"key": "iifname"}}, "right": iif}})
         if dport is not None:
             expr.append({"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": dport}})
         if saddr:
