@@ -24,7 +24,7 @@
 | --- | --- |
 | `stage0-check.sh` | 只读现状检查与流程定位：会话事实、监听/服务、sshd 有效配置、账户与公钥、nft/UFW、备份、旧版痕迹、重启证据；对照声明的目标（`--port/--user/--allow/--closed-port`）输出所处位置与下一步该跑哪个脚本 |
 | `stage1-port-key.sh` | 指导：切端口（开新端口→外部验证→关旧端口）、切密钥（sudo 组非 root 账户 + 公钥）、验证 sudo 用户 |
-| `stage2-lockdown.sh` | 指导：nft 来源白名单、禁 root/禁密码/禁键盘交互、最终确认清单、重启后复验；`--tailnet` 时改用接口放行并可关闭公网入口 |
+| `stage2-lockdown.sh` | 指导：nft 来源白名单、禁 root/禁密码/禁键盘交互、最终确认清单、重启后复验；`--tailnet` 时叠加接口与声明 CIDR 放行，拒绝白名单外来源 |
 
 三个脚本各自自包含（bash 包装 + 内嵌 Python heredoc），只依赖 Bash、Python 3 与系统自带的 `ss`/`sshd`/`nft`/`ufw`/`systemctl`/`journalctl`。需要完整读取权限（`sudo`）；非 root 运行会降级并打印 sudo 命令（退出码 2）。
 
@@ -70,10 +70,12 @@
 | 场景 | 白名单 | 新入口证据 | 终态 |
 | --- | --- | --- | --- |
 | 不入 tailnet | `--allow` 来源 CIDR | 该端口上的公钥会话重跑 stage1 | 公网端口仅白名单可达 |
-| 加入 tailnet | `iifname "tailscale0" accept`（stage2 自动生成） | 经 tailnet 到 **sshd** 的新端口公钥会话 | 推荐再用 `1b-close-public` 关闭公网入口 |
+| 加入 tailnet | `iifname "tailscale0" accept` 加全部 `--allow` 云内网/指定公网来源 | 经 tailnet 到 **sshd** 的新端口公钥会话，并分别验证声明来源 | `1b-close-public` 拒绝白名单外来源；未声明 CIDR 时才只留 tailnet |
 | tailnet + DERP | 同上 | 同上 | 443/tcp、3478/udp 属独立规则域，不并入 SSH 白名单 |
 
 只读检测读取 `/sys/class/net/tailscale0`：存在且 `flags` 的 IFF_UP 位为 1 即视为可用（TUN 的 `operstate` 常为 `unknown`，只在读不到 flags 时回退）。地址识别同时覆盖 `100.64.0.0/10` 与 `fd7a:115c:a1e0::/48`。不调用 `tailscale` CLI，也不推断 Tailscale SSH 是否启用。
+
+**混合白名单**：云服务商内网只保留用户明确声明的可信来源 IP/CIDR，不从私网属性或当前连接自动推导信任。`--tailnet` 与重复 `--allow` 为并集；规则生成、最终确认和重启续跑都保留该并集。每个声明来源必须有放行证据，不能仅凭 tailnet 放行即判定达标。混合模式不再提示仅绑定 tailnet，也不要求指定公网来源连接失败。
 
 **证据边界**：Tailscale SSH 由 `tailscaled` 终结认证，不经过 sshd。它可以作为救援/管理通路，但**不能**作为 sshd 加固通过的证据；stage1 在第 4 步会明确区分"经 tailnet 到 sshd"与"Tailscale SSH"。`--tailnet` 只改变指导内容，不写任何系统状态。
 
@@ -110,9 +112,9 @@
 
 ## 8. 分发与旧版处置
 
-部署只包含三个指导脚本 + Python 3；`legacy/` 与 `tests/` 不随部署分发。远端曾部署的旧版（OPS-015/016/019 记录了 md5）保持字节冻结用于取证；`working-scripts/` 上传器仍指向旧文件名，待真实部署计划确定后更新（台账 DEV 待办）。
+部署只包含三个指导脚本 + Python 3；`legacy/` 与 `tests/` 不随部署分发。远端曾部署的旧版（OPS-015/016/019 记录了 md5）在本地 `legacy/` 与台账中保留取证；aliyun-1 的旧 `~/ssh-apply` 已按用户要求于 2026-10-27 整体删除（OPS-024），其他机器上遗留的旧目录不由上传器更新或删除。本地上传器 `working-scripts/upload-ssh-guides-to-aliyun-1.sh` 与 `upload-ssh-guides-to-jdcloud-1.sh` 只把三个脚本上传到远端 `~/ssh-guides`，逐文件核对 md5 并分别验证远端 `--help`；上传不等于部署，实际执行仍需按机器逐个授权（台账 DEV-013）。
 
 ## 9. 验证范围与验收边界
 
-- 桩件回归：`python3 tests/run-tests.py`，55 项全部通过（解析、判定、门槛、退出码、只读契约、Tailscale 拓扑、socket 激活与防火墙规则顺序）。
+- 桩件回归：`python3 tests/run-tests.py`，68 项全部通过（解析、判定、门槛、退出码、只读契约、Tailscale 拓扑、socket 激活与防火墙规则顺序）。
 - 未闭环（不得省略）：在可销毁整机上完成真实迁移与故障注入——外部连接成功/失败、白名单外来源拒绝、救援通道真实可用、跨重启复验；京东云节点的远端根因与旧事务处置（[[BUG-016]]、[[CHK-013]]）。桩件测试不替代整机验收。

@@ -387,6 +387,9 @@ def nft_ruleset_summary(system):
 def literal_values(value):
     """nft JSON 右值可能是标量、列表或 {"set": [...]}；统一为字面量列表。"""
     if isinstance(value, dict):
+        if "prefix" in value:
+            prefix = value["prefix"]
+            return [str(prefix["addr"]) + "/" + str(prefix["len"])]
         if "set" in value:
             out = []
             for item in value["set"] if isinstance(value["set"], list) else [value["set"]]:
@@ -446,23 +449,21 @@ def ufw_status(system):
 
 
 def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
-    """指导级判断：目标端口是否已被来源白名单约束。只做字面量比较，不确定就报 unknown。
-
-    tailnet=True 时额外承认 iifname "tailscale0" 的接口放行（它同时覆盖 v4/v6，
-    但只证明“经 tailnet 进入”，不证明 Tailscale SSH 与 sshd 的关系）。
-    """
+    """核对全部声明来源与默认拒绝；复杂条件和拒绝后的放行不作为可达证据。"""
     if not allows and not tailnet:
         return {"status": UNKNOWN, "detail": "未声明 --allow，不判定白名单合规"}
     networks = [ipaddress.ip_network(item) for item in allows]
     port_s = str(port)
     offenders, restricting_drop, saw_accept, tailnet_accept = [], False, False, False
+    accepted, stopped = [], set()
     for rule in nft_summary.get("rules", []):
         if port_s not in rule["dports"]:
             continue
         if rule["verdict"] == "accept":
             saw_accept = True
+            reachable = rule["location"] not in stopped
             if tailnet and "tailscale0" in rule.get("iifs", []) and not rule.get("iif_negated"):
-                tailnet_accept = True
+                tailnet_accept |= reachable
                 continue
             if not rule["saddrs"]:
                 offenders.append(rule["location"] + "：accept dport " + port_s + " 无来源限制")
@@ -472,37 +473,56 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
                 except ValueError:
                     offenders.append(rule["location"] + "：无法解析来源 " + literal)
                     continue
-                if not any(net.subnet_of(declared) or net == declared for declared in networks):
+                if not any(net.version == declared.version and net.subnet_of(declared) for declared in networks):
                     offenders.append(rule["location"] + "：来源 " + literal + " 超出声明白名单")
+                elif reachable and not rule.get("iifs"):
+                    accepted.append(net)
         if rule["verdict"] in ("drop", "reject"):
-            restricting_drop = True
+            restricting_drop |= not rule["saddrs"] and (not rule.get("iifs") or rule.get("iif_negated", False))
+            # 拒绝之后的放行不能作为可达证据；复杂条件保守判为待复核。
+            stopped.add(rule["location"])
     policy_drop = any("policy=drop" in item for item in nft_summary.get("input_policy", []))
     if ufw.get("active"):
+        ufw_stopped = set()
         for line in ufw.get("text", "").splitlines():
-            m = re.match(r"^%s(/tcp)?(?:\s+on\s+(\S+))?\s+(ALLOW|DENY|REJECT)\s*(\S*)" % re.escape(port_s), line.strip())
+            m = re.match(r"^%s(/tcp)?(?:\s+\(v6\))?(?:\s+on\s+(\S+))?\s+(ALLOW|DENY|REJECT)\s*(\S*)" % re.escape(port_s), line.strip())
             if not m:
                 continue
             iface, verdict, literal = m.group(2), m.group(3), m.group(4)
+            version = 6 if "(v6)" in line or ":" in literal else 4
             if verdict == "ALLOW":
                 saw_accept = True
                 if tailnet and iface == "tailscale0":
-                    tailnet_accept = True
+                    tailnet_accept |= version not in ufw_stopped
                     continue
-                if literal not in ("Anywhere", "/ ::/0", "::/0", "0.0.0.0/0"):
+                if literal in ("Anywhere", "::/0", "0.0.0.0/0"):
+                    offenders.append("ufw：ALLOW " + port_s + " 无来源限制")
+                else:
                     try:
                         net = ipaddress.ip_network(literal.split()[0])
-                        if not any(net.subnet_of(d) or net == d for d in networks):
+                        if not any(net.version == d.version and net.subnet_of(d) for d in networks):
                             offenders.append("ufw：来源 " + literal + " 超出声明白名单")
+                        elif version not in ufw_stopped and not iface:
+                            accepted.append(net)
                     except ValueError:
                         offenders.append("ufw：无法解析来源 " + literal)
-                else:
-                    offenders.append("ufw：ALLOW " + port_s + " 无来源限制")
             else:
-                restricting_drop = True
+                restricting_drop |= not iface and literal in ("Anywhere", "::/0", "0.0.0.0/0")
+                ufw_stopped.add(version)
     if offenders:
         return {"status": FAIL, "detail": "；".join(offenders[:4])}
+    if saw_accept:
+        missing = []
+        for declared in networks:
+            merged = ipaddress.collapse_addresses(net for net in accepted if net.version == declared.version)
+            if not any(declared.subnet_of(net) for net in merged):
+                missing.append(str(declared))
+        if tailnet and not tailnet_accept:
+            missing.append("tailscale0")
+        if missing:
+            return {"status": FAIL, "detail": "未证实全部声明来源放行（含规则顺序）：" + ", ".join(missing)}
     if tailnet_accept and (restricting_drop or policy_drop):
-        return {"status": PASS, "detail": "iifname tailscale0 放行 + 默认拒绝；这只证明 tailnet 路径，Tailscale SSH 与 sshd 仍需分开验证"}
+        return {"status": PASS, "detail": "tailscale0 放行，全部声明 CIDR 放行 + 默认拒绝；Tailscale SSH 与 sshd 仍需分开验证"}
     if saw_accept and (restricting_drop or policy_drop):
         return {"status": PASS, "detail": "运行规则字面量比较：目标端口仅对声明白名单放行且存在默认拒绝；集合/区间写法请人工复核证据"}
     if saw_accept:

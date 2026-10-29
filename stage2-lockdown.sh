@@ -283,6 +283,9 @@ def backup_facts(system, backup_root):
 
 def literal_values(value):
     if isinstance(value, dict):
+        if "prefix" in value:
+            prefix = value["prefix"]
+            return [str(prefix["addr"]) + "/" + str(prefix["len"])]
         if "set" in value:
             out = []
             for item in value["set"] if isinstance(value["set"], list) else [value["set"]]:
@@ -361,18 +364,21 @@ def ufw_status(system):
 
 
 def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
+    """核对全部声明来源与默认拒绝；复杂条件和拒绝后的放行不作为可达证据。"""
     if not allows and not tailnet:
         return {"status": UNKNOWN, "detail": "未声明 --allow，不判定白名单合规"}
     networks = [ipaddress.ip_network(item) for item in allows]
     port_s = str(port)
     offenders, restricting_drop, saw_accept, tailnet_accept = [], False, False, False
+    accepted, stopped = [], set()
     for rule in nft_summary.get("rules", []):
         if port_s not in rule["dports"]:
             continue
         if rule["verdict"] == "accept":
             saw_accept = True
+            reachable = rule["location"] not in stopped
             if tailnet and "tailscale0" in rule.get("iifs", []) and not rule.get("iif_negated"):
-                tailnet_accept = True
+                tailnet_accept |= reachable
                 continue
             if not rule["saddrs"]:
                 offenders.append(rule["location"] + "：accept dport " + port_s + " 无来源限制")
@@ -382,37 +388,56 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
                 except ValueError:
                     offenders.append(rule["location"] + "：无法解析来源 " + literal)
                     continue
-                if not any(net.subnet_of(declared) or net == declared for declared in networks):
+                if not any(net.version == declared.version and net.subnet_of(declared) for declared in networks):
                     offenders.append(rule["location"] + "：来源 " + literal + " 超出声明白名单")
+                elif reachable and not rule.get("iifs"):
+                    accepted.append(net)
         if rule["verdict"] in ("drop", "reject"):
-            restricting_drop = True
+            restricting_drop |= not rule["saddrs"] and (not rule.get("iifs") or rule.get("iif_negated", False))
+            # 拒绝之后的放行不能作为可达证据；复杂条件保守判为待复核。
+            stopped.add(rule["location"])
     policy_drop = any("policy=drop" in item for item in nft_summary.get("input_policy", []))
     if ufw.get("active"):
+        ufw_stopped = set()
         for line in ufw.get("text", "").splitlines():
-            m = re.match(r"^%s(/tcp)?(?:\s+on\s+(\S+))?\s+(ALLOW|DENY|REJECT)\s*(\S*)" % re.escape(port_s), line.strip())
+            m = re.match(r"^%s(/tcp)?(?:\s+\(v6\))?(?:\s+on\s+(\S+))?\s+(ALLOW|DENY|REJECT)\s*(\S*)" % re.escape(port_s), line.strip())
             if not m:
                 continue
             iface, verdict, literal = m.group(2), m.group(3), m.group(4)
+            version = 6 if "(v6)" in line or ":" in literal else 4
             if verdict == "ALLOW":
                 saw_accept = True
                 if tailnet and iface == "tailscale0":
-                    tailnet_accept = True
+                    tailnet_accept |= version not in ufw_stopped
                     continue
                 if literal in ("Anywhere", "::/0", "0.0.0.0/0"):
                     offenders.append("ufw：ALLOW " + port_s + " 无来源限制")
                 else:
                     try:
                         net = ipaddress.ip_network(literal.split()[0])
-                        if not any(net.subnet_of(d) or net == d for d in networks):
+                        if not any(net.version == d.version and net.subnet_of(d) for d in networks):
                             offenders.append("ufw：来源 " + literal + " 超出声明白名单")
+                        elif version not in ufw_stopped and not iface:
+                            accepted.append(net)
                     except ValueError:
                         offenders.append("ufw：无法解析来源 " + literal)
             else:
-                restricting_drop = True
+                restricting_drop |= not iface and literal in ("Anywhere", "::/0", "0.0.0.0/0")
+                ufw_stopped.add(version)
     if offenders:
         return {"status": FAIL, "detail": "；".join(offenders[:4])}
+    if saw_accept:
+        missing = []
+        for declared in networks:
+            merged = ipaddress.collapse_addresses(net for net in accepted if net.version == declared.version)
+            if not any(declared.subnet_of(net) for net in merged):
+                missing.append(str(declared))
+        if tailnet and not tailnet_accept:
+            missing.append("tailscale0")
+        if missing:
+            return {"status": FAIL, "detail": "未证实全部声明来源放行（含规则顺序）：" + ", ".join(missing)}
     if tailnet_accept and (restricting_drop or policy_drop):
-        return {"status": PASS, "detail": "iifname tailscale0 放行 + 默认拒绝；只证明 tailnet 路径，Tailscale SSH 与 sshd 仍需分开验证"}
+        return {"status": PASS, "detail": "tailscale0 放行，全部声明 CIDR 放行 + 默认拒绝；Tailscale SSH 与 sshd 仍需分开验证"}
     if saw_accept and (restricting_drop or policy_drop):
         return {"status": PASS, "detail": "运行规则字面量比较：目标端口仅对声明白名单放行且存在默认拒绝；集合/区间写法请人工复核证据"}
     if saw_accept:
@@ -653,9 +678,9 @@ def parse_args(argv):
         epilog="退出码：0=stage2 全部达成（含跨重启复验）；1=阻断性异常；2=步骤未完成或需要 sudo。")
     parser.add_argument("--port", type=int, required=True, help="加固后的唯一 SSH 端口（stage1 成果）")
     parser.add_argument("--user", required=True, help="非 root 管理账户（stage1 成果）")
-    parser.add_argument("--allow", action="append", default=[], help="允许来源 CIDR，可重复；与 --tailnet 至少给一个")
+    parser.add_argument("--allow", action="append", default=[], help="可信来源 IP/CIDR，可重复声明云内网和指定公网来源；与 --tailnet 至少给一个")
     parser.add_argument("--tailnet", action="store_true",
-                        help="管理通路经 Tailscale tailnet：白名单改用 iifname tailscale0，并增加关闭公网入口步骤")
+                        help="额外放行 Tailscale 接口，保留全部 --allow 云内网/指定公网来源，并拒绝白名单外来源")
     parser.add_argument("--host", help="客户端连接地址或 SSH 别名，仅用于生成提示命令")
     parser.add_argument("--rescue-confirmed", action="store_true", help="已实际演练 VNC/串口救援登录（硬门槛）")
     parser.add_argument("--backup-dir", default=BACKUP_ROOT, help="备份约定目录（默认 " + BACKUP_ROOT + "）")
@@ -770,7 +795,7 @@ def build_steps(system, options, ctx):
                          "sudo nft -f " + ALLOWLIST_FILE + "   # 先试装（原子：失败不落规则），随后持久化：",
                          "grep -qs 'include \"/etc/nftables.d/\\*.nft\"' " + NFTABLES_CONF + " || echo 'include \"/etc/nftables.d/*.nft\"' | sudo tee -a " + NFTABLES_CONF,
                          "sudo systemctl enable --now nftables.service  # 重启后仍生效（若本机已有其它防火墙加载器，请先核对开机图）"]
-    step("1-allowlist", "nft 来源白名单（仅放行 --allow 到新端口）",
+    step("1-allowlist", "nft 来源白名单（Tailscale 接口与声明的云内网/公网来源）",
          allow_status, allow_note,
          "白名单把“知道端口”变成“还得来自允许的来源”。这是 login 前的第一道闸门；写错顺序或写错来源会直接断掉你自己的连接，因此本步先做链条自检再执行。",
          allow_do,
@@ -787,7 +812,7 @@ def build_steps(system, options, ctx):
     # 1b. 关闭公网入口（仅 --tailnet）
     if options.tailnet:
         exposed = public_exposure(ctx["bindings"], port)
-        verdict = public_entry_verdict(ctx["nft"], ctx["ufw"], port)
+        verdict = public_entry_verdict(ctx["nft"], ctx["ufw"], port) if not options.allow else None
         if not exposed:
             close_status = DONE
             close_note = "SSH 只监听回环/tailnet 地址，公网接口上没有该端口的监听"
@@ -800,8 +825,6 @@ def build_steps(system, options, ctx):
         else:
             close_status = UNKNOWN
             close_note = "端口 %d 在 %s 上监听，但未找到能证明非 tailnet 来源被拒绝的规则" % (port, ", ".join(exposed))
-        if options.allow:
-            close_note += "；本次同时声明了 --allow：若有意保留公网来源，可跳过本步骤，但最终确认清单会保持未通过"
         if ctx["ufw"].get("active"):
             close_do = ["# 本机 UFW active：用 UFW 规则收口（第 1 步若已生成，跳过对应行）：",
                         "sudo ufw allow in on tailscale0 to any port %d proto tcp comment 'ssh tailnet only'" % port,
@@ -818,20 +841,35 @@ def build_steps(system, options, ctx):
                         "# 方案 B：让 sshd 只绑定 tailnet 地址（先查询地址；socket 布局需改写 ListenStream）：",
                         "tailscale ip -4",
                         "# 在 " + SSHD_CONFIG + " 或其 drop-in 中写：ListenAddress <tailnet-ip>"]
-        step("1b-close-public", "关闭公网 SSH 入口（只保留 tailnet 通路）",
+        mixed_sources = bool(options.allow)
+        if mixed_sources:
+            close_status = DONE if allow_status == DONE else TODO
+            close_note = ("保留 tailscale0 与声明来源 " + ", ".join(options.allow)
+                          + "；白名单外来源拒绝；" + assessment["detail"])
+            close_do = ["# 按 1-allowlist 的完整规则操作：保留 tailscale0 和每个 --allow，再拒绝其余来源。",
+                        "# 云内网来源必须填写可信的实际 IP/CIDR；不要自动放行全部私网。",
+                        "# 清理已有宽泛放行，逐条核对顺序；不要将 sshd 仅绑定到 tailnet 地址。"]
+        close_verify = (["sudo nft list ruleset  # 或 sudo ufw status numbered：核对完整白名单与最终拒绝",
+                         "# 分别从 tailnet、声明的云内网、指定公网来源建立新的公钥 SSH 会话，应成功",
+                         "# 从白名单外来源连接，应被拒绝；保留当前会话直到全部验证完成"]
+                        if mixed_sources else
+                        ["sudo nft list chain inet sshguard ssh_allow  # 或 sudo ufw status numbered：tailscale0 放行应在该端口的拒绝之前",
+                         "# 客户端（非 tailnet 网络，例如手机热点）：ssh -p " + str(port) + " " + user + "@<公网地址>  # 应失败/超时",
+                         "# 客户端（tailnet 内）：ssh -p " + str(port) + " " + user + "@<tailnet-ip>  # 应成功"])
+        step("1b-close-public", "拒绝白名单外 SSH 来源（保留全部声明入口）" if mixed_sources else "关闭公网 SSH 入口（只保留 tailnet 通路）",
              close_status, close_note,
-             "把 sshd 从公网撤下，管理只走 tailnet：这消除了动态 IP 白名单最大的弱点，也减少暴露面。"
+             ("Tailscale 接口和 --allow 是累加关系；只收口白名单外来源，保留云内网和指定公网管理入口。" if mixed_sources else
+              "把 sshd 从公网撤下，管理只走 tailnet，减少暴露面。") +
              "前提是 tailnet 通路已被真实验证；Tailscale SSH（tailscaled 终结）不能作为 sshd 路径的验证证据。"
              "云安全组与本地防火墙是两个规则域，本步只动本机。",
              close_do,
-             ["sudo nft list chain inet sshguard ssh_allow  # 或 sudo ufw status numbered：tailscale0 放行应在该端口的拒绝之前",
-              "# 客户端（非 tailnet 网络，例如手机热点）：ssh -p " + str(port) + " " + user + "@<公网地址>  # 应失败/超时",
-              "# 客户端（tailnet 内）：ssh -p " + str(port) + " " + user + "@<tailnet-ip>  # 应成功"],
-             ["# 撤销方案 A：按 handle 删除两条规则（先 nft -a list chain inet sshguard ssh_allow 查看 handle）",
+             close_verify,
+             (["# 本步骤复用第 1 步完整白名单；按 1-allowlist 的撤销说明或备份手工恢复"] if mixed_sources else
+              ["# 撤销方案 A：按 handle 删除两条规则（先 nft -a list chain inet sshguard ssh_allow 查看 handle）",
               "sudo nft delete rule inet sshguard ssh_allow handle <handle>",
               "# UFW：sudo ufw delete deny " + str(port) + "/tcp",
               "# 或从 1-backup 备份的 nft-ruleset.nft / ufw-status.txt 重新装载",
-              "# 撤销方案 B：从备份恢复 sshd 配置并 reload"],
+              "# 撤销方案 B：从备份恢复 sshd 配置并 reload"]),
              blocked_by=(["0-preconditions"] if pre_fail else []) + (["1-allowlist"] if allow_status != DONE else []))
         close_block = ["1b-close-public"] if close_status != DONE else []
     else:
@@ -891,7 +929,7 @@ def build_steps(system, options, ctx):
     if options.tailnet:
         checks.append(("Tailscale 接入", PASS if ctx["tailnet"].get("up") else FAIL,
                        "tailscale0=%s" % (ctx["tailnet"].get("state") or "未发现")))
-        checks.append(("公网入口已关闭", PASS if close_status == DONE else FAIL, close_note))
+        checks.append(("白名单外入口已关闭" if options.allow else "公网入口已关闭", PASS if close_status == DONE else FAIL, close_note))
     if ctx["match_blocks"]:
         checks.append(("Match 覆盖风险", UNKNOWN, "存在 Match 块，需人工复核：" + "; ".join(ctx["match_blocks"][:4])))
     confirm_ok = all(status == PASS for _, status, _ in checks)

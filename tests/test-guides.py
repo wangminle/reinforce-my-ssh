@@ -451,6 +451,112 @@ class TestStage2Steps(unittest.TestCase):
         self.assertTrue(any("--tailnet" in line for line in steps["4-reboot-verify"]["do"]))
         self.assertTrue(any("--tailnet" in line for line in steps["0-preconditions"]["do"]))
 
+    def mixed(self, rules, **kwargs):
+        return self.build(session_source="100.64.1.9", tailnet=True,
+                          allow=["10.20.0.0/16", "203.0.113.9/32", "2001:db8::9/128"],
+                          session_port=62207, listeners=[62207], backup=True,
+                          disk_ports=(62207,), auth=HARDENED_AUTH,
+                          hardening_mtime=999999999, allowlist_rules=rules,
+                          extra=["--tailnet"], **kwargs)
+
+    def mixed_rules(self):
+        return [("accept", 62207, None, None, "tailscale0"),
+                ("accept", 62207, ["10.20.0.0/16", "203.0.113.9/32", "2001:db8::9/128"], None),
+                ("drop", 62207, None, None)]
+
+    def test_mixed_sources_can_complete_all_steps(self):
+        _, _, _, steps = self.mixed(self.mixed_rules())
+        self.assertTrue(all(s["status"] == "done" for s in steps.values()), steps)
+
+    def test_mixed_guidance_preserves_all_sources(self):
+        _, _, _, steps = self.mixed([])
+        commands = "\n".join(steps["1-allowlist"]["do"])
+        for source in ("10.20.0.0/16", "203.0.113.9/32", "2001:db8::9/128"):
+            self.assertIn(source, commands)
+            self.assertIn("--allow " + source, "\n".join(steps["4-reboot-verify"]["do"]))
+        self.assertIn('iifname "tailscale0"', commands)
+        close = "\n".join(steps["1b-close-public"]["do"] + steps["1b-close-public"]["verify"])
+        self.assertNotIn("ListenAddress", close)
+        self.assertNotIn("应失败/超时", close)
+        self.assertIn("白名单外", steps["1b-close-public"]["title"])
+
+    def test_mixed_missing_declared_source_cannot_pass(self):
+        rules = self.mixed_rules()
+        rules[1] = ("accept", 62207, ["10.20.0.0/16", "2001:db8::9/128"], None)
+        _, _, ctx, steps = self.mixed(rules)
+        self.assertNotEqual(ctx["allowlist"]["status"], "pass")
+        self.assertNotEqual(steps["3-confirm"]["status"], "done")
+
+    def test_mixed_missing_tailnet_rule_cannot_pass(self):
+        _, _, ctx, _ = self.mixed(self.mixed_rules()[1:])
+        self.assertNotEqual(ctx["allowlist"]["status"], "pass")
+
+    def test_mixed_unlisted_public_source_cannot_pass(self):
+        rules = self.mixed_rules()
+        rules.insert(1, ("accept", 62207, ["198.51.100.9/32"], None))
+        _, _, ctx, steps = self.mixed(rules)
+        self.assertEqual(ctx["allowlist"]["status"], "fail")
+        self.assertNotEqual(steps["1b-close-public"]["status"], "done")
+
+    def test_mixed_accept_after_drop_cannot_pass(self):
+        rules = self.mixed_rules()
+        rules.insert(0, ("drop", 62207, None, None))
+        _, _, ctx, _ = self.mixed(rules)
+        self.assertNotEqual(ctx["allowlist"]["status"], "pass")
+
+    def test_mixed_ufw_sources_can_complete(self):
+        text = ("Status: active\n62207/tcp on tailscale0 ALLOW Anywhere\n"
+                "62207/tcp ALLOW 10.20.0.0/16\n62207/tcp ALLOW 203.0.113.9\n"
+                "62207/tcp ALLOW 2001:db8::9\n62207/tcp DENY Anywhere\n")
+        _, _, _, steps = self.mixed([], ufw_active=True, ufw_text=text)
+        self.assertTrue(all(s["status"] == "done" for s in steps.values()), steps)
+
+    def test_mixed_source_specific_drop_is_not_default_deny(self):
+        rules = self.mixed_rules()[:-1] + [("drop", 62207, ["198.51.100.9/32"], None)]
+        _, _, ctx, _ = self.mixed(rules)
+        self.assertNotEqual(ctx["allowlist"]["status"], "pass")
+
+    def test_real_nft_prefix_json_is_parsed(self):
+        for module in (STAGE0, STAGE2):
+            with self.subTest(script=module.SCRIPT):
+                for address, length in (("10.20.0.0", 16), ("2001:db8::", 64)):
+                    values = module.literal_values({"set": [{"prefix": {"addr": address, "len": length}}]})
+                    self.assertEqual(values, [address + "/" + str(length)])
+
+    def test_stage0_also_requires_all_declared_sources(self):
+        rules = self.mixed_rules()
+        rules[1] = ("accept", 62207, ["10.20.0.0/16"], None)
+        system = make_stub(STAGE0, allowlist_rules=rules)
+        result = STAGE0.allowlist_assessment(STAGE0.nft_ruleset_summary(system), {}, 62207,
+                                            ["10.20.0.0/16", "203.0.113.9/32"], tailnet=True)
+        self.assertNotEqual(result["status"], "pass")
+
+    def test_mixed_cloud_and_public_sessions_remain_allowed(self):
+        for source in ("10.20.1.8", "203.0.113.9", "2001:db8::9"):
+            with self.subTest(source=source):
+                _, _, _, steps = self.build(session_source=source, tailnet=True,
+                    allow=["10.20.0.0/16", "203.0.113.9/32", "2001:db8::9/128"],
+                    session_port=62207, listeners=[62207], backup=True,
+                    disk_ports=(62207,), auth=HARDENED_AUTH, hardening_mtime=999999999,
+                    allowlist_rules=self.mixed_rules(), extra=["--tailnet"])
+                self.assertEqual(steps["1-allowlist"]["status"], "done")
+                self.assertEqual(steps["3-confirm"]["status"], "done")
+
+    def test_mixed_ufw_real_ipv6_rows_remain_allowed(self):
+        text = ("Status: active\n62207/tcp on tailscale0 ALLOW Anywhere\n"
+                "62207/tcp ALLOW 10.20.0.0/16\n62207/tcp ALLOW 203.0.113.9\n"
+                "62207/tcp DENY Anywhere\n62207/tcp (v6) on tailscale0 ALLOW Anywhere (v6)\n"
+                "62207/tcp (v6) ALLOW 2001:db8::9\n62207/tcp (v6) DENY Anywhere (v6)\n")
+        _, _, ctx, steps = self.mixed([], ufw_active=True, ufw_text=text)
+        self.assertEqual(ctx["allowlist"]["status"], "pass")
+        self.assertEqual(steps["3-confirm"]["status"], "done")
+
+    def test_mixed_ufw_missing_source_cannot_pass(self):
+        text = ("Status: active\n62207/tcp on tailscale0 ALLOW Anywhere\n"
+                "62207/tcp DENY Anywhere\n")
+        _, _, ctx, _ = self.mixed([], ufw_active=True, ufw_text=text)
+        self.assertNotEqual(ctx["allowlist"]["status"], "pass")
+
     def test_tailnet_requires_interface(self):
         _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=False, allow=[],
                                     session_port=62207, listeners=[62207], backup=True,
