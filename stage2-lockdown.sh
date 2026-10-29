@@ -50,6 +50,7 @@ HARDEN_DROPIN = SSHD_CONFIG_D + "/20-hardening.conf"
 ALLOWLIST_FILE = "/etc/nftables.d/ssh-allowlist.nft"
 NFTABLES_CONF = "/etc/nftables.conf"
 MANAGED_HINT_FILES = (
+    "/usr/local/sbin/reinforce-my-ssh-firewall",
     "/etc/ssh/sshd_config.d/00-reinforce-my-ssh.conf",
     "/etc/nftables.d/reinforce-my-ssh.nft",
     "/etc/systemd/system/reinforce-my-ssh-firewall.service",
@@ -113,10 +114,22 @@ class System:
             raise EvidenceError("无法读取 " + path + "：" + exc.strerror)
 
     def exists(self, path):
-        return Path(path).exists()
+        try:
+            Path(path).stat()
+            return True
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError as exc:
+            raise EvidenceError("无法检查路径 " + path + "：" + str(exc))
 
     def is_dir(self, path):
-        return Path(path).is_dir()
+        import stat
+        try:
+            return stat.S_ISDIR(Path(path).stat().st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError as exc:
+            raise EvidenceError("无法检查目录 " + path + "：" + str(exc))
 
     def list_dir(self, path):
         try:
@@ -194,7 +207,10 @@ def session_auth(system, connection, user):
 
 
 def endpoint_port(text):
-    return int(text.rsplit(":", 1)[1])
+    value = text.rsplit(":", 1)[-1]
+    if not value.isdecimal() or not 1 <= int(value) <= 65535:
+        raise ValueError("不是有效 TCP 端口：" + text)
+    return int(value)
 
 
 def sshd_config_files(system):
@@ -236,46 +252,72 @@ def sshd_valid(system):
 
 
 def account_facts(system, user):
-    facts = {"user": user}
+    facts = {"user": user, "authorized_keys_readable": False}
     try:
-        uid = system.run("id", "-u", user).strip()
-    except EvidenceError as exc:
-        facts["exists"] = False
-        facts["detail"] = str(exc)
+        facts["uid"] = int(system.run("id", "-u", user).strip())
+    except (EvidenceError, ValueError) as exc:
+        facts.update(exists=False, detail=str(exc))
         return facts
     facts["exists"] = True
-    facts["uid"] = int(uid) if uid.isdigit() else uid
     try:
         facts["groups"] = system.run("id", "-nG", user).split()
-    except EvidenceError:
-        facts["groups"] = []
-    facts["sudo"] = "sudo" in facts["groups"]
-    try:
         home = system.run("getent", "passwd", user).split(":")[5]
     except (EvidenceError, IndexError):
         home = None
+    facts["sudo"] = "sudo" in facts.get("groups", []) and facts["uid"] != 0
+    facts["home"] = home
     if home:
-        keyfile = Path(home) / ".ssh" / "authorized_keys"
+        keyfile = home.rstrip("/") + "/.ssh/authorized_keys"
+        facts["authorized_keys_path"] = keyfile
         try:
-            content = system.read(str(keyfile))
-            facts["authorized_keys_count"] = len([line for line in content.splitlines() if line.strip() and not line.strip().startswith("#")])
-        except EvidenceError:
-            facts["authorized_keys_count"] = 0
+            content = system.read(keyfile)
+            facts["authorized_keys_readable"] = True
+            facts["authorized_keys_count"] = sum(bool(line.strip()) and not line.lstrip().startswith("#")
+                                                  for line in content.splitlines())
+            attrs = [("home", home), ("ssh_dir", home.rstrip("/") + "/.ssh"), ("authorized_keys", keyfile)]
+            for label, path in attrs:
+                st = system.stat(path)
+                facts[label + "_mode"] = oct(st.st_mode & 0o777)
+                facts[label + "_owner_ok"] = st.st_uid in (0, facts["uid"])
+            facts["permissions_safe"] = all(
+                facts[label + "_owner_ok"] and not (int(facts[label + "_mode"], 8) & 0o022)
+                for label, _ in attrs)
+        except EvidenceError as exc:
+            facts["permissions_safe"] = False
+            facts["detail"] = str(exc)
     return facts
 
 
 def backup_facts(system, backup_root):
-    facts = {"root": backup_root, "latest": None, "has_sshd_config": False}
+    facts = {"root": backup_root, "latest": None, "has_sshd_config": False, "complete": False}
     if not system.is_dir(backup_root):
         return facts
-    try:
-        names = system.list_dir(backup_root)
-    except EvidenceError:
+    names = [name for name in system.list_dir(backup_root)
+             if re.fullmatch(r"[0-9]{8}-[0-9]{6}(?:-[0-9]+)?", name)
+             and system.is_dir(backup_root.rstrip("/") + "/" + name)]
+    if not names:
         return facts
-    if names:
-        latest = backup_root.rstrip("/") + "/" + names[-1]
-        facts["latest"] = latest
-        facts["has_sshd_config"] = system.exists(latest + "/sshd_config")
+    latest = backup_root.rstrip("/") + "/" + names[-1]
+    facts["latest"] = latest
+    required = ["sshd_config", "units.txt", "backup-complete", "ssh.socket.active", "nftables.enabled"]
+    missing = [name for name in required if not system.exists(latest + "/" + name)]
+    for name in ("sshd_config.d", "ssh.socket.d", "nftables.d", "ufw"):
+        if not (system.is_dir(latest + "/" + name) or system.exists(latest + "/" + name + ".absent")):
+            missing.append(name)
+    for name in ("nftables.conf",):
+        if not (system.exists(latest + "/" + name) or system.exists(latest + "/" + name + ".absent")):
+            missing.append(name)
+    for name in ("nft-ruleset.nft", "ufw-status.txt"):
+        if not (system.exists(latest + "/" + name) or system.exists(latest + "/" + name + ".unavailable")):
+            missing.append(name)
+    if system.exists(latest + "/nft-ruleset.nft"):
+        if not system.exists(latest + "/nft-ruleset.json"):
+            missing.append("nft-ruleset.json")
+        if not (system.exists(latest + "/sshguard.nft") or system.exists(latest + "/sshguard.nft.absent")):
+            missing.append("sshguard.nft")
+    facts["has_sshd_config"] = system.exists(latest + "/sshd_config")
+    facts["missing"] = missing
+    facts["complete"] = not missing
     return facts
 
 
@@ -350,6 +392,8 @@ def nft_ruleset_summary(system):
             if digest:
                 summary["rules"].append({
                     "location": "%s %s chain %s" % (item["rule"].get("family"), item["rule"].get("table"), item["rule"].get("chain")),
+                    "identity": [item["rule"].get(key) for key in ("family", "table", "chain")],
+                    "handle": item["rule"].get("handle"), "comment": item["rule"].get("comment"),
                     **digest,
                 })
     return summary
@@ -463,15 +507,17 @@ def legacy_blocking(system):
     except EvidenceError:
         timers = []
     for unit in timers:
-        active = "unknown"
-        try:
-            value = (system.run_allow_fail("systemctl", "is-active", unit).stdout or "").strip().splitlines()
-            active = value[0] if value else "unknown"
-        except EvidenceError:
-            pass
-        traces.append("旧版恢复定时器 %s（%s）" % (unit, active))
-        if active == "active":
-            reasons.append("旧版自动恢复定时器仍在运行：" + unit)
+        states = []
+        for sub in ("is-active", "is-enabled"):
+            try:
+                result = system.run_allow_fail("systemctl", sub, unit)
+                states.append((result.stdout or "").strip() or "unknown")
+            except EvidenceError:
+                states.append("unknown")
+        active, enabled = states
+        traces.append("旧版恢复定时器 %s（%s / %s）" % (unit, active, enabled))
+        if active not in ("inactive", "failed") or enabled not in ("disabled", "masked"):
+            reasons.append("旧版恢复定时器运行、已启用或状态未知，先人工核对：" + unit)
     for path in MANAGED_HINT_FILES:
         if system.exists(path):
             traces.append(path)
@@ -698,14 +744,175 @@ def parse_args(argv):
         parser.error("--allow 至少一个来源，或使用 --tailnet 声明经 Tailscale 管理")
     if options.host and not re.fullmatch(r"[A-Za-z0-9_.:\[\]-]+", options.host):
         parser.error("--host 含不支持的字符")
+    if (not options.backup_dir.startswith("/") or options.backup_dir.startswith("//")
+            or options.backup_dir.rstrip("/") == "" or any(part in (".", "..") for part in options.backup_dir.split("/"))
+            or any(ord(c) < 32 or ord(c) == 127 for c in options.backup_dir)):
+        parser.error("--backup-dir 必须是非根目录的绝对路径，不含 .、.. 或控制字符")
+    options.backup_dir = options.backup_dir.rstrip("/")
     return options
 
 
 # ---------------------------------------------------------------- 步骤方案
 
+def transition_cleanup(nft_summary, port):
+    commands = ["# 先保留当前会话，从声明来源建立新的公钥会话验证成功，再清理过渡规则。",
+                "sudo nft -a list ruleset  # 核对下面的 handle 未变化；不要 flush ruleset"]
+    for rule in nft_summary.get("rules", []):
+        if (rule.get("comment") == "stage1 new-port bridge" and rule.get("verdict") == "accept"
+                and rule.get("dports") == [str(port)] and not rule.get("saddrs") and not rule.get("iifs")
+                and rule.get("ct_state") == ["new"]):
+            identity = rule.get("identity", [])
+            handle = rule.get("handle")
+            if len(identity) == 3 and all(isinstance(x, str) for x in identity) and isinstance(handle, int):
+                commands.append("sudo nft delete rule " + " ".join(shlex.quote(x) for x in identity)
+                                + " handle " + str(handle))
+            else:
+                commands.append("# stage1 过渡规则的 handle 无法读取；用上面命令定位后人工精确删除。")
+    commands += ["# 若还有非 stage1 的宽泛放行，人工核对其用途与持久化文件；按 handle 精确收口，再重跑。",
+                 "# nft 跨基链 accept 不能绕过 drop；当前检查保守拒绝未清理的宽泛规则。"]
+    return commands
+
+
+def recovery_commands(backup_dir):
+    # 只生成供操作员执行的恢复程序；指导脚本本身不会执行它。
+    program = r'''import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path("/")
+backup = Path(sys.argv[1])
+
+def target(path):
+    return ROOT / path.lstrip("/")
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, text=True, **kwargs)
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+def remove_file(path):
+    # 只删除精确列出的文件；目录异常直接失败，绝不递归删除配置树。
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        raise SystemExit("预期文件却发现目录，停止恢复：" + str(path))
+
+def copy_file(source, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    remove_file(destination)
+    run("cp", "-a", "--", str(source), str(destination))
+
+domains = [
+    ("sshd_config.d", "/etc/ssh/sshd_config.d", ["10-newport.conf", "20-hardening.conf"]),
+    ("ssh.socket.d", "/etc/systemd/system/ssh.socket.d", ["10-newport.conf"]),
+    ("nftables.d", "/etc/nftables.d", ["ssh-allowlist.nft"]),
+    ("ufw", "/etc/ufw", []),
+]
+for name in ("backup-complete", "sshd_config", "units.txt", "ssh.socket.active", "nftables.enabled"):
+    require((backup / name).is_file(), "备份不完整，停止恢复：" + name)
+require((backup / "backup-complete").read_text().strip() == "complete", "备份未成功完成")
+for name, _, _ in domains:
+    require((backup / name).is_dir() or (backup / (name + ".absent")).is_file(), "备份缺少目录状态：" + name)
+require((backup / "nftables.conf").exists() or (backup / "nftables.conf.absent").is_file(), "备份缺少 nftables.conf 状态")
+socket_state = (backup / "ssh.socket.active").read_text().strip()
+nft_enabled = (backup / "nftables.enabled").read_text().strip()
+require(socket_state in ("active", "inactive", "failed", "not-found"), "备份中 ssh.socket 状态不明确")
+require(nft_enabled in ("enabled", "enabled-runtime", "disabled", "masked", "static", "not-found"), "备份中 nftables 启用状态不明确")
+snapshot = None
+if (backup / "nft-ruleset.nft").is_file():
+    require(shutil.which("nft"), "缺少 nft，不能恢复防火墙")
+    snapshot = json.loads((backup / "nft-ruleset.json").read_text())
+    require(isinstance(snapshot.get("nftables"), list), "nft JSON 快照无效")
+    require((backup / "sshguard.nft").is_file() or (backup / "sshguard.nft.absent").is_file(), "缺少 sshguard 原始状态")
+    had_table = any(x.get("table", {}).get("family") == "inet" and x.get("table", {}).get("name") == "sshguard"
+                    for x in snapshot["nftables"])
+    require(had_table == (backup / "sshguard.nft").is_file(), "sshguard 快照与规则清单矛盾")
+else:
+    require((backup / "nft-ruleset.nft.unavailable").is_file(), "缺少 nft 备份状态")
+    require(not shutil.which("nft"), "备份时 nft 不可用，现在已安装；先人工核对防火墙，不能猜测原始规则")
+ufw_active = False
+if (backup / "ufw-status.txt").is_file():
+    ufw_active = "Status: active" in (backup / "ufw-status.txt").read_text()
+    require(not ufw_active or shutil.which("ufw"), "原 UFW 处于 active，当前缺少 ufw")
+else:
+    require((backup / "ufw-status.txt.unavailable").is_file(), "缺少 UFW 备份状态")
+
+# 先校验恢复表的语法，错误快照不得触发文件删除。
+if snapshot is not None and (backup / "sshguard.nft").is_file():
+    # 该表可能已存在，完整替换事务在执行前统一检查。
+    require((backup / "sshguard.nft").stat().st_size > 0, "sshguard 快照为空")
+
+def firewall_transaction():
+    current = json.loads(run("nft", "-j", "list", "ruleset", capture_output=True).stdout)
+    entries = current.get("nftables", [])
+    commands = []
+    if any(x.get("table", {}).get("family") == "inet" and x.get("table", {}).get("name") == "sshguard" for x in entries):
+        commands.append("delete table inet sshguard")
+    if (backup / "sshguard.nft").is_file():
+        commands.append((backup / "sshguard.nft").read_text())
+    def identity(rule):
+        return tuple(rule.get(k) for k in ("family", "table", "chain", "handle"))
+    original = {identity(x["rule"]) for x in snapshot["nftables"] if "rule" in x}
+    for item in entries:
+        rule = item.get("rule", {})
+        if (rule.get("comment") != "stage1 new-port bridge" or identity(rule) in original
+                or (rule.get("family") == "inet" and rule.get("table") == "sshguard")):
+            continue
+        require(rule.get("family") in ("ip", "ip6", "inet") and isinstance(rule.get("handle"), int), "过渡规则身份不明确")
+        require(all(isinstance(rule.get(key), str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", rule[key])
+                    for key in ("table", "chain")), "规则表/链名称需人工核对，停止恢复")
+        commands.append("delete rule " + rule["family"] + " " + rule["table"]
+                        + " " + rule["chain"] + " handle " + str(rule["handle"]))
+    return "\n".join(commands) + "\n"
+
+if snapshot is not None:
+    run("nft", "-c", "-f", "-", input=firewall_transaction())
+
+copy_file(backup / "sshd_config", target("/etc/ssh/sshd_config"))
+for name, destination, introduced in domains:
+    saved = backup / name
+    destination = target(destination)
+    for filename in introduced:
+        remove_file(destination / filename)
+    if saved.is_dir():
+        destination.mkdir(parents=True, exist_ok=True)
+        run("cp", "-a", "--", str(saved) + "/.", str(destination) + "/")
+if (backup / "nftables.conf").exists():
+    copy_file(backup / "nftables.conf", target("/etc/nftables.conf"))
+else:
+    remove_file(target("/etc/nftables.conf"))
+if ufw_active:
+    run("ufw", "reload")
+if snapshot is not None:
+    transaction = firewall_transaction()
+    run("nft", "-c", "-f", "-", input=transaction)
+    run("nft", "-f", "-", input=transaction)
+# 不 stop nftables：其 ExecStop 可能 flush 全机规则。仅撤销本流程增加的开机启用。
+if nft_enabled == "disabled":
+    run("systemctl", "disable", "nftables.service")
+run("sshd", "-t")
+run("systemctl", "daemon-reload")
+if socket_state == "active":
+    run("systemctl", "restart", "ssh.socket")
+# socket 监听和 sshd 认证配置是两层状态；仅重启 socket 不会让存活的 sshd 重载认证配置。
+run("systemctl", "reload-or-restart", "ssh.service")
+print("备份中的配置与 SSH 防火墙域已恢复；保持救援会话，验证旧入口、新公钥会话及完整规则，再考虑重启。")
+'''
+    return ["# 完整恢复到 stage1 备份，会同时撤销后续 SSH/防火墙更改；从已验证的救援通道执行，失败停止。",
+            "sudo python3 - " + shlex.quote(backup_dir) + " <<'SSH_RECOVERY_PY'\n" + program + "SSH_RECOVERY_PY",
+            "sudo ss -ltnp  # 核对旧入口恢复，再从客户端建立新的公钥 SSH 会话",
+            "# 有 nft 时核对 sudo nft list ruleset；原有其它规则不应被清空。"]
+
+
 def build_steps(system, options, ctx):
     host = options.host or "SERVER"
     port, user = options.port, options.user
+    restore_path = ctx["backup"].get("latest") or options.backup_dir + "/REPLACE_WITH_TIMESTAMP"
     steps = []
 
     def step(sid, title, status, evidence, why, do, verify, undo, blocked_by=None):
@@ -715,9 +922,9 @@ def build_steps(system, options, ctx):
     session = ctx["connection"]
     listen_ok = ctx["listeners"] == [port]
     session_ok = bool(session and session["port"] == port and ctx["auth"] == "publickey")
-    backup_ok = ctx["backup"].get("has_sshd_config")
+    backup_ok = ctx["backup"].get("complete")
     account = ctx["account"]
-    account_ok = bool(account.get("exists") and account.get("sudo") and account.get("authorized_keys_count"))
+    account_ok = bool(account.get("exists") and account.get("sudo") and account.get("authorized_keys_count") and account.get("permissions_safe"))
     preconditions = {
         "仅新端口 %d 在监听" % port: listen_ok,
         "当前会话为新端口公钥登录": session_ok,
@@ -733,10 +940,11 @@ def build_steps(system, options, ctx):
          "；".join(("%s：%s" % (name, "已满足" if ok else "未满足")) for name, ok in preconditions.items()),
          "stage2 会禁用密码与限制来源；任何一个前置条件不成立都可能把自己关在门外。先回到 stage1 补齐，或从新端口的公钥会话重跑。",
          (["# 前置未满足时的处置：",
-           "sudo bash " + entry_dir() + "/" + STAGE1 + " --port " + str(port) + " --user " + user
+           "sudo bash " + shlex.quote(entry_dir() + "/" + STAGE1) + " --port " + str(port) + " --user " + user
            + ((" --host " + shlex.quote(options.host)) if options.host else "")
            + (" --rescue-confirmed" if options.rescue_confirmed else "")
-           + (" --tailnet" if options.tailnet else "")]
+           + " --backup-dir " + shlex.quote(options.backup_dir)
+          + (" --tailnet" if options.tailnet else "")]
           if pre_fail else ["# 全部满足；继续检查下一步"]),
          ["重跑本脚本：0-preconditions 应显示已完成"],
          ["无需撤销：本步骤只读"],
@@ -769,10 +977,12 @@ def build_steps(system, options, ctx):
         if ctx["ufw"].get("active"):
             allow_do = ["# 本机 UFW 处于 active，用 UFW 等效命令（保持其统一管理，勿混用 nft 文件）："]
             if options.tailnet:
-                allow_do += ["sudo ufw allow in on tailscale0 to any port %d proto tcp comment 'ssh allowlist tailnet'" % port]
-            allow_do += ["sudo ufw allow from %s to any port %d proto tcp comment 'ssh allowlist'" % (item, port)
+                allow_do += ["sudo ufw insert 1 allow in on tailscale0 to any port %d proto tcp comment 'ssh allowlist tailnet'" % port]
+            allow_do += ["sudo ufw insert 1 allow from %s to any port %d proto tcp comment 'ssh allowlist'" % (item, port)
                          for item in options.allow]
             allow_do += ["sudo ufw deny %d/tcp comment 'ssh allowlist default-deny'" % port,
+                         "# 先从每个声明来源验证新的公钥会话成功，再移除 stage1 的全来源允许（IPv4/IPv6）：",
+                         "sudo ufw delete allow %d/tcp" % port,
                          "sudo ufw status numbered  # 逐条核对：白名单 allow 在 deny 之前的语义生效"]
         else:
             allow_do = ["# 本机无 active UFW：用独立 nft 链（只影响本端口的“新连接”，不改全局策略）：",
@@ -795,6 +1005,7 @@ def build_steps(system, options, ctx):
                          "sudo nft -f " + ALLOWLIST_FILE + "   # 先试装（原子：失败不落规则），随后持久化：",
                          "grep -qs 'include \"/etc/nftables.d/\\*.nft\"' " + NFTABLES_CONF + " || echo 'include \"/etc/nftables.d/*.nft\"' | sudo tee -a " + NFTABLES_CONF,
                          "sudo systemctl enable --now nftables.service  # 重启后仍生效（若本机已有其它防火墙加载器，请先核对开机图）"]
+            allow_do += transition_cleanup(ctx["nft"], port)
     step("1-allowlist", "nft 来源白名单（Tailscale 接口与声明的云内网/公网来源）",
          allow_status, allow_note,
          "白名单把“知道端口”变成“还得来自允许的来源”。这是 login 前的第一道闸门；写错顺序或写错来源会直接断掉你自己的连接，因此本步先做链条自检再执行。",
@@ -803,10 +1014,7 @@ def build_steps(system, options, ctx):
           "sudo nft list ruleset  # 或 sudo ufw status verbose，逐条核对来源与端口",
           "客户端：ssh -p " + str(port) + " " + user + "@" + host + "  # 白名单内来源应仍可登录",
           "# 可选：从白名单外的网络（如手机热点）尝试连接，应被拒绝"],
-         ["# 撤销白名单（保持原样要比新加容易得多）：",
-          "sudo rm -f " + ALLOWLIST_FILE + " && sudo nft delete table inet sshguard 2>/dev/null || true",
-          "sudo ufw delete deny " + str(port) + "/tcp 2>/dev/null || true",
-          "# 或直接从 1-backup 备份的 nft-ruleset.nft 重新装载"],
+         recovery_commands(restore_path),
          blocked_by=["0-preconditions"] if pre_fail else [])
 
     # 1b. 关闭公网入口（仅 --tailnet）
@@ -864,12 +1072,7 @@ def build_steps(system, options, ctx):
              "云安全组与本地防火墙是两个规则域，本步只动本机。",
              close_do,
              close_verify,
-             (["# 本步骤复用第 1 步完整白名单；按 1-allowlist 的撤销说明或备份手工恢复"] if mixed_sources else
-              ["# 撤销方案 A：按 handle 删除两条规则（先 nft -a list chain inet sshguard ssh_allow 查看 handle）",
-              "sudo nft delete rule inet sshguard ssh_allow handle <handle>",
-              "# UFW：sudo ufw delete deny " + str(port) + "/tcp",
-              "# 或从 1-backup 备份的 nft-ruleset.nft / ufw-status.txt 重新装载",
-              "# 撤销方案 B：从备份恢复 sshd 配置并 reload"]),
+             recovery_commands(restore_path),
              blocked_by=(["0-preconditions"] if pre_fail else []) + (["1-allowlist"] if allow_status != DONE else []))
         close_block = ["1b-close-public"] if close_status != DONE else []
     else:
@@ -882,7 +1085,8 @@ def build_steps(system, options, ctx):
     kbd_ok = auth.get("kbdinteractiveauthentication") in (None, "no")
     methods = auth.get("authenticationmethods")
     methods_ok = methods in (None, "any") or "publickey" in (methods or "")
-    if root_ok and pass_ok and kbd_ok and methods_ok:
+    pubkey_ok = auth.get("pubkeyauthentication") == "yes"
+    if root_ok and pass_ok and kbd_ok and methods_ok and pubkey_ok:
         auth_status, auth_note = DONE, "PermitRootLogin=%s PasswordAuthentication=%s KbdInteractive=%s AuthenticationMethods=%s" % (
             auth.get("permitrootlogin"), auth.get("passwordauthentication"),
             auth.get("kbdinteractiveauthentication"), methods or "any")
@@ -890,6 +1094,7 @@ def build_steps(system, options, ctx):
         auth_status, auth_note = TODO, "PermitRootLogin=%s PasswordAuthentication=%s KbdInteractive=%s AuthenticationMethods=%s" % (
             auth.get("permitrootlogin"), auth.get("passwordauthentication"),
             auth.get("kbdinteractiveauthentication"), methods or "any")
+    auth_note += " PubkeyAuthentication=%s" % auth.get("pubkeyauthentication")
     if source_in_allow is False:
         auth_status = BLOCKED
         auth_note += "；当前来源不在白名单内，先完成第 1 步"
@@ -898,6 +1103,7 @@ def build_steps(system, options, ctx):
         auth_note += "；当前会话不是新端口公钥登录，禁用密码前必须先有一个已验证的公钥会话"
     auth_do = ["sudo tee " + HARDEN_DROPIN + " >/dev/null <<'EOF'",
                "PermitRootLogin no",
+               "PubkeyAuthentication yes",
                "PasswordAuthentication no",
                "KbdInteractiveAuthentication no",
                "AuthenticationMethods publickey",
@@ -911,8 +1117,7 @@ def build_steps(system, options, ctx):
           "客户端：ssh -o PreferredAuthentications=publickey -p " + str(port) + " " + user + "@" + host + " true  # 成功",
           "客户端：ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -p " + str(port) + " " + user + "@" + host + "  # 必须失败（Permission denied）",
           "客户端：ssh -p " + str(port) + " root@" + host + "  # 必须失败"],
-         ["sudo rm -f " + HARDEN_DROPIN + " && sudo sshd -t && sudo systemctl reload ssh.service",
-          "# 或从 1-backup 备份的 sshd_config.d/ 恢复；绝不依赖任何自动回滚"],
+         recovery_commands(restore_path),
          blocked_by=[b for b in (["0-preconditions"] if pre_fail else []) + (["1-allowlist"] if allow_status != DONE else []) + close_block])
 
     # 3. 最终确认清单
@@ -924,7 +1129,7 @@ def build_steps(system, options, ctx):
     checks.append(("禁 root", PASS if root_ok else FAIL, "PermitRootLogin=%s" % auth.get("permitrootlogin")))
     checks.append(("禁密码/键盘交互", PASS if (pass_ok and kbd_ok) else FAIL, "Password=%s Kbd=%s" % (
         auth.get("passwordauthentication"), auth.get("kbdinteractiveauthentication"))))
-    checks.append(("公钥认证生效", PASS if methods_ok else FAIL, "AuthenticationMethods=%s" % (methods or "any")))
+    checks.append(("公钥认证生效", PASS if (methods_ok and pubkey_ok) else FAIL, "PubkeyAuthentication=%s AuthenticationMethods=%s" % (auth.get("pubkeyauthentication"), methods or "any")))
     checks.append(("sshd 配置有效", PASS if ctx["sshd_valid"] else FAIL, ctx["sshd_error"] or "sshd -t 通过"))
     if options.tailnet:
         checks.append(("Tailscale 接入", PASS if ctx["tailnet"].get("up") else FAIL,
@@ -959,18 +1164,14 @@ def build_steps(system, options, ctx):
           "# 等待重启完成，从客户端重新连接（务必用公钥、新端口）：",
           "ssh -o PreferredAuthentications=publickey -p " + str(port) + " " + user + "@" + host,
           "# 重连后重跑本脚本完成复验：",
-          "sudo bash " + entry_dir() + "/" + SCRIPT + " --port " + str(port) + " --user " + user
+          "sudo bash " + shlex.quote(entry_dir() + "/" + SCRIPT) + " --port " + str(port) + " --user " + user
           + "".join(" --allow " + shlex.quote(item) for item in options.allow)
           + ((" --host " + shlex.quote(options.host)) if options.host else "")
           + (" --rescue-confirmed" if options.rescue_confirmed else "")
+          + " --backup-dir " + shlex.quote(options.backup_dir)
           + (" --tailnet" if options.tailnet else "")],
          ["重跑后本步骤应显示已完成"],
-         ["# 若重启后不可达：走救援通道（VNC/串口），按备份手工恢复：",
-          "sudo cp -a " + options.backup_dir + "/<时间戳>/sshd_config.d/. " + SSHD_CONFIG_D + "/",
-          "sudo cp -a " + options.backup_dir + "/<时间戳>/ssh.socket.d/. " + SOCKET_DROPIN_DIR + "/ 2>/dev/null || true",
-          "sudo nft -f " + options.backup_dir + "/<时间戳>/nft-ruleset.nft",
-          "sudo sshd -t && sudo systemctl restart ssh.socket ssh.service",
-          "# 恢复命令永远由你手工执行；本工具不会自动回滚"],
+         recovery_commands(restore_path),
          blocked_by=[b for b in (["0-preconditions"] if pre_fail else []) + ([] if confirm_ok else ["3-confirm"])])
     return steps
 

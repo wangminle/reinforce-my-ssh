@@ -9,8 +9,9 @@
 #   3. 打印下一步应运行的指导脚本（stage1-port-key.sh / stage2-lockdown.sh）。
 # 所有建议命令由操作员本人（或其监督下的智能体）手工执行。
 #
-# 退出码：0=检查完成；1=发现阻断性异常（如旧版待确认事务、sshd 配置损坏）；
-#         2=检查不完整（权限不足或必要采集失败）。
+# 退出码：0=未声明目标且采集完成，或已声明目标全部达成；
+#         1=阻断性异常（旧版待确认事务、sshd 配置损坏）；
+#         2=步骤未完成、需要 sudo，或必要采集失败。
 # 设计文档：plans/DESIGN-v2.md。旧版自动执行体系已废弃，见 legacy/README.md。
 
 set -uo pipefail
@@ -128,10 +129,22 @@ class System:
             raise EvidenceError("无法读取 " + path + "：" + exc.strerror)
 
     def exists(self, path):
-        return Path(path).exists()
+        try:
+            Path(path).stat()
+            return True
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError as exc:
+            raise EvidenceError("无法检查路径 " + path + "：" + str(exc))
 
     def is_dir(self, path):
-        return Path(path).is_dir()
+        import stat
+        try:
+            return stat.S_ISDIR(Path(path).stat().st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError as exc:
+            raise EvidenceError("无法检查目录 " + path + "：" + str(exc))
 
     def list_dir(self, path):
         try:
@@ -214,7 +227,10 @@ def session_auth(system, connection, user):
 # ---------------------------------------------------------------- 监听与服务
 
 def endpoint_port(text):
-    return int(text.rsplit(":", 1)[1])
+    value = text.rsplit(":", 1)[-1]
+    if not value.isdecimal() or not 1 <= int(value) <= 65535:
+        raise ValueError("不是有效 TCP 端口：" + text)
+    return int(value)
 
 
 def sshd_listeners(system):
@@ -307,56 +323,57 @@ def disk_port_directives(system):
                     ports.setdefault(int(m.group(1)), []).append("%s:%d" % (path, number))
         except EvidenceError:
             continue
-    try:
-        for path in sorted(Path(SOCKET_DROPIN_DIR).glob("*.conf")):
-            for number, line in enumerate(system.read(str(path)).splitlines(), 1):
-                m = re.match(r"\s*ListenStream\s*=\s*(\S+)\s*$", line)
-                if m:
-                    try:
-                        ports.setdefault(endpoint_port(m.group(1)), []).append("%s:%d" % (path, number))
-                    except ValueError:
-                        continue
-    except OSError:
-        pass
+    names = system.list_dir(SOCKET_DROPIN_DIR) if system.is_dir(SOCKET_DROPIN_DIR) else []
+    for name in sorted(names):
+        if not name.endswith(".conf"):
+            continue
+        path = SOCKET_DROPIN_DIR + "/" + name
+        for number, line in enumerate(system.read(path).splitlines(), 1):
+            m = re.match(r"\s*ListenStream\s*=\s*(\S+)\s*$", line)
+            if m:
+                try:
+                    ports.setdefault(endpoint_port(m.group(1)), []).append("%s:%d" % (path, number))
+                except ValueError:
+                    continue
     return ports
 
 
 # ---------------------------------------------------------------- 账户与公钥
 
 def account_facts(system, user):
-    facts = {"user": user}
+    facts = {"user": user, "authorized_keys_readable": False}
     try:
-        uid = system.run("id", "-u", user).strip()
-    except EvidenceError as exc:
-        facts["exists"] = False
-        facts["detail"] = str(exc)
+        facts["uid"] = int(system.run("id", "-u", user).strip())
+    except (EvidenceError, ValueError) as exc:
+        facts.update(exists=False, detail=str(exc))
         return facts
     facts["exists"] = True
-    facts["uid"] = int(uid) if uid.isdigit() else uid
     try:
-        groups = system.run("id", "-nG", user).split()
-    except EvidenceError:
-        groups = []
-    facts["groups"] = groups
-    facts["sudo"] = "sudo" in groups or (isinstance(facts["uid"], int) and facts["uid"] == 0)
-    try:
+        facts["groups"] = system.run("id", "-nG", user).split()
         home = system.run("getent", "passwd", user).split(":")[5]
     except (EvidenceError, IndexError):
         home = None
+    facts["sudo"] = "sudo" in facts.get("groups", []) and facts["uid"] != 0
     facts["home"] = home
     if home:
-        keyfile = Path(home) / ".ssh" / "authorized_keys"
-        facts["authorized_keys_path"] = str(keyfile)
+        keyfile = home.rstrip("/") + "/.ssh/authorized_keys"
+        facts["authorized_keys_path"] = keyfile
         try:
-            content = system.read(str(keyfile))
-            keys = [line for line in content.splitlines() if line.strip() and not line.strip().startswith("#")]
-            facts["authorized_keys_count"] = len(keys)
-            st = system.stat(str(keyfile))
-            facts["authorized_keys_mode"] = oct(st.st_mode & 0o777)
-            facts["ssh_dir_mode"] = oct(system.stat(str(keyfile.parent)).st_mode & 0o777)
-            facts["authorized_keys_owner_ok"] = st.st_uid == facts["uid"]
-        except EvidenceError:
-            facts["authorized_keys_count"] = 0
+            content = system.read(keyfile)
+            facts["authorized_keys_readable"] = True
+            facts["authorized_keys_count"] = sum(bool(line.strip()) and not line.lstrip().startswith("#")
+                                                  for line in content.splitlines())
+            attrs = [("home", home), ("ssh_dir", home.rstrip("/") + "/.ssh"), ("authorized_keys", keyfile)]
+            for label, path in attrs:
+                st = system.stat(path)
+                facts[label + "_mode"] = oct(st.st_mode & 0o777)
+                facts[label + "_owner_ok"] = st.st_uid in (0, facts["uid"])
+            facts["permissions_safe"] = all(
+                facts[label + "_owner_ok"] and not (int(facts[label + "_mode"], 8) & 0o022)
+                for label, _ in attrs)
+        except EvidenceError as exc:
+            facts["permissions_safe"] = False
+            facts["detail"] = str(exc)
     return facts
 
 
@@ -555,10 +572,12 @@ def legacy_facts(system):
                 facts["recovery_timers"].append({"unit": name, "active": active, "enabled": enabled})
     except EvidenceError:
         pass
-    if facts["recovery_timers"]:
+    dangerous = [item for item in facts["recovery_timers"]
+                 if item["active"] not in ("inactive", "failed") or item["enabled"] not in ("disabled", "masked")]
+    if dangerous:
         facts["blocking"] = ((facts["blocking"] + " " if facts["blocking"] else "")
                              + "发现旧版自动恢复定时器残留：%s。它会无人值守改写 SSH/防火墙，必须先人工核对并清理。"
-                             % ", ".join(item["unit"] + "(" + item["active"] + ")" for item in facts["recovery_timers"]))
+                             % ", ".join(item["unit"] + "(" + item["active"] + ")" for item in dangerous))
     return facts
 
 
@@ -600,21 +619,35 @@ def is_tailnet_address(value):
 # ---------------------------------------------------------------- 备份与重启证据
 
 def backup_facts(system, backup_root):
-    facts = {"root": backup_root, "latest": None, "has_sshd_config": False}
+    facts = {"root": backup_root, "latest": None, "has_sshd_config": False, "complete": False}
     if not system.is_dir(backup_root):
         return facts
-    try:
-        names = system.list_dir(backup_root)
-    except EvidenceError:
+    names = [name for name in system.list_dir(backup_root)
+             if re.fullmatch(r"[0-9]{8}-[0-9]{6}(?:-[0-9]+)?", name)
+             and system.is_dir(backup_root.rstrip("/") + "/" + name)]
+    if not names:
         return facts
-    if names:
-        latest = backup_root.rstrip("/") + "/" + names[-1]
-        facts["latest"] = latest
-        facts["has_sshd_config"] = system.exists(latest + "/sshd_config")
-        try:
-            facts["entries"] = system.list_dir(latest)[:12]
-        except EvidenceError:
-            facts["entries"] = []
+    latest = backup_root.rstrip("/") + "/" + names[-1]
+    facts["latest"] = latest
+    required = ["sshd_config", "units.txt", "backup-complete", "ssh.socket.active", "nftables.enabled"]
+    missing = [name for name in required if not system.exists(latest + "/" + name)]
+    for name in ("sshd_config.d", "ssh.socket.d", "nftables.d", "ufw"):
+        if not (system.is_dir(latest + "/" + name) or system.exists(latest + "/" + name + ".absent")):
+            missing.append(name)
+    for name in ("nftables.conf",):
+        if not (system.exists(latest + "/" + name) or system.exists(latest + "/" + name + ".absent")):
+            missing.append(name)
+    for name in ("nft-ruleset.nft", "ufw-status.txt"):
+        if not (system.exists(latest + "/" + name) or system.exists(latest + "/" + name + ".unavailable")):
+            missing.append(name)
+    if system.exists(latest + "/nft-ruleset.nft"):
+        if not system.exists(latest + "/nft-ruleset.json"):
+            missing.append("nft-ruleset.json")
+        if not (system.exists(latest + "/sshguard.nft") or system.exists(latest + "/sshguard.nft.absent")):
+            missing.append("sshguard.nft")
+    facts["has_sshd_config"] = system.exists(latest + "/sshd_config")
+    facts["missing"] = missing
+    facts["complete"] = not missing
     return facts
 
 
@@ -656,7 +689,7 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(
         prog=SCRIPT,
         description="只读检查 SSH 加固现状并定位所处步骤；不修改系统、不代执行。",
-        epilog="退出码：0=检查完成；1=阻断性异常（旧版待确认事务/恢复定时器、sshd 配置损坏）；2=检查不完整（需要 sudo 或必要采集失败）。")
+        epilog="退出码：0=未声明目标且采集完成，或已声明目标全部达成；1=阻断性异常（旧版待确认事务/恢复定时器、sshd 配置损坏）；2=步骤未完成、需要 sudo，或必要采集失败。")
     parser.add_argument("--port", type=int, help="目标 SSH 端口（加固后唯一保留的端口）")
     parser.add_argument("--user", help="目标非 root 管理账户")
     parser.add_argument("--allow", action="append", default=[], help="允许来源 CIDR，可重复；声明后才判定白名单")
@@ -681,6 +714,11 @@ def parse_args(argv):
         parser.error(str(exc))
     if options.host and not re.fullmatch(r"[A-Za-z0-9_.:\[\]-]+", options.host):
         parser.error("--host 含不支持的字符")
+    if (not options.backup_dir.startswith("/") or options.backup_dir.startswith("//")
+            or options.backup_dir.rstrip("/") == "" or any(part in (".", "..") for part in options.backup_dir.split("/"))
+            or any(ord(c) < 32 or ord(c) == 127 for c in options.backup_dir)):
+        parser.error("--backup-dir 必须是非根目录的绝对路径，不含 .、.. 或控制字符")
+    options.backup_dir = options.backup_dir.rstrip("/")
     return options
 
 
@@ -697,11 +735,15 @@ def assess(facts, options):
     if goals_user:
         account = facts.get("account", {})
         if not account.get("exists"):
-            add("sudo 账户与公钥", FAIL, "账户 %s 不存在" % goals_user)
+            add("sudo 账户与公钥", FAIL if is_root() else UNKNOWN, "账户 %s 不存在或无法读取" % goals_user)
         elif not account.get("sudo"):
             add("sudo 账户与公钥", FAIL, "账户 %s 不在 sudo 组" % goals_user)
+        elif not account.get("authorized_keys_readable"):
+            add("sudo 账户与公钥", UNKNOWN, "authorized_keys 无法读取，不能判断是否安装公钥")
         elif not account.get("authorized_keys_count"):
             add("sudo 账户与公钥", FAIL, "账户 %s 没有已安装的公钥" % goals_user)
+        elif not account.get("permissions_safe"):
+            add("sudo 账户与公钥", UNKNOWN if not is_root() else FAIL, "账户路径权限/属主不安全或无法证实")
         elif account.get("authorized_keys_mode") not in ("0o600", "0o400") or account.get("ssh_dir_mode") != "0o700":
             add("sudo 账户与公钥", WARN, "公钥已安装但权限异常（目录 %s / 文件 %s）" % (account.get("ssh_dir_mode"), account.get("authorized_keys_mode")))
         else:
@@ -711,11 +753,15 @@ def assess(facts, options):
     if goals_port is not None:
         if goals_port in listeners:
             add("新端口监听", PASS, "端口 %d 正在监听" % goals_port)
+        elif not facts.get("listeners", {}).get("complete", False):
+            add("新端口监听", UNKNOWN, "监听归属不可完整读取；请用 sudo 复查")
         else:
             add("新端口监听", FAIL, "端口 %d 未在监听（当前 sshd 监听：%s）" % (goals_port, listeners or "无"))
     for port in options.closed_port:
         if port in listeners:
             add("旧端口 %d 已关闭" % port, FAIL, "端口 %d 仍在监听" % port)
+        elif not facts.get("listeners", {}).get("complete", False):
+            add("旧端口 %d 已关闭" % port, UNKNOWN, "未看到该端口不等于已关闭；请用 sudo 复查")
         else:
             add("旧端口 %d 已关闭" % port, PASS, "端口 %d 未监听" % port)
 
@@ -749,6 +795,10 @@ def assess(facts, options):
         else:
             add("公钥认证可用", FAIL, "PubkeyAuthentication=%s AuthenticationMethods=%s" % (pubkey, methods))
 
+    if not effective and not root_context:
+        for label in ("禁止 root 登录", "禁止密码/键盘交互登录", "公钥认证可用"):
+            add(label, UNKNOWN, "有效配置未采集；请用 sudo 复查")
+
     if options.allow or options.tailnet:
         wl = facts.get("allowlist", {})
         add("来源白名单", wl.get("status", UNKNOWN), wl.get("detail", "未评估"))
@@ -763,10 +813,10 @@ def assess(facts, options):
             add("Tailscale 接入", FAIL, "未发现 tailscale0：本机尚未加入 tailnet")
 
     backup = facts.get("backup", {})
-    if backup.get("has_sshd_config"):
-        add("手工备份", PASS, "备份目录 %s 含 sshd_config" % backup.get("latest"))
+    if backup.get("complete"):
+        add("手工备份", PASS, "备份目录 %s 含完整配置与防火墙快照" % backup.get("latest"))
     elif backup.get("latest"):
-        add("手工备份", WARN, "备份目录 %s 存在但缺 sshd_config 副本" % backup.get("latest"))
+        add("手工备份", WARN, "备份目录 %s 不完整；请重做 stage1 备份" % backup.get("latest"))
     else:
         add("手工备份", FAIL, "未发现 %s 下的备份" % backup.get("root"))
 
@@ -779,8 +829,9 @@ def assess(facts, options):
     port_ok = ok("新端口监听") if "新端口监听" in statuses else None
     old_ok = all(ok("旧端口 %d 已关闭" % port) for port in options.closed_port) if options.closed_port else None
     auth_ok = None
-    if "禁止 root 登录" in statuses or "禁止密码/键盘交互登录" in statuses:
-        auth_ok = ok("禁止 root 登录") and ok("禁止密码/键盘交互登录")
+    auth_names = ("禁止 root 登录", "禁止密码/键盘交互登录", "公钥认证可用")
+    if any(name in statuses for name in auth_names):
+        auth_ok = all(ok(name) for name in auth_names)
     allow_ok = ok("来源白名单") if "来源白名单" in statuses else None
 
     def not_failed(value):
@@ -814,18 +865,22 @@ def assess(facts, options):
         position = "stage0"
 
     host = options.host or "SERVER"
-    stage1_cmd = "sudo bash %s/%s --port %s --user %s" % (
-        entry_dir(), STAGE1,
+    stage1_cmd = "sudo bash %s --port %s --user %s" % (
+        shlex.quote(entry_dir() + "/" + STAGE1),
         goals_port if goals_port is not None else "NEW_PORT",
         goals_user or "deploy")
+    stage1_cmd += " --backup-dir " + shlex.quote(options.backup_dir)
+    for cidr in options.allow:
+        stage1_cmd += " --allow " + shlex.quote(cidr)
     if options.host:
         stage1_cmd += " --host " + shlex.quote(options.host)
     if options.tailnet:
         stage1_cmd += " --tailnet"
-    stage2_cmd = "sudo bash %s/%s --port %s --user %s" % (
-        entry_dir(), STAGE2,
+    stage2_cmd = "sudo bash %s --port %s --user %s" % (
+        shlex.quote(entry_dir() + "/" + STAGE2),
         goals_port if goals_port is not None else "NEW_PORT",
         goals_user or "deploy")
+    stage2_cmd += " --backup-dir " + shlex.quote(options.backup_dir)
     for cidr in options.allow:
         stage2_cmd += " --allow " + shlex.quote(cidr)
     if options.tailnet:
@@ -869,7 +924,7 @@ def collect(system, options):
         try:
             callback()
             facts["collected"].append(name)
-        except (EvidenceError, ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+        except (EvidenceError, OSError, ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
             facts["failed"].append({"name": name, "detail": str(exc)})
 
     facts["session"] = {}
@@ -893,17 +948,20 @@ def collect(system, options):
         if active == "active":
             # socket 激活时监听由 systemd 持有，ss 里没有 sshd 进程归属
             ports.update(listen)
-        facts["listeners"] = {"sshd_ports": sorted(ports)}
+        facts["listeners"] = {"sshd_ports": sorted(ports), "complete": is_root()}
     attempt("监听采集", services)
 
     def config():
         facts["sshd_config_valid"] = None
-        try:
-            system.run("sshd", "-t", "-f", SSHD_CONFIG)
-            facts["sshd_config_valid"] = True
-        except EvidenceError as exc:
-            facts["sshd_config_valid"] = False
-            facts["sshd_config_error"] = str(exc)
+        if is_root():
+            try:
+                system.run("sshd", "-t", "-f", SSHD_CONFIG)
+                facts["sshd_config_valid"] = True
+            except EvidenceError as exc:
+                facts["sshd_config_valid"] = False
+                facts["sshd_config_error"] = str(exc)
+        else:
+            facts["sshd_config_error"] = "需要 sudo 检查配置及 host keys；未执行 sshd -t"
         facts["disk_ports"] = {str(port): where for port, where in disk_port_directives(system).items()}
         facts["match_blocks"] = match_blocks(system)
         if is_root():
@@ -1029,7 +1087,7 @@ def render_text(facts, options, items, position, next_step):
     print("\n-- 备份 / 旧版痕迹 / 重启 --")
     backup = facts.get("backup", {})
     if backup.get("latest"):
-        print("备份：%s%s" % (backup.get("latest"), "（含 sshd_config）" if backup.get("has_sshd_config") else "（缺 sshd_config 副本）"))
+        print("备份：%s%s" % (backup.get("latest"), "（完整备份）" if backup.get("complete") else "（备份不完整）"))
     else:
         print("备份：%s 下未发现备份" % backup.get("root", options.backup_dir))
     legacy = facts.get("legacy", {})
@@ -1089,12 +1147,14 @@ def main(argv=None):
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
     else:
         render_text(facts, options, items, position, next_step)
+    if not is_root():
+        return 2
     if blocking:
         return 1
-    critical = {"会话采集", "监听采集"}
-    if any(failure["name"] in critical for failure in facts.get("failed", [])) or not facts.get("collected"):
+    if facts.get("failed") or not facts.get("collected"):
         return 2
-    if not is_root():
+    declared = bool(options.port or options.user or options.allow or options.closed_port or options.tailnet)
+    if declared and any(item["status"] != PASS for item in items):
         return 2
     return 0
 

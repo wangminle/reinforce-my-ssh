@@ -4,6 +4,7 @@
 运行：python3 tests/run-tests.py
 """
 import contextlib
+import ast
 import importlib
 import io
 import json
@@ -70,6 +71,7 @@ def make_stub(module, *, session_port=22, session_source="203.0.113.9", journal_
         system.set_read("/home/fenix/.ssh/authorized_keys", "ssh-ed25519 AAAATEST key fenix\n")
         system.set_stat("/home/fenix/.ssh/authorized_keys", 0o100600, 1000)
         system.set_stat("/home/fenix/.ssh", 0o40700, 1000)
+        system.set_stat("/home/fenix", 0o40750, 1000)
     else:
         system.can("id -u fenix", "", returncode=1, stderr="no such user")
 
@@ -108,9 +110,13 @@ def make_stub(module, *, session_port=22, session_source="203.0.113.9", journal_
     if allowlist_rules:
         system.touch_dir("/etc/nftables.d", ["ssh-allowlist.nft"])
     if backup:
-        system.touch_dir("/var/backups/ssh-hardening", ["20261027-1600"])
-        system.touch_dir("/var/backups/ssh-hardening/20261027-1600", ["sshd_config", "nft-ruleset.nft"])
-        system.touch_file("/var/backups/ssh-hardening/20261027-1600/sshd_config")
+        system.touch_dir("/var/backups/ssh-hardening", ["20261027-160000"])
+        system.touch_dir("/var/backups/ssh-hardening/20261027-160000", ["sshd_config", "nft-ruleset.nft"])
+        for name in ("sshd_config", "units.txt", "backup-complete", "nft-ruleset.nft", "ufw-status.txt",
+                     "sshd_config.d.absent", "ssh.socket.d.absent", "nftables.conf.absent",
+                     "nftables.d.absent", "ufw.absent", "ssh.socket.active", "nftables.enabled",
+                     "nft-ruleset.json", "sshguard.nft.absent"):
+            system.touch_file("/var/backups/ssh-hardening/20261027-160000/" + name)
     if hardening_mtime is not None:
         for path in ("/etc/ssh/sshd_config.d/10-newport.conf", "/etc/nftables.d/ssh-allowlist.nft"):
             system.mtimes[path] = hardening_mtime
@@ -171,8 +177,12 @@ class TestScriptIntegrity(unittest.TestCase):
             source = module.SOURCE
             self.assertNotIn("shell=True", source)
             self.assertNotIn("os.system", source)
-            self.assertNotIn("systemctl\", \"restart", source)
-            self.assertNotIn("systemctl\", \"reload", source)
+            # 恢复指令是字符串数据；只检查指导程序自身的可执行调用。
+            for node in ast.walk(ast.parse(source)):
+                if isinstance(node, ast.Call) and len(node.args) >= 2:
+                    values = [arg.value if isinstance(arg, ast.Constant) else None for arg in node.args[:2]]
+                    if values[0] == "systemctl":
+                        self.assertNotIn(values[1], MUTATING_VERBS)
 
     def test_all_executed_calls_stay_read_only(self):
         system = make_stub(STAGE0, account=True)
@@ -276,8 +286,8 @@ class TestStage1Steps(unittest.TestCase):
         self.assertEqual(ctx["old_port"], 22)
         for step in steps.values():
             self.assertEqual(step["status"], "todo")
-        self.assertEqual(steps["3-new-port"]["blocked_by"], ["1-backup"])
-        self.assertEqual(steps["5-close-old"]["blocked_by"], ["0-rescue", "4-verify-new"])
+        self.assertEqual(steps["3-new-port"]["blocked_by"], ["1-backup", "2-account"])
+        self.assertEqual(steps["5-close-old"]["blocked_by"], ["0-rescue", "4-verify-new", "1-backup", "2-account"])
 
     def test_existing_account_counts_as_done(self):
         _, _, _, steps = self.steps()
@@ -587,7 +597,7 @@ class TestStage0Assessment(unittest.TestCase):
                                           session_port=62207, listeners=[62207], disk_ports=(62207,), backup=True,
                                           auth=HARDENED_AUTH, allowlist_rules=ALLOW_RULES, hardening_mtime=1000000001)
         self.assertIn("待跨重启验证", output)
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 2)
 
     def test_verified_after_reboot(self):
         code, output, _ = self.run_stage0(["--port", "62207", "--user", "fenix", "--allow", "203.0.113.0/24"],
@@ -602,7 +612,8 @@ class TestStage0Assessment(unittest.TestCase):
                  ("drop", 62207, None, None)]
         code, output, _ = self.run_stage0(["--port", "62207", "--user", "fenix", "--tailnet"],
                                           session_port=62207, listeners=[62207], disk_ports=(62207,), backup=True,
-                                          auth=HARDENED_AUTH, allowlist_rules=rules, tailnet=True)
+                                          auth=HARDENED_AUTH, allowlist_rules=rules, tailnet=True,
+                                          hardening_mtime=999999999)
         self.assertIn("tailscale0 放行", output)
         self.assertIn("tailscale0：up", output)
         self.assertEqual(code, 0)

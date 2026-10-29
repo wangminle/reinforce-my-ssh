@@ -1,0 +1,127 @@
+import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path("/")
+backup = Path(sys.argv[1])
+
+def target(path):
+    return ROOT / path.lstrip("/")
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, text=True, **kwargs)
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+def remove_file(path):
+    # 只删除精确列出的文件；目录异常直接失败，绝不递归删除配置树。
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        raise SystemExit("预期文件却发现目录，停止恢复：" + str(path))
+
+def copy_file(source, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    remove_file(destination)
+    run("cp", "-a", "--", str(source), str(destination))
+
+domains = [
+    ("sshd_config.d", "/etc/ssh/sshd_config.d", ["10-newport.conf", "20-hardening.conf"]),
+    ("ssh.socket.d", "/etc/systemd/system/ssh.socket.d", ["10-newport.conf"]),
+    ("nftables.d", "/etc/nftables.d", ["ssh-allowlist.nft"]),
+    ("ufw", "/etc/ufw", []),
+]
+for name in ("backup-complete", "sshd_config", "units.txt", "ssh.socket.active", "nftables.enabled"):
+    require((backup / name).is_file(), "备份不完整，停止恢复：" + name)
+require((backup / "backup-complete").read_text().strip() == "complete", "备份未成功完成")
+for name, _, _ in domains:
+    require((backup / name).is_dir() or (backup / (name + ".absent")).is_file(), "备份缺少目录状态：" + name)
+require((backup / "nftables.conf").exists() or (backup / "nftables.conf.absent").is_file(), "备份缺少 nftables.conf 状态")
+socket_state = (backup / "ssh.socket.active").read_text().strip()
+nft_enabled = (backup / "nftables.enabled").read_text().strip()
+require(socket_state in ("active", "inactive", "failed", "not-found"), "备份中 ssh.socket 状态不明确")
+require(nft_enabled in ("enabled", "enabled-runtime", "disabled", "masked", "static", "not-found"), "备份中 nftables 启用状态不明确")
+snapshot = None
+if (backup / "nft-ruleset.nft").is_file():
+    require(shutil.which("nft"), "缺少 nft，不能恢复防火墙")
+    snapshot = json.loads((backup / "nft-ruleset.json").read_text())
+    require(isinstance(snapshot.get("nftables"), list), "nft JSON 快照无效")
+    require((backup / "sshguard.nft").is_file() or (backup / "sshguard.nft.absent").is_file(), "缺少 sshguard 原始状态")
+    had_table = any(x.get("table", {}).get("family") == "inet" and x.get("table", {}).get("name") == "sshguard"
+                    for x in snapshot["nftables"])
+    require(had_table == (backup / "sshguard.nft").is_file(), "sshguard 快照与规则清单矛盾")
+else:
+    require((backup / "nft-ruleset.nft.unavailable").is_file(), "缺少 nft 备份状态")
+    require(not shutil.which("nft"), "备份时 nft 不可用，现在已安装；先人工核对防火墙，不能猜测原始规则")
+ufw_active = False
+if (backup / "ufw-status.txt").is_file():
+    ufw_active = "Status: active" in (backup / "ufw-status.txt").read_text()
+    require(not ufw_active or shutil.which("ufw"), "原 UFW 处于 active，当前缺少 ufw")
+else:
+    require((backup / "ufw-status.txt.unavailable").is_file(), "缺少 UFW 备份状态")
+
+# 先校验恢复表的语法，错误快照不得触发文件删除。
+if snapshot is not None and (backup / "sshguard.nft").is_file():
+    # 该表可能已存在，完整替换事务在执行前统一检查。
+    require((backup / "sshguard.nft").stat().st_size > 0, "sshguard 快照为空")
+
+def firewall_transaction():
+    current = json.loads(run("nft", "-j", "list", "ruleset", capture_output=True).stdout)
+    entries = current.get("nftables", [])
+    commands = []
+    if any(x.get("table", {}).get("family") == "inet" and x.get("table", {}).get("name") == "sshguard" for x in entries):
+        commands.append("delete table inet sshguard")
+    if (backup / "sshguard.nft").is_file():
+        commands.append((backup / "sshguard.nft").read_text())
+    def identity(rule):
+        return tuple(rule.get(k) for k in ("family", "table", "chain", "handle"))
+    original = {identity(x["rule"]) for x in snapshot["nftables"] if "rule" in x}
+    for item in entries:
+        rule = item.get("rule", {})
+        if (rule.get("comment") != "stage1 new-port bridge" or identity(rule) in original
+                or (rule.get("family") == "inet" and rule.get("table") == "sshguard")):
+            continue
+        require(rule.get("family") in ("ip", "ip6", "inet") and isinstance(rule.get("handle"), int), "过渡规则身份不明确")
+        require(all(isinstance(rule.get(key), str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", rule[key])
+                    for key in ("table", "chain")), "规则表/链名称需人工核对，停止恢复")
+        commands.append("delete rule " + rule["family"] + " " + rule["table"]
+                        + " " + rule["chain"] + " handle " + str(rule["handle"]))
+    return "\n".join(commands) + "\n"
+
+if snapshot is not None:
+    run("nft", "-c", "-f", "-", input=firewall_transaction())
+
+copy_file(backup / "sshd_config", target("/etc/ssh/sshd_config"))
+for name, destination, introduced in domains:
+    saved = backup / name
+    destination = target(destination)
+    for filename in introduced:
+        remove_file(destination / filename)
+    if saved.is_dir():
+        destination.mkdir(parents=True, exist_ok=True)
+        run("cp", "-a", "--", str(saved) + "/.", str(destination) + "/")
+if (backup / "nftables.conf").exists():
+    copy_file(backup / "nftables.conf", target("/etc/nftables.conf"))
+else:
+    remove_file(target("/etc/nftables.conf"))
+if ufw_active:
+    run("ufw", "reload")
+if snapshot is not None:
+    transaction = firewall_transaction()
+    run("nft", "-c", "-f", "-", input=transaction)
+    run("nft", "-f", "-", input=transaction)
+# 不 stop nftables：其 ExecStop 可能 flush 全机规则。仅撤销本流程增加的开机启用。
+if nft_enabled == "disabled":
+    run("systemctl", "disable", "nftables.service")
+run("sshd", "-t")
+run("systemctl", "daemon-reload")
+if socket_state == "active":
+    run("systemctl", "restart", "ssh.socket")
+# socket 监听和 sshd 认证配置是两层状态；仅重启 socket 不会让存活的 sshd 重载认证配置。
+run("systemctl", "reload-or-restart", "ssh.service")
+print("备份中的配置与 SSH 防火墙域已恢复；保持救援会话，验证旧入口、新公钥会话及完整规则，再考虑重启。")

@@ -46,7 +46,7 @@
 | 有效认证策略 | `sshd -T -C user=...,addr=...` 上下文（Match 块单独警告，不自动解释） |
 | 防火墙 | `nft -j list ruleset` 的指导级摘要（dport/saddr 字面量）+ `ufw status verbose` |
 | 账户与公钥 | `id`/`getent` + authorized_keys 数量与权限 |
-| 备份 | 约定目录 `/var/backups/ssh-hardening/<ts>/` 且含 sshd_config |
+| 备份 | 约定目录（可用 `--backup-dir` 指定），必须有配置副本、服务/防火墙快照（工具缺失需显式记录）、可选目录的副本或缺省记录，以及成功后才写入的 `backup-complete` |
 | 旧版残留 | `/var/lib/reinforce-my-ssh`、旧受管文件、`reinforce-my-ssh-*.timer` |
 | 重启证据 | `/proc/stat` btime 与全部加固文件的 mtime 比较 |
 
@@ -96,7 +96,7 @@
 }
 ```
 
-退出码：`0` 本阶段目标全部达成；`1` 阻断性异常（旧版待确认事务/恢复定时器残留、sshd 配置损坏、白名单锁死风险）；`2` 步骤未完成或需要 sudo；`130` 中断。
+退出码：`0` 已声明目标全部达成（stage0 未声明目标时表示采集完成）；`1` 阻断性异常（旧版待确认事务/恢复定时器残留、sshd 配置损坏、白名单锁死风险）；`2` 步骤未完成或需要 sudo；`130` 中断。
 
 ## 7. 智能体执行契约
 
@@ -116,5 +116,13 @@
 
 ## 9. 验证范围与验收边界
 
-- 桩件回归：`python3 tests/run-tests.py`，68 项全部通过（解析、判定、门槛、退出码、只读契约、Tailscale 拓扑、socket 激活与防火墙规则顺序）。
+- 回归（桩件、隔离 shell 与 nft 语法）：`python3 tests/run-tests.py`，105 项（解析、判定、门槛、退出码、只读契约、Tailscale 拓扑、socket 激活与防火墙规则顺序）。隔离 shell/nft 需在 Linux/WSL 运行。
 - 未闭环（不得省略）：在可销毁整机上完成真实迁移与故障注入——外部连接成功/失败、白名单外来源拒绝、救援通道真实可用、跨重启复验；京东云节点的远端根因与旧事务处置（[[BUG-016]]、[[CHK-013]]）。桩件测试不替代整机验收。
+
+## 剩余路径复核修复（2026-10-30）
+
+- stage0 端口解析支持裸数字及 IPv4/IPv6 端点；socket drop-in 全部经 System 读取，桩件能覆盖 stage1 实际生成内容。公钥读失败和确认空文件分开判定。
+- stage1 所有续跑与阶段衔接共用参数拼接；旧端口未知时省略该声明并保持阻断，显式 none 也不能绕过其它监听或新会话验证。stage1 的可选重复 --allow 仅用于明确声明并传给 stage2，不推导信任范围。
+- 手工备份新增 nftables.d、ufw、nft JSON、原 sshguard 表/缺省记录、socket 活跃及 nftables 启用状态。旧快照缺少这些事实时应重做，不手工伪造完成标记。
+- 撤销与救援生成同一份自包含 Python 程序，仅供操作员从救援通道手工执行。先验证备份和 nft 替换事务，再还原文件；指定工具文件原来不存在则移除，原来存在则恢复。仅替换 inet sshguard 和删除本流程新增的带标记过渡规则，不 flush ruleset；原 UFW active 时重载备份配置，不 stop nftables.service。最后校验 sshd、重载 systemd 并恢复监听/认证配置，须另做外部连接验证。
+- tests/recovery-program.txt 是恢复程序的测试参考，部署脚本已内嵌完整副本，不依赖该文件。测试验证两处内嵌内容一致，并在临时文件系统及独立用户/网络命名空间中实际执行文件恢复和 nft 事务；sshd/systemctl/ufw 为假命令，不冒充真实整机恢复。
