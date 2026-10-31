@@ -80,6 +80,29 @@ class EvidenceError(Exception):
     pass
 
 
+def validate_read_only_command(args):
+    if not args or args[0] not in READ_ONLY_COMMANDS:
+        raise EvidenceError("拒绝非只读命令")
+    tool, tail = args[0], tuple(args[1:])
+    allowed = READ_ONLY_COMMANDS[tool]
+    if allowed is not None and (not tail or tail[0] not in allowed):
+        raise EvidenceError("拒绝非只读子命令")
+    exact = {
+        "ss": {("-tlnpH",)},
+        "nft": {("-j", "list", "ruleset"), ("list", "tables"), ("list", "ruleset")},
+        "ufw": {("status", "verbose")},
+        "journalctl": {("-b", "-u", "ssh", "-u", "sshd", "-u", "ssh@*", "-o", "cat", "--no-pager")},
+    }
+    if tool in exact and tail not in exact[tool]:
+        raise EvidenceError("拒绝未经声明的只读命令参数：" + tool)
+    if tool == "sshd":
+        rest = list(tail[1:])
+        while rest:
+            if len(rest) < 2 or rest[0] not in ("-f", "-C"):
+                raise EvidenceError("拒绝 sshd 参数")
+            del rest[:2]
+
+
 class System:
     """只执行白名单内的只读命令；一切失败都以证据异常上报，不猜测。"""
 
@@ -94,11 +117,7 @@ class System:
         return result.stdout
 
     def run_allow_fail(self, *args):
-        if args[0] not in READ_ONLY_COMMANDS:
-            raise EvidenceError("拒绝执行非只读白名单命令：" + args[0])
-        allowed_sub = READ_ONLY_COMMANDS[args[0]]
-        if allowed_sub is not None and (len(args) < 2 or args[1] not in allowed_sub):
-            raise EvidenceError("拒绝执行非只读子命令：" + " ".join(args[:2]))
+        validate_read_only_command(args)
         self.calls.append(list(args))
         try:
             return subprocess.run(list(args), capture_output=True, text=True, timeout=60)
@@ -316,6 +335,13 @@ def backup_facts(system, backup_root):
         if not (system.exists(latest + "/sshguard.nft") or system.exists(latest + "/sshguard.nft.absent")):
             missing.append("sshguard.nft")
     facts["has_sshd_config"] = system.exists(latest + "/sshd_config")
+    for item in ("ssh-allowlist.service", "ssh-allowlist.service.d"):
+        if not (system.exists(latest + "/" + item) or system.is_dir(latest + "/" + item)
+                or system.exists(latest + "/" + item + ".absent")):
+            missing.append(item)
+    for item in ("ssh-allowlist.active", "ssh-allowlist.enabled"):
+        if not system.exists(latest + "/" + item):
+            missing.append(item)
     facts["missing"] = missing
     facts["complete"] = not missing
     return facts
@@ -434,7 +460,7 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
                     continue
                 if not any(net.version == declared.version and net.subnet_of(declared) for declared in networks):
                     offenders.append(rule["location"] + "：来源 " + literal + " 超出声明白名单")
-                elif reachable and not rule.get("iifs"):
+                elif reachable and not rule.get("iif_negated"):
                     accepted.append(net)
         if rule["verdict"] in ("drop", "reject"):
             restricting_drop |= not rule["saddrs"] and (not rule.get("iifs") or rule.get("iif_negated", False))
@@ -444,10 +470,12 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
     if ufw.get("active"):
         ufw_stopped = set()
         for line in ufw.get("text", "").splitlines():
-            m = re.match(r"^%s(/tcp)?(?:\s+\(v6\))?(?:\s+on\s+(\S+))?\s+(ALLOW|DENY|REJECT)\s*(\S*)" % re.escape(port_s), line.strip())
+            m = re.match(r"^%s(/tcp)?(?:\s+\(v6\))?(?:\s+on\s+(\S+))?\s+(ALLOW|DENY|REJECT)(?:\s+(IN|OUT|FWD))?\s+(\S+)" % re.escape(port_s), line.strip())
             if not m:
                 continue
-            iface, verdict, literal = m.group(2), m.group(3), m.group(4)
+            iface, verdict, direction, literal = m.group(2), m.group(3), m.group(4), m.group(5)
+            if direction in ("OUT", "FWD"):
+                continue
             version = 6 if "(v6)" in line or ":" in literal else 4
             if verdict == "ALLOW":
                 saw_accept = True
@@ -461,7 +489,7 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
                         net = ipaddress.ip_network(literal.split()[0])
                         if not any(net.version == d.version and net.subnet_of(d) for d in networks):
                             offenders.append("ufw：来源 " + literal + " 超出声明白名单")
-                        elif version not in ufw_stopped and not iface:
+                        elif version not in ufw_stopped:
                             accepted.append(net)
                     except ValueError:
                         offenders.append("ufw：无法解析来源 " + literal)
@@ -525,28 +553,31 @@ def legacy_blocking(system):
 
 
 def reboot_facts(system):
-    facts = {}
+    facts = {"evidence_scope": "仅比较磁盘文件；不能检测启动后的纯运行态变更，须实际冷启动及外部验收"}
     try:
         facts["btime"] = int(re.search(r"^btime (\d+)$", system.read("/proc/stat"), re.M)[1])
         facts["boot_time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(facts["btime"]))
-    except (EvidenceError, AttributeError, TypeError, ValueError):
-        return facts
-    hardened = []
-    for path in sshd_config_files(system):
-        if path != SSHD_CONFIG:
-            hardened.append(path)
-    for directory in (SOCKET_DROPIN_DIR, "/etc/nftables.d"):
-        try:
-            hardened += [directory + "/" + name for name in system.list_dir(directory)]
-        except EvidenceError:
-            continue
-    mtimes = [(system.mtime(path), path) for path in hardened]
-    mtimes = [(m, p) for m, p in mtimes if m is not None]
-    if mtimes:
+        hardened = set(sshd_config_files(system))
+        for path in ("/etc/nftables.conf", "/etc/systemd/system/ssh-allowlist.service"):
+            if system.exists(path):
+                hardened.add(path)
+        for directory in (SSHD_CONFIG_D, SOCKET_DROPIN_DIR, "/etc/nftables.d",
+                          "/etc/systemd/system/ssh-allowlist.service.d"):
+            if system.is_dir(directory):
+                for name in system.list_dir(directory):
+                    path = directory + "/" + name
+                    if not system.is_dir(path):
+                        hardened.add(path)
+        mtimes = [(system.mtime(path), path) for path in sorted(hardened)]
+        if not mtimes or any(m is None for m, _ in mtimes):
+            facts["detail"] = "加固文件时间采集不完整，不能证实文件早于启动"
+            return facts
         latest = max(mtimes)
         facts["hardened_latest_mtime"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(latest[0]))
         facts["hardened_latest_file"] = latest[1]
         facts["booted_after_hardening"] = facts["btime"] > latest[0]
+    except (EvidenceError, AttributeError, TypeError, ValueError):
+        facts.pop("booted_after_hardening", None)
     return facts
 
 
@@ -587,7 +618,8 @@ def is_tailnet_network(value):
         network = ipaddress.ip_network(value, strict=False)
     except ValueError:
         return False
-    return network.subnet_of(CGNAT) or network.subnet_of(TAILSCALE_V6)
+    return any(network.version == declared.version and network.subnet_of(declared)
+               for declared in (CGNAT, TAILSCALE_V6))
 
 
 def sshd_bindings(system):
@@ -668,7 +700,7 @@ def nft_public_verdict(nft_summary, port):
                 if not rule["saddrs"]:
                     verdict = True
                     break
-                if any(not is_tailnet_network(item) for item in rule["saddrs"]):
+                if rule["saddrs"]:  # 来源地址不能证明入站接口，CGNAT 也可能来自云内网
                     verdict = True
                     break
             elif rule["verdict"] in ("drop", "reject"):
@@ -684,25 +716,25 @@ def nft_public_verdict(nft_summary, port):
 
 
 def ufw_public_verdict(ufw, port):
-    """按 UFW 规则顺序判断非 tailnet 来源能否进入该端口。"""
-    any_source = ("Anywhere", "::/0", "0.0.0.0/0", "Anywhere (v6)")
+    """每个地址族按首条匹配判定，IPv4 拒绝不能掩盖 IPv6 放行。"""
+    decisions = {}
     for line in ufw.get("text", "").splitlines():
-        match = re.match(r"^%s(/tcp)?(?:\s+on\s+(\S+))?\s+(ALLOW|DENY|REJECT)\s*(\S*)" % re.escape(str(port)), line.strip())
+        match = re.match(r"^%s(/tcp)?(?:\s+\(v6\))?(?:\s+on\s+(\S+))?\s+(ALLOW|DENY|REJECT)(?:\s+(IN|OUT|FWD))?\s+(\S+)" % re.escape(str(port)), line.strip())
         if not match:
             continue
-        iface, verdict, source = match.group(2), match.group(3), match.group(4)
-        if iface and iface != "tailscale0":
+        iface, verdict, direction, source = match.group(2), match.group(3), match.group(4), match.group(5)
+        if direction in ("OUT", "FWD") or iface == "tailscale0":
             continue
-        if iface == "tailscale0":
+        family = 6 if "(v6)" in line or ":" in source else 4
+        if family in decisions:
             continue
-        if verdict == "ALLOW":
-            if source in any_source:
-                return True
-            if not is_tailnet_network(source.split()[0]):
-                return True
-        elif source in any_source:
-            return False
-    return None
+        if verdict == "ALLOW":  # 非 tailscale0 接口放行属于外部入口，不能按地址段跳过
+            decisions[family] = True
+        elif verdict in ("DENY", "REJECT") and source in ("Anywhere", "0.0.0.0/0", "::/0") and not iface:
+            decisions[family] = False
+    if True in decisions.values():
+        return True
+    return False if decisions and all(v is False for v in decisions.values()) else None
 
 
 def public_entry_verdict(nft_summary, ufw, port):
@@ -730,8 +762,12 @@ def parse_args(argv):
     parser.add_argument("--host", help="客户端连接地址或 SSH 别名，仅用于生成提示命令")
     parser.add_argument("--rescue-confirmed", action="store_true", help="已实际演练 VNC/串口救援登录（硬门槛）")
     parser.add_argument("--backup-dir", default=BACKUP_ROOT, help="备份约定目录（默认 " + BACKUP_ROOT + "）")
+    parser.add_argument("--tailnet-session-confirmed", action="store_true", help="已核实当前 SSH 会话确经 tailscale0 到 sshd；地址段不能代替入口证据")
+    parser.add_argument("--reboot-confirmed", action="store_true", help="本次冷启动后已验证全部允许来源和拒绝来源的新连接；任何运行态变更后须重新验收")
     parser.add_argument("--format", choices=("text", "json"), default="text")
     options = parser.parse_args(argv)
+    if options.tailnet_session_confirmed and not options.tailnet:
+        parser.error("--tailnet-session-confirmed 必须与 --tailnet 同用，且只声明本次实际入口")
     if not 1 <= options.port <= 65535:
         parser.error("--port 超出范围")
     if not re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", options.user) or options.user == "root":
@@ -773,6 +809,80 @@ def transition_cleanup(nft_summary, port):
     return commands
 
 
+def ssh_service_program():
+    # 仅生成手工命令文本，不在只读指导进程中执行。
+    return r'''import json
+import shlex
+import subprocess
+
+SSH_SERVICE = "ssh.service"
+SSH_SOCKET = "ssh.socket"
+
+def ssh_properties(unit, names):
+    result = subprocess.run(["systemctl", "show", unit, "--all"] +
+                            [arg for name in names for arg in ("-p", name)],
+                            check=True, text=True, capture_output=True)
+    values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    if not all(name in values for name in names):
+        raise SystemExit("服务状态采集不完整；保留现有会话，从控制台核对，未停止 SSH。")
+    return values
+
+def ssh_preflight(socket_active):
+    service = ssh_properties(SSH_SERVICE, ("KillMode", "SendSIGHUP"))
+    # systemctl show 即使 --all 也可能省略空的 ExecStop 数组；通过 D-Bus 获取明确的空数组。
+    unit_path = "/org/freedesktop/systemd1/unit/" + "".join(
+        c if c.isascii() and c.isalnum() else "_%02x" % ord(c) for c in SSH_SERVICE)
+    hooks = []
+    for name in ("ExecStop", "ExecStopPost"):
+        result = subprocess.run(["busctl", "--json=short", "get-property", "org.freedesktop.systemd1",
+                                 unit_path, "org.freedesktop.systemd1.Service", name],
+                                check=True, text=True, capture_output=True)
+        value = json.loads(result.stdout)
+        if value.get("type") != "a(sasbttttuii)" or not isinstance(value.get("data"), list):
+            raise SystemExit("停止钩子的 D-Bus 证据无效，未停止 SSH。")
+        hooks.extend(value["data"])
+    if (service["KillMode"] != "process" or service["SendSIGHUP"] != "no"
+            or hooks):
+        raise SystemExit("无法证明现有会话可保留：要求 KillMode=process、SendSIGHUP=no 且无 ExecStop/ExecStopPost；"
+                         "未停止 SSH，不自动修改保护参数。请保持救援控制台并人工核对。")
+    socket = ssh_properties(SSH_SOCKET, ("LoadState", "ActiveState"))
+    if socket["LoadState"] not in ("loaded", "not-found") or socket["ActiveState"] not in ("active", "inactive", "failed"):
+        raise SystemExit("socket 状态不明确，未停止 SSH；请从救援控制台核对。")
+    if socket_active and socket["LoadState"] != "loaded":
+        raise SystemExit("要求 socket 激活但单元不存在，未停止 SSH。")
+    return socket["ActiveState"]
+
+def switch_ssh(socket_active):
+    start = ["systemctl", "start"] + ([SSH_SOCKET] if socket_active else []) + [SSH_SERVICE]
+    try:
+        subprocess.run(["sshd", "-t"], check=True)
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
+        current = ssh_preflight(socket_active)
+        coordinated = socket_active or current in ("active", "failed")
+        if coordinated:
+            # 同一 stop 事务禁止 socket 激活并停主进程；保护条件保留已建立会话的子进程。
+            subprocess.run(["systemctl", "stop", SSH_SOCKET, SSH_SERVICE], check=True)
+            subprocess.run(start, check=True)
+        else:
+            subprocess.run(["systemctl", "reload-or-restart", SSH_SERVICE], check=True)
+        subprocess.run(["systemctl", "is-active", "--quiet", SSH_SERVICE], check=True)
+        if socket_active:
+            subprocess.run(["systemctl", "is-active", "--quiet", SSH_SOCKET], check=True)
+    except (subprocess.CalledProcessError, OSError, ValueError, SystemExit) as error:
+        # 失败即停止：这里只生成文本，不再执行查询、start、stop 或回滚命令。
+        status = ["sudo", "systemctl", "status", SSH_SERVICE, SSH_SOCKET, "--no-pager"]
+        journal = ["sudo", "journalctl", "-u", SSH_SERVICE, "-u", SSH_SOCKET, "-n", "50", "--no-pager"]
+        raise SystemExit("SSH 切换未完成，已停止执行：%s\n"
+                         "保持现有会话和救援控制台；故障后的服务状态尚未核实。\n"
+                         "以下仅供手工执行，本程序没有执行这些建议：\n"
+                         "1. 核对当前状态与日志：\n%s\n%s\n"
+                         "2. 检查并修正配置：\nsudo sshd -t\n"
+                         "3. 确认故障原因已处理、保护条件仍满足后，由操作员决定是否启动：\n%s\n"
+                         "随后验证监听和新的公钥会话，未验证前不要继续下一步或重启主机。"
+                         % (error, shlex.join(status), shlex.join(journal), shlex.join(["sudo"] + start)))
+'''
+
+
 def recovery_commands(backup_dir):
     # 只生成供操作员执行的恢复程序；指导脚本本身不会执行它。
     program = r'''import json
@@ -812,6 +922,7 @@ domains = [
     ("ssh.socket.d", "/etc/systemd/system/ssh.socket.d", ["10-newport.conf"]),
     ("nftables.d", "/etc/nftables.d", ["ssh-allowlist.nft"]),
     ("ufw", "/etc/ufw", []),
+    ("ssh-allowlist.service.d", "/etc/systemd/system/ssh-allowlist.service.d", []),
 ]
 for name in ("backup-complete", "sshd_config", "units.txt", "ssh.socket.active", "nftables.enabled"):
     require((backup / name).is_file(), "备份不完整，停止恢复：" + name)
@@ -819,6 +930,12 @@ require((backup / "backup-complete").read_text().strip() == "complete", "备份�
 for name, _, _ in domains:
     require((backup / name).is_dir() or (backup / (name + ".absent")).is_file(), "备份缺少目录状态：" + name)
 require((backup / "nftables.conf").exists() or (backup / "nftables.conf.absent").is_file(), "备份缺少 nftables.conf 状态")
+require((backup / "ssh-allowlist.service").is_file() or (backup / "ssh-allowlist.service.absent").is_file(), "缺少实际加载器备份")
+loader_active = (backup / "ssh-allowlist.active").read_text().strip()
+loader_enabled = (backup / "ssh-allowlist.enabled").read_text().strip()
+require(loader_active in ("active", "inactive", "failed", "not-found"), "加载器活跃状态不明确")
+require(loader_enabled in ("enabled", "enabled-runtime", "disabled", "masked", "static", "not-found"), "加载器启用状态不明确")
+require(loader_enabled != "masked", "原加载器 masked，须人工核对掩码链接，停止自动还原")
 socket_state = (backup / "ssh.socket.active").read_text().strip()
 nft_enabled = (backup / "nftables.enabled").read_text().strip()
 require(socket_state in ("active", "inactive", "failed", "not-found"), "备份中 ssh.socket 状态不明确")
@@ -842,6 +959,11 @@ if (backup / "ufw-status.txt").is_file():
 else:
     require((backup / "ufw-status.txt.unavailable").is_file(), "缺少 UFW 备份状态")
 
+loader_dropins = target("/etc/systemd/system/ssh-allowlist.service.d")
+saved_dropins = backup / "ssh-allowlist.service.d"
+if loader_dropins.is_dir():
+    saved_names = {p.name for p in saved_dropins.iterdir()} if saved_dropins.is_dir() else set()
+    require(all(p.name in saved_names for p in loader_dropins.iterdir()), "实际加载器存在未备份的 drop-in，先人工协调，停止恢复")
 # 先校验恢复表的语法，错误快照不得触发文件删除。
 if snapshot is not None and (backup / "sshguard.nft").is_file():
     # 该表可能已存在，完整替换事务在执行前统一检查。
@@ -873,6 +995,8 @@ def firewall_transaction():
 if snapshot is not None:
     run("nft", "-c", "-f", "-", input=firewall_transaction())
 
+# 写入恢复文件前预检，daemon-reload 后再次检查保护条件。
+ssh_preflight(socket_state == "active")
 copy_file(backup / "sshd_config", target("/etc/ssh/sshd_config"))
 for name, destination, introduced in domains:
     saved = backup / name
@@ -886,6 +1010,24 @@ if (backup / "nftables.conf").exists():
     copy_file(backup / "nftables.conf", target("/etc/nftables.conf"))
 else:
     remove_file(target("/etc/nftables.conf"))
+loader_path = target("/etc/systemd/system/ssh-allowlist.service")
+if (backup / "ssh-allowlist.service").is_file():
+    copy_file(backup / "ssh-allowlist.service", loader_path)
+else:
+    remove_file(loader_path)
+# 先恢复磁盘与内核快照；加载器 active 状态仅在原配置可检查且不执行未知变更时恢复。
+run("systemctl", "daemon-reload")
+if loader_enabled in ("enabled", "enabled-runtime"):
+    args = ["systemctl", "enable"]
+    if loader_enabled == "enabled-runtime":
+        args.append("--runtime")
+    run(*args, "ssh-allowlist.service")
+elif loader_enabled == "disabled":
+    run("systemctl", "disable", "ssh-allowlist.service")
+elif loader_enabled == "not-found":
+    # 本工具仅生成 multi-user.target 链接；不能在删除 unit 后 disable 一个不存在的服务。
+    for directory in ("/etc/systemd/system", "/run/systemd/system"):
+        remove_file(target(directory + "/multi-user.target.wants/ssh-allowlist.service"))
 if ufw_active:
     run("ufw", "reload")
 if snapshot is not None:
@@ -895,14 +1037,14 @@ if snapshot is not None:
 # 不 stop nftables：其 ExecStop 可能 flush 全机规则。仅撤销本流程增加的开机启用。
 if nft_enabled == "disabled":
     run("systemctl", "disable", "nftables.service")
-run("sshd", "-t")
-run("systemctl", "daemon-reload")
-if socket_state == "active":
-    run("systemctl", "restart", "ssh.socket")
-# socket 监听和 sshd 认证配置是两层状态；仅重启 socket 不会让存活的 sshd 重载认证配置。
-run("systemctl", "reload-or-restart", "ssh.service")
+if loader_active == "active":
+    print("原专用加载器为 active：内核快照已还原；请核对原 unit/drop-in 后，另行手工恢复其 active 状态，避免未知 ExecStart 改写快照。")
+switch_ssh(socket_state == "active")
+if loader_active == "active":
+    raise SystemExit("SSH 配置及内核快照已恢复，但原加载器 active 状态待操作员核实后另行恢复；本次不宣称完整恢复。")
 print("备份中的配置与 SSH 防火墙域已恢复；保持救援会话，验证旧入口、新公钥会话及完整规则，再考虑重启。")
 '''
+    program = ssh_service_program() + "\n" + program
     return ["# 完整恢复到 stage1 备份，会同时撤销后续 SSH/防火墙更改；从已验证的救援通道执行，失败停止。",
             "sudo python3 - " + shlex.quote(backup_dir) + " <<'SSH_RECOVERY_PY'\n" + program + "SSH_RECOVERY_PY",
             "sudo ss -ltnp  # 核对旧入口恢复，再从客户端建立新的公钥 SSH 会话",
@@ -960,7 +1102,7 @@ def build_steps(system, options, ctx):
     source_in_allow = None
     tailnet_source = bool(source and is_tailnet_address(source))
     if source:
-        if options.tailnet and tailnet_source:
+        if options.tailnet and options.tailnet_session_confirmed and tailnet_source:
             source_in_allow = True
         else:
             source_in_allow = any(ipaddress.ip_address(source) in ipaddress.ip_network(item) for item in options.allow)
@@ -988,6 +1130,8 @@ def build_steps(system, options, ctx):
             allow_do = ["# 本机无 active UFW：用独立 nft 链（只影响本端口的“新连接”，不改全局策略）：",
                         "sudo install -d -m 755 /etc/nftables.d",
                         "sudo tee " + ALLOWLIST_FILE + " >/dev/null <<'EOF'",
+                        "table inet sshguard",
+                        "delete table inet sshguard",
                         "table inet sshguard {",
                         "  chain ssh_allow {",
                         "    type filter hook input priority filter - 10; policy accept;",
@@ -1002,10 +1146,27 @@ def build_steps(system, options, ctx):
                          "  }",
                          "}",
                          "EOF",
-                         "sudo nft -f " + ALLOWLIST_FILE + "   # 先试装（原子：失败不落规则），随后持久化：",
-                         "grep -qs 'include \"/etc/nftables.d/\\*.nft\"' " + NFTABLES_CONF + " || echo 'include \"/etc/nftables.d/*.nft\"' | sudo tee -a " + NFTABLES_CONF,
-                         "sudo systemctl enable --now nftables.service  # 重启后仍生效（若本机已有其它防火墙加载器，请先核对开机图）"]
+                         "sudo nft -c -f " + ALLOWLIST_FILE + "  # 仅校验：失败时停止，旧表不变",
+                         "sudo nft -f " + ALLOWLIST_FILE + "  # 单次事务替换，只影响 inet sshguard",
+                         "# 先核对现有启动加载器：禁止全局 flush、禁止两个加载器重复装载同一文件。",
+                         "# 若 /etc/nftables.conf 已包含本文件，先人工协调移除该专用 include；不要修改无关表。",
+                         "# 已启用的全局加载器若会 flush ruleset，先人工协调其启动配置；不要直接启用/重启它。",
+                         "test -x /usr/sbin/nft  # 确认专用加载器中的实际 nft 路径；失败则先修正路径",
+                         "sudo tee /etc/systemd/system/ssh-allowlist.service >/dev/null <<'EOF'",
+                         "[Unit]", "Description=SSH source allowlist", "Before=ssh.service ssh.socket",
+                         "[Service]", "Type=oneshot", "RemainAfterExit=yes",
+                         "ExecStart=/usr/sbin/nft -f /etc/nftables.d/ssh-allowlist.nft",
+                         "ExecReload=/usr/sbin/nft -f /etc/nftables.d/ssh-allowlist.nft",
+                         "[Install]", "WantedBy=multi-user.target", "EOF",
+                         "# 无 ExecStop：停止服务不得清空过滤规则；Before 只提供顺序，不保证加载失败时 SSH 停止。",
+                         "sudo systemctl daemon-reload",
+                         "sudo python3 - <<'SSH_LOADER_PY'\n" + 'import json\nimport subprocess\nunit = "ssh-allowlist.service"\nresult = subprocess.run(["systemctl", "show", unit, "-p", "FragmentPath", "-p", "DropInPaths"], check=True, text=True, capture_output=True)\nprops = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)\nif props.get("FragmentPath") != "/etc/systemd/system/ssh-allowlist.service" or props.get("DropInPaths") != "":\n    raise SystemExit("实际加载器路径或 drop-in 不明确，停止，未启用/重启服务")\nfor name in ("ExecStop", "ExecStopPost"):\n    result = subprocess.run(["busctl", "--json=short", "get-property", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/ssh_2dallowlist_2eservice", "org.freedesktop.systemd1.Service", name], check=True, text=True, capture_output=True)\n    value = json.loads(result.stdout)\n    if value.get("type") != "a(sasbttttuii)" or value.get("data") != []:\n        raise SystemExit("无法证明停止钩子为空，停止，未启用/重启服务")\nsubprocess.run(["systemctl", "enable", unit], check=True)\nsubprocess.run(["systemctl", "restart", unit], check=True)\n' + "SSH_LOADER_PY"]
+
             allow_do += transition_cleanup(ctx["nft"], port)
+    if ctx.get("loader", {}).get("status") == FAIL and not ctx["ufw"].get("active"):
+        allow_status = BLOCKED
+        allow_note = ctx["loader"]["detail"]
+        allow_do = ["# 先从已验证的救援通道核对并协调原白名单加载器及 drop-in，重跑后才生成加载命令。"]
     step("1-allowlist", "nft 来源白名单（Tailscale 接口与声明的云内网/公网来源）",
          allow_status, allow_note,
          "白名单把“知道端口”变成“还得来自允许的来源”。这是 login 前的第一道闸门；写错顺序或写错来源会直接断掉你自己的连接，因此本步先做链条自检再执行。",
@@ -1135,6 +1296,8 @@ def build_steps(system, options, ctx):
         checks.append(("Tailscale 接入", PASS if ctx["tailnet"].get("up") else FAIL,
                        "tailscale0=%s" % (ctx["tailnet"].get("state") or "未发现")))
         checks.append(("白名单外入口已关闭" if options.allow else "公网入口已关闭", PASS if close_status == DONE else FAIL, close_note))
+    if not ctx["ufw"].get("active"):
+        checks.append(("专用白名单加载器", ctx["loader"]["status"], ctx["loader"]["detail"]))
     if ctx["match_blocks"]:
         checks.append(("Match 覆盖风险", UNKNOWN, "存在 Match 块，需人工复核：" + "; ".join(ctx["match_blocks"][:4])))
     confirm_ok = all(status == PASS for _, status, _ in checks)
@@ -1148,11 +1311,11 @@ def build_steps(system, options, ctx):
 
     # 4. 重启后复验
     reboot = ctx["reboot"]
-    reboot_ok = bool(reboot.get("booted_after_hardening")) and confirm_ok
+    reboot_ok = bool(reboot.get("booted_after_hardening")) and options.reboot_confirmed and confirm_ok
     if reboot_ok:
         reboot_evidence = "本次启动（%s）晚于全部加固文件修改，且确认清单全部通过" % reboot.get("boot_time")
     else:
-        reboot_evidence = "尚无“启动晚于全部加固文件修改”的证据；当前启动 %s" % reboot.get("boot_time", "未知")
+        reboot_evidence = "尚无完整文件早于启动或冷启动后外部验收声明（--reboot-confirmed）；当前启动 %s" % reboot.get("boot_time", "未知")
     step("4-reboot-verify", "重启后复验（持久化证据）",
          DONE if reboot_ok else TODO,
          reboot_evidence,
@@ -1163,17 +1326,47 @@ def build_steps(system, options, ctx):
           "sudo reboot",
           "# 等待重启完成，从客户端重新连接（务必用公钥、新端口）：",
           "ssh -o PreferredAuthentications=publickey -p " + str(port) + " " + user + "@" + host,
-          "# 重连后重跑本脚本完成复验：",
+          "# 冷启动后分别验证允许/拒绝来源的新连接，期间未改运行规则后，重跑并手动加 --reboot-confirmed：",
           "sudo bash " + shlex.quote(entry_dir() + "/" + SCRIPT) + " --port " + str(port) + " --user " + user
           + "".join(" --allow " + shlex.quote(item) for item in options.allow)
           + ((" --host " + shlex.quote(options.host)) if options.host else "")
           + (" --rescue-confirmed" if options.rescue_confirmed else "")
           + " --backup-dir " + shlex.quote(options.backup_dir)
-          + (" --tailnet" if options.tailnet else "")],
+          + (" --tailnet" if options.tailnet else "")
+          + (" --tailnet-session-confirmed" if options.tailnet_session_confirmed else "")],
          ["重跑后本步骤应显示已完成"],
          recovery_commands(restore_path),
          blocked_by=[b for b in (["0-preconditions"] if pre_fail else []) + ([] if confirm_ok else ["3-confirm"])])
     return steps
+
+
+def loader_facts(system):
+    path = "/etc/systemd/system/ssh-allowlist.service"
+    try:
+        if system.exists(NFTABLES_CONF):
+            global_config = system.read(NFTABLES_CONF)
+            enabled = system.run_allow_fail("systemctl", "is-enabled", "nftables.service").stdout.strip()
+            if enabled not in ("disabled", "masked", "not-found"):
+                active_lines = [line.split("#", 1)[0] for line in global_config.splitlines()]
+                if any("flush ruleset" in line or ("include" in line and "/etc/nftables.d/" in line)
+                       for line in active_lines):
+                    return {"status": FAIL, "detail": "另有已启用或状态未知的全局加载器可能清表/重复装载，先人工协调，禁止直接继续"}
+        text = system.read(path)
+        directory = path + ".d"
+        if system.is_dir(directory) and system.list_dir(directory):
+            return {"status": FAIL, "detail": "存在未知加载器 drop-in；先人工核对，不得直接 restart"}
+        if re.search(r"^\s*Exec(?:StartPre|StartPost|Stop|StopPost)\s*=\s*\S", text, re.M):
+            return {"status": FAIL, "detail": "专用加载器不应配置清理规则的 ExecStop"}
+        for line in ("ExecStart=/usr/sbin/nft -f /etc/nftables.d/ssh-allowlist.nft",
+                     "ExecReload=/usr/sbin/nft -f /etc/nftables.d/ssh-allowlist.nft"):
+            if line not in text.splitlines():
+                return {"status": UNKNOWN, "detail": "加载器不是已知的专用事务配置，需人工核对实际加载路径"}
+        for sub, want in (("is-active", "active"), ("is-enabled", "enabled")):
+            if system.run("systemctl", sub, "ssh-allowlist.service").strip() != want:
+                return {"status": FAIL, "detail": "专用加载器未 active/enabled"}
+        return {"status": PASS, "detail": "专用加载器 active/enabled；仍需核对其它加载器顺序并做冷启动验证"}
+    except EvidenceError as exc:
+        return {"status": UNKNOWN, "detail": str(exc)}
 
 
 def resolve_context(system, options):
@@ -1197,6 +1390,7 @@ def resolve_context(system, options):
     ctx["allowlist"] = allowlist_assessment(ctx["nft"], ctx["ufw"], options.port, options.allow, tailnet=options.tailnet)
     ctx["legacy"], ctx["legacy_traces"] = legacy_blocking(system)
     ctx["reboot"] = reboot_facts(system)
+    ctx["loader"] = loader_facts(system)
     addr = ctx["connection"]["source"] if ctx["connection"] else (options.allow[0].split("/")[0] if options.allow else "192.0.2.1")
     keep = ("permitrootlogin", "passwordauthentication", "kbdinteractiveauthentication",
             "authenticationmethods", "pubkeyauthentication")

@@ -109,16 +109,20 @@ def make_stub(module, *, session_port=22, session_source="203.0.113.9", journal_
     system.touch_dir("/etc/nftables.d", [])
     if allowlist_rules:
         system.touch_dir("/etc/nftables.d", ["ssh-allowlist.nft"])
+        system.touch_file("/etc/systemd/system/ssh-allowlist.service")
+        system.set_read("/etc/systemd/system/ssh-allowlist.service", "[Service]\nExecStart=/usr/sbin/nft -f /etc/nftables.d/ssh-allowlist.nft\nExecReload=/usr/sbin/nft -f /etc/nftables.d/ssh-allowlist.nft\n")
     if backup:
         system.touch_dir("/var/backups/ssh-hardening", ["20261027-160000"])
         system.touch_dir("/var/backups/ssh-hardening/20261027-160000", ["sshd_config", "nft-ruleset.nft"])
         for name in ("sshd_config", "units.txt", "backup-complete", "nft-ruleset.nft", "ufw-status.txt",
                      "sshd_config.d.absent", "ssh.socket.d.absent", "nftables.conf.absent",
                      "nftables.d.absent", "ufw.absent", "ssh.socket.active", "nftables.enabled",
-                     "nft-ruleset.json", "sshguard.nft.absent"):
+                     "nft-ruleset.json", "sshguard.nft.absent", "ssh-allowlist.service.absent",
+                     "ssh-allowlist.service.d.absent", "ssh-allowlist.active", "ssh-allowlist.enabled"):
             system.touch_file("/var/backups/ssh-hardening/20261027-160000/" + name)
     if hardening_mtime is not None:
-        for path in ("/etc/ssh/sshd_config.d/10-newport.conf", "/etc/nftables.d/ssh-allowlist.nft"):
+        for path in ("/etc/ssh/sshd_config", "/etc/systemd/system/ssh-allowlist.service",
+                     "/etc/ssh/sshd_config.d/10-newport.conf", "/etc/nftables.d/ssh-allowlist.nft"):
             system.mtimes[path] = hardening_mtime
     if legacy_pending:
         system.touch_file("/var/lib/reinforce-my-ssh/state.conf")
@@ -321,33 +325,33 @@ class TestStage1Steps(unittest.TestCase):
     def test_tailnet_step_only_when_declared(self):
         _, _, _, plain = self.steps()
         self.assertNotIn("2b-tailnet", plain)
-        _, _, _, declared = self.steps(extra=["--tailnet"], tailnet=True)
+        _, _, _, declared = self.steps(extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=True)
         self.assertEqual(declared["2b-tailnet"]["status"], "done")
 
     def test_tailnet_step_reports_missing_interface(self):
-        _, _, _, steps = self.steps(extra=["--tailnet"], tailnet=False)
+        _, _, _, steps = self.steps(extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=False)
         self.assertEqual(steps["2b-tailnet"]["status"], "todo")
         self.assertIn("未发现 tailscale0", steps["2b-tailnet"]["evidence"])
 
     def test_tailnet_operstate_unknown_with_flags_up(self):
-        _, _, _, steps = self.steps(extra=["--tailnet"], tailnet=True,
+        _, _, _, steps = self.steps(extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=True,
                                     tailnet_state="unknown", tailnet_flags=0x1003)
         self.assertEqual(steps["2b-tailnet"]["status"], "done")
 
     def test_tailnet_flags_down_is_not_ready(self):
-        _, _, _, steps = self.steps(extra=["--tailnet"], tailnet=True,
+        _, _, _, steps = self.steps(extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=True,
                                     tailnet_state="up", tailnet_flags=0x1002)
         self.assertEqual(steps["2b-tailnet"]["status"], "todo")
 
     def test_tailnet_step_verifies_via_current_port(self):
-        _, _, _, steps = self.steps(extra=["--tailnet"], tailnet=True)
+        _, _, _, steps = self.steps(extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=True)
         joined = "\n".join(steps["2b-tailnet"]["do"] + steps["2b-tailnet"]["verify"])
         self.assertIn("-p 22", joined)
         self.assertNotIn("62207", joined)
         self.assertIn("第 4 步", joined)
 
     def test_verify_resume_command_keeps_tailnet(self):
-        _, _, _, steps = self.steps(session_port=22, extra=["--tailnet"], tailnet=True)
+        _, _, _, steps = self.steps(session_port=22, extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=True)
         joined = "\n".join(steps["4-verify-new"]["do"])
         self.assertIn("--tailnet", joined)
 
@@ -387,7 +391,7 @@ class TestStage2Steps(unittest.TestCase):
 
     def test_complete_after_reboot(self):
         _, _, _, steps = self.build(session_port=62207, listeners=[62207], backup=True, disk_ports=(62207,),
-                                    auth=HARDENED_AUTH, allowlist_rules=ALLOW_RULES, hardening_mtime=999999999)
+                                    auth=HARDENED_AUTH, allowlist_rules=ALLOW_RULES, hardening_mtime=999999999, extra=["--reboot-confirmed"])
         self.assertEqual(steps["4-reboot-verify"]["status"], "done")
         self.assertTrue(all(step["status"] == "done" for step in steps.values()))
 
@@ -400,7 +404,7 @@ class TestStage2Steps(unittest.TestCase):
     def test_tailnet_declared_without_allow_uses_interface_rule(self):
         _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
                                     session_port=62207, listeners=[62207], backup=True,
-                                    extra=["--tailnet"])
+                                    extra=["--tailnet", "--tailnet-session-confirmed"])
         self.assertNotEqual(steps["1-allowlist"]["status"], "blocked")
         self.assertTrue(any('iifname "tailscale0"' in line for line in steps["1-allowlist"]["do"]))
         self.assertEqual(steps["1b-close-public"]["status"], "unknown")
@@ -409,7 +413,7 @@ class TestStage2Steps(unittest.TestCase):
     def test_socket_activated_listener_is_not_mistaken_for_closed(self):
         _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
                                     session_port=62207, listeners=[62207], backup=True,
-                                    listener_process="systemd", extra=["--tailnet"])
+                                    listener_process="systemd", extra=["--tailnet", "--tailnet-session-confirmed"])
         self.assertEqual(steps["1b-close-public"]["status"], "unknown")
         self.assertIn("0.0.0.0", steps["1b-close-public"]["evidence"])
 
@@ -420,7 +424,7 @@ class TestStage2Steps(unittest.TestCase):
                 "62207/tcp DENY Anywhere\n")
         _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
                                     session_port=62207, listeners=[62207], backup=True,
-                                    ufw_active=True, ufw_text=text, extra=["--tailnet"])
+                                    ufw_active=True, ufw_text=text, extra=["--tailnet", "--tailnet-session-confirmed"])
         self.assertEqual(steps["1b-close-public"]["status"], "todo")
         self.assertIn("公网仍可进入", steps["1b-close-public"]["evidence"])
 
@@ -430,19 +434,19 @@ class TestStage2Steps(unittest.TestCase):
                 "62207/tcp DENY Anywhere\n")
         _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
                                     session_port=62207, listeners=[62207], backup=True,
-                                    ufw_active=True, ufw_text=text, extra=["--tailnet"])
+                                    ufw_active=True, ufw_text=text, extra=["--tailnet", "--tailnet-session-confirmed"])
         self.assertEqual(steps["1b-close-public"]["status"], "done")
 
     def test_tailnet_ipv6_session_is_accepted(self):
         _, _, _, steps = self.build(session_source="fd7a:115c:a1e0::1", tailnet=True, allow=[],
                                     session_port=62207, listeners=[62207], backup=True,
-                                    extra=["--tailnet"])
+                                    extra=["--tailnet", "--tailnet-session-confirmed"])
         self.assertNotEqual(steps["1-allowlist"]["status"], "blocked")
 
     def test_tailnet_ipv6_binding_is_not_public(self):
         _, _, _, steps = self.build(session_source="fd7a:115c:a1e0::1", tailnet=True, allow=[],
                                     session_port=62207, listeners=[62207], backup=True,
-                                    bind_address="fd7a:115c:a1e0::1", extra=["--tailnet"])
+                                    bind_address="fd7a:115c:a1e0::1", extra=["--tailnet", "--tailnet-session-confirmed"])
         self.assertEqual(steps["1b-close-public"]["status"], "done")
 
     def test_nft_negated_tailscale_drop_closes_public(self):
@@ -451,13 +455,13 @@ class TestStage2Steps(unittest.TestCase):
                  ("drop", 62207, None, None, "tailscale0", True)]
         _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
                                     session_port=62207, listeners=[62207], backup=True,
-                                    allowlist_rules=rules, extra=["--tailnet"])
+                                    allowlist_rules=rules, extra=["--tailnet", "--tailnet-session-confirmed"])
         self.assertEqual(steps["1b-close-public"]["status"], "done")
 
     def test_resume_commands_keep_tailnet_flag(self):
         _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
                                     session_port=62207, listeners=[62207], backup=True,
-                                    journal_method=None, extra=["--tailnet"])
+                                    journal_method=None, extra=["--tailnet", "--tailnet-session-confirmed"])
         self.assertTrue(any("--tailnet" in line for line in steps["4-reboot-verify"]["do"]))
         self.assertTrue(any("--tailnet" in line for line in steps["0-preconditions"]["do"]))
 
@@ -467,7 +471,7 @@ class TestStage2Steps(unittest.TestCase):
                           session_port=62207, listeners=[62207], backup=True,
                           disk_ports=(62207,), auth=HARDENED_AUTH,
                           hardening_mtime=999999999, allowlist_rules=rules,
-                          extra=["--tailnet"], **kwargs)
+                          extra=["--tailnet", "--tailnet-session-confirmed", "--reboot-confirmed"], **kwargs)
 
     def mixed_rules(self):
         return [("accept", 62207, None, None, "tailscale0"),
@@ -548,7 +552,7 @@ class TestStage2Steps(unittest.TestCase):
                     allow=["10.20.0.0/16", "203.0.113.9/32", "2001:db8::9/128"],
                     session_port=62207, listeners=[62207], backup=True,
                     disk_ports=(62207,), auth=HARDENED_AUTH, hardening_mtime=999999999,
-                    allowlist_rules=self.mixed_rules(), extra=["--tailnet"])
+                    allowlist_rules=self.mixed_rules(), extra=["--tailnet", "--tailnet-session-confirmed"])
                 self.assertEqual(steps["1-allowlist"]["status"], "done")
                 self.assertEqual(steps["3-confirm"]["status"], "done")
 
@@ -570,14 +574,14 @@ class TestStage2Steps(unittest.TestCase):
     def test_tailnet_requires_interface(self):
         _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=False, allow=[],
                                     session_port=62207, listeners=[62207], backup=True,
-                                    extra=["--tailnet"])
+                                    extra=["--tailnet", "--tailnet-session-confirmed"])
         self.assertEqual(steps["0-preconditions"]["status"], "blocked")
         self.assertIn("Tailscale 已接入", steps["0-preconditions"]["evidence"])
 
     def test_tailnet_binding_marks_public_closed(self):
         _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
                                     session_port=62207, listeners=[62207], backup=True,
-                                    bind_address="100.64.1.5", extra=["--tailnet"])
+                                    bind_address="100.64.1.5", extra=["--tailnet", "--tailnet-session-confirmed"])
         self.assertEqual(steps["1b-close-public"]["status"], "done")
         self.assertIn("回环/tailnet", steps["1b-close-public"]["evidence"])
 
@@ -600,7 +604,7 @@ class TestStage0Assessment(unittest.TestCase):
         self.assertEqual(code, 2)
 
     def test_verified_after_reboot(self):
-        code, output, _ = self.run_stage0(["--port", "62207", "--user", "fenix", "--allow", "203.0.113.0/24"],
+        code, output, _ = self.run_stage0(["--reboot-confirmed", "--port", "62207", "--user", "fenix", "--allow", "203.0.113.0/24"],
                                           session_port=62207, listeners=[62207], disk_ports=(62207,), backup=True,
                                           auth=HARDENED_AUTH, allowlist_rules=ALLOW_RULES, hardening_mtime=999999999)
         self.assertIn("已完成并通过跨重启验证", output)
@@ -610,7 +614,7 @@ class TestStage0Assessment(unittest.TestCase):
         rules = [("accept", None, None, ("established", "related")),
                  ("accept", 62207, None, None, "tailscale0"),
                  ("drop", 62207, None, None)]
-        code, output, _ = self.run_stage0(["--port", "62207", "--user", "fenix", "--tailnet"],
+        code, output, _ = self.run_stage0(["--reboot-confirmed", "--port", "62207", "--user", "fenix", "--tailnet"],
                                           session_port=62207, listeners=[62207], disk_ports=(62207,), backup=True,
                                           auth=HARDENED_AUTH, allowlist_rules=rules, tailnet=True,
                                           hardening_mtime=999999999)
@@ -691,7 +695,7 @@ class TestJsonReports(unittest.TestCase):
     def test_stage2_json_complete(self):
         system = make_stub(STAGE2, session_port=62207, listeners=[62207], disk_ports=(62207,), backup=True,
                            auth=HARDENED_AUTH, allowlist_rules=ALLOW_RULES, hardening_mtime=999999999)
-        code, output = run_main(STAGE2, ["--port", "62207", "--user", "fenix", "--allow", "203.0.113.0/24",
+        code, output = run_main(STAGE2, ["--reboot-confirmed", "--port", "62207", "--user", "fenix", "--allow", "203.0.113.0/24",
                                          "--rescue-confirmed", "--format", "json"], system)
         report = json.loads(output)
         self.assertTrue(report["complete"])

@@ -4,7 +4,8 @@
 用法：python3 tests/run-tests.py
 命名约定：连字符风格（如 stage0-check.sh）。由于 unittest 的发现机制拒绝
 非标识符文件名，这里改为按路径显式加载 test-*.py，并以模块对象注册。
-全部测试使用内存桩件，不接触真实系统；真实服务器验收见 README 与 plans/DESIGN-v2.md。
+测试包括内存桩件、临时文件与隔离 Linux 命名空间；缺依赖显式跳过原生子项。
+真实服务器验收见 README 与 plans/DESIGN-v2.md。
 """
 import importlib.util
 import sys

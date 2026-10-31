@@ -82,6 +82,29 @@ class EvidenceError(Exception):
     pass
 
 
+def validate_read_only_command(args):
+    if not args or args[0] not in READ_ONLY_COMMANDS:
+        raise EvidenceError("拒绝非只读命令")
+    tool, tail = args[0], tuple(args[1:])
+    allowed = READ_ONLY_COMMANDS[tool]
+    if allowed is not None and (not tail or tail[0] not in allowed):
+        raise EvidenceError("拒绝非只读子命令")
+    exact = {
+        "ss": {("-tlnpH",)},
+        "nft": {("-j", "list", "ruleset"), ("list", "tables"), ("list", "ruleset")},
+        "ufw": {("status", "verbose")},
+        "journalctl": {("-b", "-u", "ssh", "-u", "sshd", "-u", "ssh@*", "-o", "cat", "--no-pager")},
+    }
+    if tool in exact and tail not in exact[tool]:
+        raise EvidenceError("拒绝未经声明的只读命令参数：" + tool)
+    if tool == "sshd":
+        rest = list(tail[1:])
+        while rest:
+            if len(rest) < 2 or rest[0] not in ("-f", "-C"):
+                raise EvidenceError("拒绝 sshd 参数")
+            del rest[:2]
+
+
 class System:
     """只执行白名单内的只读命令；一切失败都以证据异常上报，不猜测。"""
 
@@ -89,11 +112,7 @@ class System:
         self.calls = []
 
     def run(self, *args):
-        if args[0] not in READ_ONLY_COMMANDS:
-            raise EvidenceError("拒绝执行非只读白名单命令：" + args[0])
-        allowed_sub = READ_ONLY_COMMANDS[args[0]]
-        if allowed_sub is not None and (len(args) < 2 or args[1] not in allowed_sub):
-            raise EvidenceError("拒绝执行非只读子命令：" + " ".join(args[:2]))
+        validate_read_only_command(args)
         self.calls.append(list(args))
         try:
             result = subprocess.run(list(args), capture_output=True, text=True, timeout=60)
@@ -108,11 +127,7 @@ class System:
 
     def run_allow_fail(self, *args):
         """供 is-active/is-enabled 这类"非零退出也是有效答案"的只读查询使用。"""
-        if args[0] not in READ_ONLY_COMMANDS:
-            raise EvidenceError("拒绝执行非只读白名单命令：" + args[0])
-        allowed_sub = READ_ONLY_COMMANDS[args[0]]
-        if allowed_sub is not None and (len(args) < 2 or args[1] not in allowed_sub):
-            raise EvidenceError("拒绝执行非只读子命令：" + " ".join(args[:2]))
+        validate_read_only_command(args)
         self.calls.append(list(args))
         try:
             result = subprocess.run(list(args), capture_output=True, text=True, timeout=60)
@@ -313,32 +328,31 @@ def match_blocks(system):
 
 
 def disk_port_directives(system):
-    """磁盘配置里显式声明的 Port/ListenStream（解释重启后仍会监听的端口）。"""
     ports = {}
     for path in sshd_config_files(system):
         try:
             for number, line in enumerate(system.read(path).splitlines(), 1):
-                m = re.match(r"\s*Port\s+(\d+)\s*$", line)
+                m = re.match(r"\s*Port\s+(\d+)\s*(?:#.*)?$", line)
                 if m:
                     ports.setdefault(int(m.group(1)), []).append("%s:%d" % (path, number))
         except EvidenceError:
             continue
-    names = system.list_dir(SOCKET_DROPIN_DIR) if system.is_dir(SOCKET_DROPIN_DIR) else []
-    for name in sorted(names):
-        if not name.endswith(".conf"):
-            continue
-        path = SOCKET_DROPIN_DIR + "/" + name
-        for number, line in enumerate(system.read(path).splitlines(), 1):
-            m = re.match(r"\s*ListenStream\s*=\s*(\S+)\s*$", line)
-            if m:
-                try:
-                    ports.setdefault(endpoint_port(m.group(1)), []).append("%s:%d" % (path, number))
-                except ValueError:
-                    continue
+    try:
+        for name in system.list_dir(SOCKET_DROPIN_DIR):
+            if not name.endswith(".conf"):
+                continue
+            path = SOCKET_DROPIN_DIR + "/" + name
+            for number, line in enumerate(system.read(path).splitlines(), 1):
+                m = re.match(r"\s*ListenStream\s*=\s*(\S+)\s*$", line)
+                if m:
+                    try:
+                        ports.setdefault((int(m.group(1)) if m.group(1).isdigit() else endpoint_port(m.group(1))), []).append("%s:%d" % (path, number))
+                    except ValueError:
+                        continue
+    except EvidenceError:
+        pass
     return ports
 
-
-# ---------------------------------------------------------------- 账户与公钥
 
 def account_facts(system, user):
     facts = {"user": user, "authorized_keys_readable": False}
@@ -492,7 +506,7 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
                     continue
                 if not any(net.version == declared.version and net.subnet_of(declared) for declared in networks):
                     offenders.append(rule["location"] + "：来源 " + literal + " 超出声明白名单")
-                elif reachable and not rule.get("iifs"):
+                elif reachable and not rule.get("iif_negated"):
                     accepted.append(net)
         if rule["verdict"] in ("drop", "reject"):
             restricting_drop |= not rule["saddrs"] and (not rule.get("iifs") or rule.get("iif_negated", False))
@@ -502,10 +516,12 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
     if ufw.get("active"):
         ufw_stopped = set()
         for line in ufw.get("text", "").splitlines():
-            m = re.match(r"^%s(/tcp)?(?:\s+\(v6\))?(?:\s+on\s+(\S+))?\s+(ALLOW|DENY|REJECT)\s*(\S*)" % re.escape(port_s), line.strip())
+            m = re.match(r"^%s(/tcp)?(?:\s+\(v6\))?(?:\s+on\s+(\S+))?\s+(ALLOW|DENY|REJECT)(?:\s+(IN|OUT|FWD))?\s+(\S+)" % re.escape(port_s), line.strip())
             if not m:
                 continue
-            iface, verdict, literal = m.group(2), m.group(3), m.group(4)
+            iface, verdict, direction, literal = m.group(2), m.group(3), m.group(4), m.group(5)
+            if direction in ("OUT", "FWD"):
+                continue
             version = 6 if "(v6)" in line or ":" in literal else 4
             if verdict == "ALLOW":
                 saw_accept = True
@@ -519,7 +535,7 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
                         net = ipaddress.ip_network(literal.split()[0])
                         if not any(net.version == d.version and net.subnet_of(d) for d in networks):
                             offenders.append("ufw：来源 " + literal + " 超出声明白名单")
-                        elif version not in ufw_stopped and not iface:
+                        elif version not in ufw_stopped:
                             accepted.append(net)
                     except ValueError:
                         offenders.append("ufw：无法解析来源 " + literal)
@@ -646,40 +662,44 @@ def backup_facts(system, backup_root):
         if not (system.exists(latest + "/sshguard.nft") or system.exists(latest + "/sshguard.nft.absent")):
             missing.append("sshguard.nft")
     facts["has_sshd_config"] = system.exists(latest + "/sshd_config")
+    for item in ("ssh-allowlist.service", "ssh-allowlist.service.d"):
+        if not (system.exists(latest + "/" + item) or system.is_dir(latest + "/" + item)
+                or system.exists(latest + "/" + item + ".absent")):
+            missing.append(item)
+    for item in ("ssh-allowlist.active", "ssh-allowlist.enabled"):
+        if not system.exists(latest + "/" + item):
+            missing.append(item)
     facts["missing"] = missing
     facts["complete"] = not missing
     return facts
 
 
 def reboot_facts(system):
-    facts = {}
+    facts = {"evidence_scope": "仅比较磁盘文件；不能检测启动后的纯运行态变更，须实际冷启动及外部验收"}
     try:
         facts["btime"] = int(re.search(r"^btime (\d+)$", system.read("/proc/stat"), re.M)[1])
         facts["boot_time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(facts["btime"]))
-    except (EvidenceError, AttributeError, TypeError, ValueError):
-        return facts
-    facts["boot_id"] = None
-    try:
-        facts["boot_id"] = system.read("/proc/sys/kernel/random/boot_id").strip()
-    except EvidenceError:
-        pass
-    hardened = []
-    for path in sshd_config_files(system):
-        if path == SSHD_CONFIG:
-            continue
-        hardened.append(path)
-    for directory in (SOCKET_DROPIN_DIR, "/etc/nftables.d"):
-        try:
-            hardened += [directory + "/" + name for name in system.list_dir(directory)]
-        except EvidenceError:
-            continue
-    mtimes = [(system.mtime(p), p) for p in hardened]
-    mtimes = [(m, p) for m, p in mtimes if m is not None]
-    if mtimes:
+        hardened = set(sshd_config_files(system))
+        for path in ("/etc/nftables.conf", "/etc/systemd/system/ssh-allowlist.service"):
+            if system.exists(path):
+                hardened.add(path)
+        for directory in (SSHD_CONFIG_D, SOCKET_DROPIN_DIR, "/etc/nftables.d",
+                          "/etc/systemd/system/ssh-allowlist.service.d"):
+            if system.is_dir(directory):
+                for name in system.list_dir(directory):
+                    path = directory + "/" + name
+                    if not system.is_dir(path):
+                        hardened.add(path)
+        mtimes = [(system.mtime(path), path) for path in sorted(hardened)]
+        if not mtimes or any(m is None for m, _ in mtimes):
+            facts["detail"] = "加固文件时间采集不完整，不能证实文件早于启动"
+            return facts
         latest = max(mtimes)
         facts["hardened_latest_mtime"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(latest[0]))
         facts["hardened_latest_file"] = latest[1]
         facts["booted_after_hardening"] = facts["btime"] > latest[0]
+    except (EvidenceError, AttributeError, TypeError, ValueError):
+        facts.pop("booted_after_hardening", None)
     return facts
 
 
@@ -698,8 +718,13 @@ def parse_args(argv):
     parser.add_argument("--tailnet", action="store_true",
                         help="管理通路经 Tailscale tailnet；白名单判定承认 iifname tailscale0 放行")
     parser.add_argument("--backup-dir", default=BACKUP_ROOT, help="备份约定目录（默认 " + BACKUP_ROOT + "）")
+    parser.add_argument("--tailnet-session-confirmed", action="store_true", help="已核实当前 SSH 会话确经 tailscale0 到 sshd；地址段不能代替入口证据")
+    parser.add_argument("--reboot-confirmed", action="store_true", help="本次冷启动后已验证全部允许来源和拒绝来源的新连接；任何运行态变更后须重新验收")
+    parser.add_argument("--rescue-confirmed", action="store_true", help="已实际演练救援控制台；仅传递操作者真实声明")
     parser.add_argument("--format", choices=("text", "json"), default="text")
     options = parser.parse_args(argv)
+    if options.tailnet_session_confirmed and not options.tailnet:
+        parser.error("--tailnet-session-confirmed 必须与 --tailnet 同用，且只声明本次实际入口")
     if options.port is not None and not 1 <= options.port <= 65535:
         parser.error("--port 超出范围")
     if any(not 1 <= port <= 65535 for port in options.closed_port):
@@ -843,7 +868,7 @@ def assess(facts, options):
     reboot = facts.get("reboot", {})
     reboot_ok = False
     if hardened_done:
-        reboot_ok = reboot.get("booted_after_hardening") is True
+        reboot_ok = reboot.get("booted_after_hardening") is True and options.reboot_confirmed
         if reboot_ok:
             add("跨重启持久化", PASS, "本次启动（%s）晚于全部加固文件修改，且运行态达标" % reboot.get("boot_time"))
         else:
@@ -887,6 +912,14 @@ def assess(facts, options):
         stage2_cmd += " --tailnet"
     if options.host:
         stage2_cmd += " --host " + shlex.quote(options.host)
+
+    for flag in ("rescue_confirmed", "tailnet_session_confirmed", "reboot_confirmed"):
+        if getattr(options, flag):
+            stage2_cmd += " --" + flag.replace("_", "-")
+    if not options.allow and not options.tailnet:
+        stage2_cmd = "# " + stage2_cmd + " --allow REPLACE_WITH_TRUSTED_CIDR"
+    if not options.rescue_confirmed:
+        stage2_cmd = "# 先真实演练救援控制台，再添加 --rescue-confirmed；不要直接复制成已演练声明。\n" + stage2_cmd
 
     if position == "legacy-blocking":
         next_step = {"summary": "先处置旧版残留，再开始新流程", "commands": []}
@@ -937,7 +970,7 @@ def collect(system, options):
         if connection:
             user = facts["session"]["sudo_user"] or "root"
             facts["session"]["auth"] = session_auth(system, connection, user)
-            facts["session"]["tailnet"] = is_tailnet_address(connection["source"])
+            facts["session"]["tailnet"] = bool(options.tailnet and options.tailnet_session_confirmed)
     attempt("会话采集", session)
 
     def services():

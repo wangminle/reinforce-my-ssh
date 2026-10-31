@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -250,6 +251,8 @@ class TestSafetyRegressions(unittest.TestCase):
         self.assertIn("--backup-dir " + shlex.quote(value), "\n".join(steps["4-verify-new"]["do"]))
 
     def test_generated_nft_rules_compile_in_isolated_network_namespace(self):
+        if not all(shutil.which(x) for x in ("unshare", "nft")):
+            self.skipTest("需要 Linux unshare 与 nft；本机未完成原生验收")
         if os.name == "nt":
             self.skipTest("实际 nft 语法检查由 Linux/WSL 执行")
         _, _, _, steps = g.TestStage2Steps().build(
@@ -275,7 +278,7 @@ class TestSafetyRegressions(unittest.TestCase):
                 "cp": '#!/usr/bin/env python3\nimport sys,pathlib\np=pathlib.Path(sys.argv[-1])\nif sys.argv[-2].endswith(".d"): p.mkdir()\nelse: p.write_text("fixture")\n',
                 "nft": '#!/bin/sh\n[ "${FAIL_NFT:-0}" = 0 ] || exit 7\nprintf "table inet fixture {}\\n"\n',
                 "ufw": '#!/bin/sh\nprintf "Status: inactive\\n"\n',
-                "systemctl": '#!/bin/sh\nprintf "ActiveState=active\\n"\n',
+                "systemctl": '#!/bin/sh\ncase "$1" in show) if [ "$3" = -p ]; then echo loaded; else echo ActiveState=active; fi;; is-active) echo active;; is-enabled) echo enabled;; esac\n',
             }
             for name, body in programs.items():
                 path = bindir / name

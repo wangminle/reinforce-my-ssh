@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -142,6 +143,7 @@ class TestFollowupRegressions(unittest.TestCase):
     def test_recovery_program_is_selfcontained_and_same_in_both_scripts(self):
         expected = Path(__file__).with_name("recovery-program.txt").read_text()
         for module in (g.STAGE1, g.STAGE2):
+            self.assertEqual(module.ssh_service_program(), Path(__file__).with_name("ssh-service-program.txt").read_text())
             self.assertEqual(program(module), expected)
             compile(program(module), "generated-recovery", "exec")
             self.assertNotIn("flush ruleset", program(module))
@@ -157,6 +159,8 @@ class TestFollowupRegressions(unittest.TestCase):
                 self.assertTrue(any("SSH_RECOVERY_PY" in x for x in steps[sid]["undo"]), sid)
 
     def test_actual_recovery_restores_files_and_targeted_nft_only(self):
+        if not all(shutil.which(x) for x in ("unshare", "nft")):
+            self.skipTest("需要 Linux unshare 与 nft；本机未完成原生验收")
         if os.name == "nt":
             self.skipTest("真实救援执行需要 Linux 用户/网络命名空间")
         # 两种关键场景：原有 sshguard/同名配置，以及原来完全不存在。
@@ -169,13 +173,15 @@ class TestFollowupRegressions(unittest.TestCase):
             backup = root / "backup space's"
             backup.mkdir()
             filesystem = root / "system"
-            for name in ("sshd_config.d", "ssh.socket.d", "nftables.d", "ufw"):
+            for name in ("sshd_config.d", "ssh.socket.d", "nftables.d", "ufw", "ssh-allowlist.service.d"):
                 (backup / name).mkdir()
             for name, content in {"sshd_config": "Port 22\n", "units.txt": "fixture",
                                   "backup-complete": "complete\n", "ssh.socket.active": "active\n",
-                                  "nftables.enabled": "disabled\n", "nftables.conf": "# original\n",
+                                  "nftables.enabled": "disabled\n", "ssh-allowlist.active": "inactive\n",
+                                  "ssh-allowlist.enabled": "disabled\n", "nftables.conf": "# original\n",
                                   "ufw-status.txt": "Status: active\n"}.items():
                 (backup / name).write_text(content)
+            (backup / "ssh-allowlist.service.absent").touch()
             (backup / "sshd_config.d/original.conf").write_text("# original file\n")
             if had_original:
                 (backup / "sshd_config.d/20-hardening.conf").write_text("# original hardening\n")
@@ -189,9 +195,16 @@ class TestFollowupRegressions(unittest.TestCase):
             bindir = root / "bin"
             bindir.mkdir()
             log = root / "calls"
-            for tool in ("sshd", "systemctl", "ufw"):
+            for tool in ("sshd", "systemctl", "ufw", "busctl"):
                 executable = bindir / tool
-                executable.write_text("#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> " + shlex.quote(str(log)) + "\n")
+                body = "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> " + shlex.quote(str(log)) + "\n"
+                if tool == "systemctl":
+                    body += ('if [ "$1" = show ]; then\n'
+                             ' if [ "$2" = ssh.service ]; then printf "KillMode=process\\nSendSIGHUP=no\\nExecStop=\\nExecStopPost=\\n";\n'
+                             ' else printf "LoadState=loaded\\nActiveState=active\\n"; fi\nfi\n')
+                if tool == "busctl":
+                    body += 'printf \'{"type":"a(sasbttttuii)","data":[]}\\n\'\n'
+                executable.write_text(body)
                 executable.chmod(0o755)
             # 仅替换测试文件系统根；实际 nft 命令在独立命名空间执行。
             body = program(g.STAGE2).replace('ROOT = Path("/")', "ROOT = Path(" + repr(str(filesystem)) + ")")
@@ -234,9 +247,9 @@ require(('original-table' in rules) == had, 'original table restoration failed')
                     self.assertFalse((filesystem / path).exists())
             calls = log.read_text()
             self.assertIn("ufw reload", calls)
-            self.assertIn("systemctl restart ssh.socket", calls)
-            self.assertIn("systemctl reload-or-restart ssh.service", calls)
-            self.assertNotIn("systemctl stop", calls)
+            self.assertIn("systemctl stop ssh.socket ssh.service", calls)
+            self.assertIn("systemctl start ssh.socket ssh.service", calls)
+            self.assertNotIn("systemctl restart ssh.socket", calls)
 
     def test_incomplete_recovery_stops_before_deleting_anything(self):
         with tempfile.TemporaryDirectory() as tmp:

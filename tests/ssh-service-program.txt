@@ -1,0 +1,69 @@
+import json
+import shlex
+import subprocess
+
+SSH_SERVICE = "ssh.service"
+SSH_SOCKET = "ssh.socket"
+
+def ssh_properties(unit, names):
+    result = subprocess.run(["systemctl", "show", unit, "--all"] +
+                            [arg for name in names for arg in ("-p", name)],
+                            check=True, text=True, capture_output=True)
+    values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    if not all(name in values for name in names):
+        raise SystemExit("服务状态采集不完整；保留现有会话，从控制台核对，未停止 SSH。")
+    return values
+
+def ssh_preflight(socket_active):
+    service = ssh_properties(SSH_SERVICE, ("KillMode", "SendSIGHUP"))
+    # systemctl show 即使 --all 也可能省略空的 ExecStop 数组；通过 D-Bus 获取明确的空数组。
+    unit_path = "/org/freedesktop/systemd1/unit/" + "".join(
+        c if c.isascii() and c.isalnum() else "_%02x" % ord(c) for c in SSH_SERVICE)
+    hooks = []
+    for name in ("ExecStop", "ExecStopPost"):
+        result = subprocess.run(["busctl", "--json=short", "get-property", "org.freedesktop.systemd1",
+                                 unit_path, "org.freedesktop.systemd1.Service", name],
+                                check=True, text=True, capture_output=True)
+        value = json.loads(result.stdout)
+        if value.get("type") != "a(sasbttttuii)" or not isinstance(value.get("data"), list):
+            raise SystemExit("停止钩子的 D-Bus 证据无效，未停止 SSH。")
+        hooks.extend(value["data"])
+    if (service["KillMode"] != "process" or service["SendSIGHUP"] != "no"
+            or hooks):
+        raise SystemExit("无法证明现有会话可保留：要求 KillMode=process、SendSIGHUP=no 且无 ExecStop/ExecStopPost；"
+                         "未停止 SSH，不自动修改保护参数。请保持救援控制台并人工核对。")
+    socket = ssh_properties(SSH_SOCKET, ("LoadState", "ActiveState"))
+    if socket["LoadState"] not in ("loaded", "not-found") or socket["ActiveState"] not in ("active", "inactive", "failed"):
+        raise SystemExit("socket 状态不明确，未停止 SSH；请从救援控制台核对。")
+    if socket_active and socket["LoadState"] != "loaded":
+        raise SystemExit("要求 socket 激活但单元不存在，未停止 SSH。")
+    return socket["ActiveState"]
+
+def switch_ssh(socket_active):
+    start = ["systemctl", "start"] + ([SSH_SOCKET] if socket_active else []) + [SSH_SERVICE]
+    try:
+        subprocess.run(["sshd", "-t"], check=True)
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
+        current = ssh_preflight(socket_active)
+        coordinated = socket_active or current in ("active", "failed")
+        if coordinated:
+            # 同一 stop 事务禁止 socket 激活并停主进程；保护条件保留已建立会话的子进程。
+            subprocess.run(["systemctl", "stop", SSH_SOCKET, SSH_SERVICE], check=True)
+            subprocess.run(start, check=True)
+        else:
+            subprocess.run(["systemctl", "reload-or-restart", SSH_SERVICE], check=True)
+        subprocess.run(["systemctl", "is-active", "--quiet", SSH_SERVICE], check=True)
+        if socket_active:
+            subprocess.run(["systemctl", "is-active", "--quiet", SSH_SOCKET], check=True)
+    except (subprocess.CalledProcessError, OSError, ValueError, SystemExit) as error:
+        # 失败即停止：这里只生成文本，不再执行查询、start、stop 或回滚命令。
+        status = ["sudo", "systemctl", "status", SSH_SERVICE, SSH_SOCKET, "--no-pager"]
+        journal = ["sudo", "journalctl", "-u", SSH_SERVICE, "-u", SSH_SOCKET, "-n", "50", "--no-pager"]
+        raise SystemExit("SSH 切换未完成，已停止执行：%s\n"
+                         "保持现有会话和救援控制台；故障后的服务状态尚未核实。\n"
+                         "以下仅供手工执行，本程序没有执行这些建议：\n"
+                         "1. 核对当前状态与日志：\n%s\n%s\n"
+                         "2. 检查并修正配置：\nsudo sshd -t\n"
+                         "3. 确认故障原因已处理、保护条件仍满足后，由操作员决定是否启动：\n%s\n"
+                         "随后验证监听和新的公钥会话，未验证前不要继续下一步或重启主机。"
+                         % (error, shlex.join(status), shlex.join(journal), shlex.join(["sudo"] + start)))
