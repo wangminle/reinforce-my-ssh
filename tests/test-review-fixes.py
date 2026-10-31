@@ -1,4 +1,4 @@
-"""BUG-042～052：真实格式、来源授权、生成指令与保守证据的回归。"""
+"""BUG-042～056：真实格式、来源授权、生成指令与保守证据的回归。"""
 import contextlib
 import importlib.util
 import io
@@ -194,6 +194,149 @@ class TestReviewFixes(unittest.TestCase):
                         with self.assertRaises(namespace["EvidenceError"]):
                             system.run_allow_fail(*command)
                         run.assert_not_called()
+
+
+    def test_interface_bound_source_allow_does_not_cover_declared_network(self):
+        ufw = {"active": True, "text":
+            "62207/tcp on lo ALLOW IN 203.0.113.0/24\n62207/tcp DENY IN Anywhere\n"}
+        rules = [("accept", 62207, ["203.0.113.0/24"], None, "lo"),
+                 ("drop", 62207, None, None)]
+        for module in (g.STAGE0, g.STAGE2):
+            with self.subTest(module=module.SCRIPT, firewall="ufw"):
+                result = module.allowlist_assessment({"rules": [], "input_policy": []}, ufw,
+                                                     62207, ["203.0.113.0/24"])
+                self.assertNotEqual(result["status"], "pass", result)
+                self.assertIn("未证实全部声明来源", result["detail"])
+            with self.subTest(module=module.SCRIPT, firewall="nft"):
+                summary = module.nft_ruleset_summary(g.make_stub(module, allowlist_rules=rules))
+                result = module.allowlist_assessment(summary, {}, 62207, ["203.0.113.0/24"])
+                self.assertNotEqual(result["status"], "pass", result)
+                self.assertIn("未证实全部声明来源", result["detail"])
+
+    def test_loader_early_boot_unit_and_transaction_have_no_ordering_cycle(self):
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+
+        _, _, _, steps = g.TestStage2Steps().build(session_port=62207, listeners=[62207], backup=True)
+        commands = "\n".join(steps["1-allowlist"]["do"])
+        for expected in ("DefaultDependencies=no", "Wants=network-pre.target",
+                         "After=local-fs.target network-pre.target",
+                         "Before=ssh.service ssh.socket shutdown.target",
+                         "Conflicts=shutdown.target", "WantedBy=sysinit.target"):
+            self.assertIn(expected, commands)
+        self.assertNotIn("WantedBy=multi-user.target", commands)
+        if os.name == "nt" or not shutil.which("systemd-analyze"):
+            self.skipTest("真实启动事务检查需要 Linux systemd-analyze")
+        unit_text = commands.split("sudo tee /etc/systemd/system/ssh-allowlist.service >/dev/null <<'EOF'\n", 1)[1]
+        unit_text = unit_text.split("\nEOF", 1)[0] + "\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixtures = {
+                "ssh-allowlist.service": unit_text,
+                "ssh.service": "[Service]\nExecStart=/bin/true\n",
+                "ssh.socket": "[Socket]\nListenStream=127.0.0.1:62207\n",
+                # 保留排序环涉及的 target 边；空的 basic.target 无法复现旧配置缺陷。
+                "basic.target": "[Unit]\nRequires=sysinit.target\nWants=sockets.target\n"
+                                "After=sysinit.target sockets.target\n",
+                "sockets.target": "[Unit]\n",
+                "sysinit.target": "[Unit]\nWants=local-fs.target\nAfter=local-fs.target\n",
+                "local-fs.target": "[Unit]\nDefaultDependencies=no\n",
+                "network-pre.target": "[Unit]\n",
+                "multi-user.target": "[Unit]\nRequires=basic.target\nAfter=basic.target\n",
+                "shutdown.target": "[Unit]\nDefaultDependencies=no\n",
+            }
+            for name, text in fixtures.items():
+                (root / name).write_text(text)
+            # 模拟 enable 的安装链接，只在临时树内建图，不加载或启动宿主单元。
+            sockets = root / "sockets.target.wants"
+            sockets.mkdir()
+            (sockets / "ssh.socket").symlink_to(root / "ssh.socket")
+            legacy_link = root / "multi-user.target.wants/ssh-allowlist.service"
+            current_link = root / "sysinit.target.wants/ssh-allowlist.service"
+            legacy_link.parent.mkdir()
+            current_link.parent.mkdir()
+            # 从实际启动目标展开依赖，不把每个夹具单元人为当成启动根。
+            paths = [str(root / "multi-user.target")]
+            env = dict(os.environ, SYSTEMD_UNIT_PATH=str(root))
+            legacy = unit_text.replace(
+                "DefaultDependencies=no\nWants=network-pre.target\nAfter=local-fs.target network-pre.target\n"
+                "Before=ssh.service ssh.socket shutdown.target\nConflicts=shutdown.target",
+                "Before=ssh.service ssh.socket").replace("WantedBy=sysinit.target", "WantedBy=multi-user.target")
+            (root / "ssh-allowlist.service").write_text(legacy)
+            legacy_link.symlink_to(root / "ssh-allowlist.service")
+            old = subprocess.run(["systemd-analyze", "verify", *paths], env=env,
+                                 capture_output=True, text=True)
+            # Wants 任务可能被删除以解环，verify 仍返回 0；旧图必须检查环诊断，不能只看退出码。
+            self.assertIn("ordering cycle", (old.stdout + old.stderr).lower(), old.stdout + old.stderr)
+            self.assertIn("ssh-allowlist.service", old.stdout + old.stderr)
+            legacy_link.unlink()
+            (root / "ssh-allowlist.service").write_text(unit_text)
+            current_link.symlink_to(root / "ssh-allowlist.service")
+            current = subprocess.run(["systemd-analyze", "verify", *paths], env=env,
+                                     capture_output=True, text=True)
+            output = current.stdout + current.stderr
+            self.assertEqual(current.returncode, 0, output)
+            self.assertNotIn("ordering cycle", output.lower(), output)
+
+    def test_numeric_and_unparsed_input_interfaces_never_prove_source_reachability(self):
+        for module in (g.STAGE0, g.STAGE2):
+            for right in (1, "lo", {"set": [1, 2]}, {"range": [1, 3]}, {"set": "@interfaces"}):
+                for op in ("==", "!="):
+                    with self.subTest(module=module.SCRIPT, right=right, op=op):
+                        rule = {"expr": [
+                            {"match": {"left": {"meta": {"key": "iif"}}, "op": op, "right": right}},
+                            {"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 62207}},
+                            {"match": {"left": {"payload": {"protocol": "ip", "field": "saddr"}}, "right": "203.0.113.0/24"}},
+                            {"accept": None}]}
+                        digest = module.rule_digest(rule)
+                        digest["location"] = "inet/filter/input"
+                        drop = module.rule_digest({"expr": [
+                            {"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 62207}},
+                            {"drop": None}]})
+                        drop["location"] = digest["location"]
+                        result = module.allowlist_assessment({"rules": [digest, drop], "input_policy": []}, {}, 62207, ["203.0.113.0/24"])
+                        self.assertNotEqual(result["status"], "pass", result)
+                        self.assertTrue(digest["iifs"], digest)
+
+    def test_unknown_numeric_interface_is_not_tailnet_or_global_drop_evidence(self):
+        for module in (g.STAGE0, g.STAGE2):
+            for verdict in ("accept", "drop"):
+                guarded = module.rule_digest({"expr": [
+                    {"match": {"left": {"meta": {"key": "iif"}}, "op": "!=", "right": 1}},
+                    *([{"match": {"left": {"meta": {"key": "iifname"}}, "op": "==", "right": "tailscale0"}}] if verdict == "accept" else []),
+                    {"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 62207}},
+                    {verdict: None}]})
+                plain = module.rule_digest({"expr": [
+                    {"match": {"left": {"meta": {"key": "iifname"}}, "op": "==", "right": "tailscale0"}},
+                    {"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 62207}},
+                    {"accept": None}]})
+                for digest in (guarded, plain):
+                    digest["location"] = "inet/filter/input"
+                unconditional_drop = dict(plain, iifs=[], verdict="drop")
+                rules = [guarded, unconditional_drop] if verdict == "accept" else [plain, guarded]
+                result = module.allowlist_assessment({"rules": rules, "input_policy": []}, {}, 62207, [], tailnet=True)
+                self.assertNotEqual(result["status"], "pass", result)
+
+    def test_kernel_nft_numeric_interface_json_keeps_source_restricted(self):
+        import os
+        import shutil
+        import subprocess
+        if os.name == "nt" or not shutil.which("unshare") or not shutil.which("nft"):
+            self.skipTest("真实 nft JSON 验证需要 Linux 用户/网络命名空间")
+        script = '''import subprocess
+subprocess.run(['nft','-f','-'],input='table inet review { chain input { type filter hook input priority 0; policy accept; iif 1 tcp dport 62207 ip saddr 203.0.113.0/24 accept; tcp dport 62207 drop; }; }\\n',text=True,check=True)
+print(subprocess.check_output(['nft','-j','-n','list','ruleset'],text=True))
+'''
+        result = subprocess.run(["unshare", "-Urn", "--", sys.executable, "-c", script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for module in (g.STAGE0, g.STAGE2):
+            system = g.make_stub(module)
+            system.can("nft -j list ruleset", result.stdout)
+            summary = module.nft_ruleset_summary(system)
+            assessment = module.allowlist_assessment(summary, {}, 62207, ["203.0.113.0/24"])
+            self.assertNotEqual(assessment["status"], "pass", assessment)
 
 
 if __name__ == "__main__":

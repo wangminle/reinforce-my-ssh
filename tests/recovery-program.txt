@@ -200,6 +200,10 @@ else:
     remove_file(loader_path)
 # 先恢复磁盘与内核快照；加载器 active 状态仅在原配置可检查且不执行未知变更时恢复。
 run("systemctl", "daemon-reload")
+if loader_enabled in ("enabled", "enabled-runtime", "static"):
+    # 清理本工具新旧安装目标的持久链接，再按备份单元重建；static 不应留下工具的开机启用。
+    for wanted in ("multi-user.target", "sysinit.target"):
+        remove_file(target("/etc/systemd/system/" + wanted + ".wants/ssh-allowlist.service"))
 if loader_enabled in ("enabled", "enabled-runtime"):
     args = ["systemctl", "enable"]
     if loader_enabled == "enabled-runtime":
@@ -208,9 +212,10 @@ if loader_enabled in ("enabled", "enabled-runtime"):
 elif loader_enabled == "disabled":
     run("systemctl", "disable", "ssh-allowlist.service")
 elif loader_enabled == "not-found":
-    # 本工具仅生成 multi-user.target 链接；不能在删除 unit 后 disable 一个不存在的服务。
+    # 删除 unit 后只能精确清理本工具生成的链接，不能 disable 不存在的服务。
     for directory in ("/etc/systemd/system", "/run/systemd/system"):
-        remove_file(target(directory + "/multi-user.target.wants/ssh-allowlist.service"))
+        for wanted in ("multi-user.target", "sysinit.target"):
+            remove_file(target(directory + "/" + wanted + ".wants/ssh-allowlist.service"))
 if ufw_active:
     run("ufw", "reload")
 if snapshot is not None:

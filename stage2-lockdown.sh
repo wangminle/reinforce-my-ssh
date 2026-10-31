@@ -371,7 +371,7 @@ def literal_values(value):
 def rule_digest(rule):
     verdict = None
     dports, saddrs, ct_state, iifs = set(), set(), set(), set()
-    iif_negated = False
+    iif_negated, iif_unknown = False, False
     for expr in rule.get("expr", []):
         if "accept" in expr:
             verdict = "accept"
@@ -392,14 +392,23 @@ def rule_digest(rule):
                     saddrs.update(values)
             if isinstance(left, dict) and "ct" in left and left["ct"].get("key") == "state":
                 ct_state.update(str(v) for v in literal_values(right))
-            if isinstance(left, dict) and "meta" in left and left["meta"].get("key") == "iifname":
-                iifs.update(v.strip('"') for v in literal_values(right) if isinstance(v, str))
+            if isinstance(left, dict) and "meta" in left and left["meta"].get("key") in ("iifname", "iif"):
+                values = literal_values(right)
+                if (left["meta"]["key"] == "iifname" and values
+                        and all(isinstance(v, str) and not v.startswith("@") for v in values)
+                        and node.get("op") in (None, "==", "!=", "in")):
+                    iifs.update(v.strip('"') for v in values)
+                else:
+                    # 数值索引不能证明实际入口；即使右值无法解析，也不得抹掉接口条件。
+                    iif_unknown = True
+                    iifs.add("unresolved:" + json.dumps(left["meta"]) + ":" + json.dumps(right))
                 if node.get("op") == "!=":
                     iif_negated = True
     if verdict is None and not dports and not saddrs:
         return None
     return {"verdict": verdict, "dports": sorted(dports), "saddrs": sorted(saddrs),
             "ct_state": sorted(ct_state), "iifs": sorted(iifs), "iif_negated": iif_negated,
+            "iif_unknown": iif_unknown,
             "loopback": "lo" in iifs}
 
 
@@ -447,7 +456,7 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
         if rule["verdict"] == "accept":
             saw_accept = True
             reachable = rule["location"] not in stopped
-            if tailnet and "tailscale0" in rule.get("iifs", []) and not rule.get("iif_negated"):
+            if tailnet and "tailscale0" in rule.get("iifs", []) and not rule.get("iif_negated") and not rule.get("iif_unknown"):
                 tailnet_accept |= reachable
                 continue
             if not rule["saddrs"]:
@@ -460,10 +469,10 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
                     continue
                 if not any(net.version == declared.version and net.subnet_of(declared) for declared in networks):
                     offenders.append(rule["location"] + "：来源 " + literal + " 超出声明白名单")
-                elif reachable and not rule.get("iif_negated"):
+                elif reachable and not rule.get("iifs") and not rule.get("iif_negated"):
                     accepted.append(net)
         if rule["verdict"] in ("drop", "reject"):
-            restricting_drop |= not rule["saddrs"] and (not rule.get("iifs") or rule.get("iif_negated", False))
+            restricting_drop |= not rule["saddrs"] and not rule.get("iif_unknown") and (not rule.get("iifs") or rule.get("iif_negated", False))
             # 拒绝之后的放行不能作为可达证据；复杂条件保守判为待复核。
             stopped.add(rule["location"])
     policy_drop = any("policy=drop" in item for item in nft_summary.get("input_policy", []))
@@ -489,7 +498,7 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
                         net = ipaddress.ip_network(literal.split()[0])
                         if not any(net.version == d.version and net.subnet_of(d) for d in networks):
                             offenders.append("ufw：来源 " + literal + " 超出声明白名单")
-                        elif version not in ufw_stopped:
+                        elif not iface and version not in ufw_stopped:
                             accepted.append(net)
                     except ValueError:
                         offenders.append("ufw：无法解析来源 " + literal)
@@ -692,6 +701,8 @@ def nft_public_verdict(nft_summary, port):
     for rules in chains.values():
         verdict = None
         for rule in rules:
+            if rule.get("iif_unknown"):
+                continue  # 未解析的入口条件不能证明公网开放或全局拒绝。
             if "tailscale0" in rule.get("iifs", []) and not rule.get("iif_negated"):
                 continue
             if rule.get("iifs") and "tailscale0" not in rule.get("iifs", []):
@@ -1017,6 +1028,10 @@ else:
     remove_file(loader_path)
 # 先恢复磁盘与内核快照；加载器 active 状态仅在原配置可检查且不执行未知变更时恢复。
 run("systemctl", "daemon-reload")
+if loader_enabled in ("enabled", "enabled-runtime", "static"):
+    # 清理本工具新旧安装目标的持久链接，再按备份单元重建；static 不应留下工具的开机启用。
+    for wanted in ("multi-user.target", "sysinit.target"):
+        remove_file(target("/etc/systemd/system/" + wanted + ".wants/ssh-allowlist.service"))
 if loader_enabled in ("enabled", "enabled-runtime"):
     args = ["systemctl", "enable"]
     if loader_enabled == "enabled-runtime":
@@ -1025,9 +1040,10 @@ if loader_enabled in ("enabled", "enabled-runtime"):
 elif loader_enabled == "disabled":
     run("systemctl", "disable", "ssh-allowlist.service")
 elif loader_enabled == "not-found":
-    # 本工具仅生成 multi-user.target 链接；不能在删除 unit 后 disable 一个不存在的服务。
+    # 删除 unit 后只能精确清理本工具生成的链接，不能 disable 不存在的服务。
     for directory in ("/etc/systemd/system", "/run/systemd/system"):
-        remove_file(target(directory + "/multi-user.target.wants/ssh-allowlist.service"))
+        for wanted in ("multi-user.target", "sysinit.target"):
+            remove_file(target(directory + "/" + wanted + ".wants/ssh-allowlist.service"))
 if ufw_active:
     run("ufw", "reload")
 if snapshot is not None:
@@ -1153,12 +1169,15 @@ def build_steps(system, options, ctx):
                          "# 已启用的全局加载器若会 flush ruleset，先人工协调其启动配置；不要直接启用/重启它。",
                          "test -x /usr/sbin/nft  # 确认专用加载器中的实际 nft 路径；失败则先修正路径",
                          "sudo tee /etc/systemd/system/ssh-allowlist.service >/dev/null <<'EOF'",
-                         "[Unit]", "Description=SSH source allowlist", "Before=ssh.service ssh.socket",
+                         "[Unit]", "Description=SSH source allowlist", "DefaultDependencies=no",
+                         "Wants=network-pre.target", "After=local-fs.target network-pre.target",
+                         "Before=ssh.service ssh.socket shutdown.target", "Conflicts=shutdown.target",
                          "[Service]", "Type=oneshot", "RemainAfterExit=yes",
                          "ExecStart=/usr/sbin/nft -f /etc/nftables.d/ssh-allowlist.nft",
                          "ExecReload=/usr/sbin/nft -f /etc/nftables.d/ssh-allowlist.nft",
-                         "[Install]", "WantedBy=multi-user.target", "EOF",
-                         "# 无 ExecStop：停止服务不得清空过滤规则；Before 只提供顺序，不保证加载失败时 SSH 停止。",
+                         "[Install]", "WantedBy=sysinit.target", "EOF",
+                         "# 无 ExecStop：停止服务不得清空过滤规则；显式早期依赖避免 socket/basic.target 排序环。",
+                         "# Before 只提供顺序，不保证加载失败时 SSH 停止；仍须做真实冷启动与外部连接验收。",
                          "sudo systemctl daemon-reload",
                          "sudo python3 - <<'SSH_LOADER_PY'\n" + 'import json\nimport subprocess\nunit = "ssh-allowlist.service"\nresult = subprocess.run(["systemctl", "show", unit, "-p", "FragmentPath", "-p", "DropInPaths"], check=True, text=True, capture_output=True)\nprops = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)\nif props.get("FragmentPath") != "/etc/systemd/system/ssh-allowlist.service" or props.get("DropInPaths") != "":\n    raise SystemExit("实际加载器路径或 drop-in 不明确，停止，未启用/重启服务")\nfor name in ("ExecStop", "ExecStopPost"):\n    result = subprocess.run(["busctl", "--json=short", "get-property", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/ssh_2dallowlist_2eservice", "org.freedesktop.systemd1.Service", name], check=True, text=True, capture_output=True)\n    value = json.loads(result.stdout)\n    if value.get("type") != "a(sasbttttuii)" or value.get("data") != []:\n        raise SystemExit("无法证明停止钩子为空，停止，未启用/重启服务")\nsubprocess.run(["systemctl", "enable", unit], check=True)\nsubprocess.run(["systemctl", "restart", unit], check=True)\n' + "SSH_LOADER_PY"]
 

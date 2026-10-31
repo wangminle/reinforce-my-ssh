@@ -2,7 +2,7 @@
 
 ## 服务恢复与缺失单元回归（2026-10-31）
 
-`test-service-recovery.py` 新增 10 项测试：协调 service/socket 切换、危险 KillMode/SendSIGHUP/停止钩子拒绝、查询或 sshd 校验失败不停止服务、失败即停止并输出人工建议、传统模式恢复、两条 stage1 指导入口，以及恢复文件改动前的保护检查。故障矩阵覆盖 sshd 校验、daemon-reload、stop/start、传统模式 reload 和 service/socket 运行态检查；断言失败命令是最后一次调用，两个阶段均不执行自动重试。真实 shell 执行备份命令，覆盖空 stdout 的缺失单元、真实 systemctl 的 not-found、bus 错误及无效状态；失败不得写完成标记。`ssh-service-program.txt` 是两脚本共同生成的手工切换程序参考，回归要求逐字一致。
+`test-service-recovery.py` 现有 12 项测试：协调 service/socket 切换、危险 KillMode/SendSIGHUP/停止钩子拒绝、查询或 sshd 校验失败不停止服务、失败即停止并输出人工建议、传统模式恢复、两条 stage1 指导入口、恢复文件改动前的保护检查，以及加载器启用状态恢复。故障矩阵覆盖 sshd 校验、daemon-reload、stop/start、传统模式 reload 和 service/socket 运行态检查；断言失败命令是最后一次调用，两个阶段均不执行自动重试。真实 shell 执行备份命令，覆盖空 stdout 的缺失单元、真实 systemctl 的 not-found、bus 错误及无效状态；失败不得写完成标记。`ssh-service-program.txt` 是两脚本共同生成的手工切换程序参考，回归要求逐字一致。
 
 在有 systemd 的 Linux/WSL 中，可显式执行 `sudo python3 tests/verify-systemd-switch.py`。此检查不纳入默认套件，需要 root、systemctl 和 busctl；只创建随机命名的 `codex-ssh-test-*` 临时回环 socket/service。它先复现活跃服务持有监听 fd 时旧命令被拒，再验证新命令保留已有 TCP 会话、新连接成功、危险 KillMode 拒绝及启动失败后立即停止。调用记录须证明启动仅尝试一次，没有执行输出中的建议；随后由夹具模拟操作员另行决定修正配置并再次手工运行。结束时核对临时单元已移除。sshd 校验在此夹具中替换为成功，服务为 fork TCP 夹具；不能把结果表述为真实 OpenSSH 登录或整机重启验收。
 
@@ -60,3 +60,9 @@ python3 tests/run-tests.py
 
 
 本轮结果：macOS 133 项（130 通过、3 跳过）；隔离 Linux 133 项（132 通过、1 个真实 systemd 总线子项跳过）。原子 nft 替换已在独立命名空间实测通过；`python3 tests/verify-nft-transaction.py` 可复验首装、来源更新、失败留旧表及无关表保留。它不会在宿主网络命名空间执行 nft；缺依赖退出 2。
+
+BUG-053～055 修复新增接口限定来源假阳性、早期加载单元与启动事务、`enabled-runtime` 持久链接清理回归。2026-10-31 Windows/Git Bash 结果为 136 项中 131 项通过、5 项平台跳过；其中 `systemd-analyze` 启动事务用例未在本机执行，不能据此宣称完成真实冷启动验证。
+
+后续 TST-016 已修复启动排序夹具：补 basic/sysinit/multi-user 的关键依赖边、shutdown/local-fs 的默认依赖设置，以及 socket 和加载器的 wants 安装链接；从 multi-user.target 展开完整事务。旧图必须报告涉及加载器的 ordering cycle（Wants 任务被删除时 verify 可能返回 0），新图要求返回 0 且无排序环。只在临时目录内运行 systemd-analyze verify，不启动宿主服务，不调用 daemon-reload。修复后 Debian WSL 完整套件 136 项全部通过，无跳过；ShellCheck/bash -n 与差异检查通过，仍不等于真实冷启动验收。
+
+BUG-054/056 后续新增 4 项测试，完整套件为 140 项：数值/未知 iif 标量、集合、区间与否定条件，不能充当来源、tailnet 或全局拒绝证据；另用真实 nft 用户/网络命名空间输出的 JSON 复验接口约束。启用恢复用例在两份完整恢复程序中结合实际文件复制及 `systemctl --root` 验证 enabled/enabled-runtime/static 与 multi-user/sysinit/custom 三种安装目标，共 18 个组合，检查精确链接集合和 is-enabled 结果。systemctl 只操作临时根目录，SSH、nft 和 daemon-reload 仍为桩件，不涉及宿主服务。回退到修复前链接逻辑时，12 个 enabled/static 子项均失败；修复后 Debian WSL 140 项全部通过，无跳过。

@@ -438,7 +438,7 @@ def literal_values(value):
 def rule_digest(rule):
     verdict = None
     dports, saddrs, ct_state, iifs = set(), set(), set(), set()
-    iif_negated = False
+    iif_negated, iif_unknown = False, False
     for expr in rule.get("expr", []):
         if "accept" in expr:
             verdict = "accept"
@@ -459,14 +459,23 @@ def rule_digest(rule):
                     saddrs.update(values)
             if isinstance(left, dict) and "ct" in left and left["ct"].get("key") == "state":
                 ct_state.update(str(v) for v in literal_values(right))
-            if isinstance(left, dict) and "meta" in left and left["meta"].get("key") == "iifname":
-                iifs.update(v.strip('"') for v in literal_values(right) if isinstance(v, str))
+            if isinstance(left, dict) and "meta" in left and left["meta"].get("key") in ("iifname", "iif"):
+                values = literal_values(right)
+                if (left["meta"]["key"] == "iifname" and values
+                        and all(isinstance(v, str) and not v.startswith("@") for v in values)
+                        and node.get("op") in (None, "==", "!=", "in")):
+                    iifs.update(v.strip('"') for v in values)
+                else:
+                    # 数值索引不能证明实际入口；即使右值无法解析，也不得抹掉接口条件。
+                    iif_unknown = True
+                    iifs.add("unresolved:" + json.dumps(left["meta"]) + ":" + json.dumps(right))
                 if node.get("op") == "!=":
                     iif_negated = True
     if verdict is None and not dports and not saddrs:
         return None
     return {"verdict": verdict, "dports": sorted(dports), "saddrs": sorted(saddrs),
             "ct_state": sorted(ct_state), "iifs": sorted(iifs), "iif_negated": iif_negated,
+            "iif_unknown": iif_unknown,
             "loopback": "lo" in iifs}
 
 
@@ -493,7 +502,7 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
         if rule["verdict"] == "accept":
             saw_accept = True
             reachable = rule["location"] not in stopped
-            if tailnet and "tailscale0" in rule.get("iifs", []) and not rule.get("iif_negated"):
+            if tailnet and "tailscale0" in rule.get("iifs", []) and not rule.get("iif_negated") and not rule.get("iif_unknown"):
                 tailnet_accept |= reachable
                 continue
             if not rule["saddrs"]:
@@ -506,10 +515,10 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
                     continue
                 if not any(net.version == declared.version and net.subnet_of(declared) for declared in networks):
                     offenders.append(rule["location"] + "：来源 " + literal + " 超出声明白名单")
-                elif reachable and not rule.get("iif_negated"):
+                elif reachable and not rule.get("iifs") and not rule.get("iif_negated"):
                     accepted.append(net)
         if rule["verdict"] in ("drop", "reject"):
-            restricting_drop |= not rule["saddrs"] and (not rule.get("iifs") or rule.get("iif_negated", False))
+            restricting_drop |= not rule["saddrs"] and not rule.get("iif_unknown") and (not rule.get("iifs") or rule.get("iif_negated", False))
             # 拒绝之后的放行不能作为可达证据；复杂条件保守判为待复核。
             stopped.add(rule["location"])
     policy_drop = any("policy=drop" in item for item in nft_summary.get("input_policy", []))
@@ -535,7 +544,7 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
                         net = ipaddress.ip_network(literal.split()[0])
                         if not any(net.version == d.version and net.subnet_of(d) for d in networks):
                             offenders.append("ufw：来源 " + literal + " 超出声明白名单")
-                        elif version not in ufw_stopped:
+                        elif not iface and version not in ufw_stopped:
                             accepted.append(net)
                     except ValueError:
                         offenders.append("ufw：无法解析来源 " + literal)

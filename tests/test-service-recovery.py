@@ -1,5 +1,7 @@
-"""BUG-037/047：拒绝危险服务切换，缺失单元与查询失败分别处理。"""
+"""BUG-037/047/055/056：安全服务切换、缺失单元与加载器启用状态恢复。"""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -217,6 +219,103 @@ fi
                 self.assertEqual(bool(markers), mode in ("missing", "real-missing", "loaded"), mode)
                 if mode in ("missing", "real-missing"):
                     self.assertEqual((markers[0].parent / "nftables.enabled").read_text().strip(), "not-found")
+
+
+    def test_enabled_runtime_recovery_removes_only_persistent_loader_links(self):
+        for module in (g.STAGE1, g.STAGE2):
+            with self.subTest(module=module.SCRIPT), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                backup = root / "backup"
+                backup.mkdir()
+                for name, text in {"sshd_config": "Port 22\n", "backup-complete": "complete\n",
+                                   "units.txt": "fixture", "ssh.socket.active": "active\n",
+                                   "nftables.enabled": "not-found\n", "ssh-allowlist.active": "inactive\n",
+                                   "ssh-allowlist.enabled": "enabled-runtime\n",
+                                   "ssh-allowlist.service": "[Unit]\n[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=sysinit.target\n"}.items():
+                    (backup / name).write_text(text)
+                for name in ("sshd_config.d.absent", "ssh.socket.d.absent", "nftables.d.absent",
+                             "ufw.absent", "nftables.conf.absent", "nft-ruleset.nft.unavailable",
+                             "ufw-status.txt.unavailable", "ssh-allowlist.service.d.absent"):
+                    (backup / name).touch()
+                persistent = [root / "system/etc/systemd/system" / (target + ".wants/ssh-allowlist.service")
+                              for target in ("multi-user.target", "sysinit.target")]
+                runtime = root / "system/run/systemd/system/sysinit.target.wants/ssh-allowlist.service"
+                unrelated = root / "system/etc/systemd/system/sysinit.target.wants/unrelated.service"
+                for path in (*persistent, runtime, unrelated):
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("fixture")
+                body = module.recovery_commands(str(backup))[1].split("<<'SSH_RECOVERY_PY'\n", 1)[1].rsplit("SSH_RECOVERY_PY", 1)[0]
+                body = body.replace('ROOT = Path("/")', "ROOT = Path(" + repr(str(root / "system")) + ")")
+                calls, run = self.controller()
+                with patch.object(sys, "argv", ["recovery", str(backup)]), \
+                     patch.object(shutil, "which", return_value=None), \
+                     patch.object(subprocess, "run", side_effect=run):
+                    exec(body, {})
+                self.assertIn(("systemctl", "enable", "--runtime", "ssh-allowlist.service"), calls)
+                self.assertTrue(all(not path.exists() for path in persistent))
+                self.assertTrue(runtime.exists())
+                self.assertTrue(unrelated.exists())
+
+    def test_loader_states_restore_links_with_offline_systemctl(self):
+        if os.name == "nt" or not shutil.which("systemctl"):
+            self.skipTest("真实离线启用链接验证需要 Linux systemctl --root")
+        real_run = subprocess.run
+        for module in (g.STAGE1, g.STAGE2):
+            for state in ("enabled", "enabled-runtime", "static"):
+                for install_target in ("multi-user.target", "sysinit.target", "custom.target"):
+                    with self.subTest(module=module.SCRIPT, state=state, target=install_target), tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp) / "system"
+                        backup = Path(tmp) / "backup"
+                        backup.mkdir()
+                        unit = "[Service]\nExecStart=/bin/true\n"
+                        if state != "static":
+                            unit += "[Install]\nWantedBy=" + install_target + "\n"
+                        for name, text in {"sshd_config": "Port 22\n", "backup-complete": "complete\n",
+                            "units.txt": "fixture", "ssh.socket.active": "active\n", "nftables.enabled": "not-found\n",
+                            "ssh-allowlist.active": "inactive\n", "ssh-allowlist.enabled": state + "\n",
+                            "ssh-allowlist.service": unit}.items():
+                            (backup / name).write_text(text)
+                        for name in ("sshd_config.d.absent", "ssh.socket.d.absent", "nftables.d.absent", "ufw.absent",
+                            "nftables.conf.absent", "nft-ruleset.nft.unavailable", "ufw-status.txt.unavailable", "ssh-allowlist.service.d.absent"):
+                            (backup / name).touch()
+                        system = root / "etc/systemd/system"
+                        system.mkdir(parents=True)
+                        loader = system / "ssh-allowlist.service"
+                        loader.write_text("[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=sysinit.target\n")
+                        for target in ("multi-user.target", "sysinit.target", "custom.target"):
+                            (system / target).write_text("[Unit]\n")
+                        # 本工具可能留下的新旧持久链接；enabled 的原目标也保留在初始夹具中。
+                        for target in {"multi-user.target", "sysinit.target"} | ({install_target} if state == "enabled" else set()):
+                            link = system / (target + ".wants/ssh-allowlist.service")
+                            link.parent.mkdir(exist_ok=True)
+                            link.symlink_to("../ssh-allowlist.service")
+                        runtime = root / ("run/systemd/system/" + install_target + ".wants/ssh-allowlist.service")
+                        if state == "enabled-runtime":
+                            runtime.parent.mkdir(parents=True)
+                            runtime.symlink_to(loader)
+                        unrelated = system / "sysinit.target.wants/unrelated.service"
+                        unrelated.symlink_to("/unrelated-intentionally-dangling.service")
+                        calls, fake_run = self.controller()
+                        def run(args, **kwargs):
+                            if args[0] == "cp":
+                                Path(args[-1]).parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(args[-2], args[-1])
+                                return subprocess.CompletedProcess(args, 0, "", "")
+                            if tuple(args[:2]) in (("systemctl", "enable"), ("systemctl", "disable")):
+                                return real_run(["systemctl", "--root", str(root), *args[1:]], **kwargs)
+                            return fake_run(args, **kwargs)
+                        body = module.recovery_commands(str(backup))[1].split("<<'SSH_RECOVERY_PY'\n", 1)[1].rsplit("SSH_RECOVERY_PY", 1)[0]
+                        body = body.replace('ROOT = Path("/")', "ROOT = Path(" + repr(str(root)) + ")")
+                        with patch.object(sys, "argv", ["recovery", str(backup)]), patch.object(shutil, "which", return_value=None), \
+                             patch.object(subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
+                            exec(body, {})
+                        persistent = {p.parent.name.removesuffix(".wants") for p in system.glob("*.wants/ssh-allowlist.service") if p.is_symlink()}
+                        self.assertEqual(persistent, {install_target} if state == "enabled" else set())
+                        self.assertTrue(unrelated.is_symlink())
+                        if state == "enabled-runtime":
+                            self.assertTrue(runtime.is_symlink())
+                        result = real_run(["systemctl", "--root", str(root), "is-enabled", "ssh-allowlist.service"], capture_output=True, text=True)
+                        self.assertEqual(result.stdout.strip(), state, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
