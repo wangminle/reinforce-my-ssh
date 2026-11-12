@@ -92,7 +92,8 @@ def make_stub(module, *, session_port=22, session_source="203.0.113.9", journal_
     system.can("nft list tables", "table inet sshguard\n")
     if ufw_active:
         system.can("ufw status verbose", ufw_text or
-                   "Status: active\n\nTo Action From\n-- ----- ----\n62207/tcp ALLOW 203.0.113.0/24\n62207/tcp DENY Anywhere\n")
+                   "Status: active\n\nTo Action From\n-- ----- ----\n62207/tcp ALLOW 203.0.113.0/24\n62207/tcp DENY Anywhere\n"
+                   "62207/tcp (v6) DENY Anywhere (v6)\n")
     else:
         system.can("ufw status verbose", "Status: inactive\n")
 
@@ -431,7 +432,7 @@ class TestStage2Steps(unittest.TestCase):
     def test_ufw_tailnet_then_deny_closes_public(self):
         text = ("Status: active\n\nTo Action From\n-- ----- ----\n"
                 "62207/tcp on tailscale0 ALLOW Anywhere\n"
-                "62207/tcp DENY Anywhere\n")
+                "62207/tcp DENY Anywhere\n62207/tcp (v6) DENY Anywhere (v6)\n")
         _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
                                     session_port=62207, listeners=[62207], backup=True,
                                     ufw_active=True, ufw_text=text, extra=["--tailnet", "--tailnet-session-confirmed"])
@@ -520,8 +521,9 @@ class TestStage2Steps(unittest.TestCase):
 
     def test_mixed_ufw_sources_can_complete(self):
         text = ("Status: active\n62207/tcp on tailscale0 ALLOW Anywhere\n"
+                "62207/tcp (v6) on tailscale0 ALLOW Anywhere (v6)\n"
                 "62207/tcp ALLOW 10.20.0.0/16\n62207/tcp ALLOW 203.0.113.9\n"
-                "62207/tcp ALLOW 2001:db8::9\n62207/tcp DENY Anywhere\n")
+                "62207/tcp ALLOW 2001:db8::9\n62207/tcp DENY Anywhere\n62207/tcp (v6) DENY Anywhere (v6)\n")
         _, _, _, steps = self.mixed([], ufw_active=True, ufw_text=text)
         self.assertTrue(all(s["status"] == "done" for s in steps.values()), steps)
 

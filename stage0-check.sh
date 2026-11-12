@@ -7,6 +7,7 @@
 #   1. 采集当前系统事实（会话、监听、认证、防火墙、账户、备份、旧版痕迹、重启证据）；
 #   2. 对照声明的目标（--port/--user/--allow）判断当前处于加固流程的哪一步；
 #   3. 打印下一步应运行的指导脚本（stage1-port-key.sh / stage2-lockdown.sh）。
+# UFW 证据按 IPv4/IPv6 分开：未知规则保守不通过，tailnet 须有双族完整接口放行。
 # 所有建议命令由操作员本人（或其监督下的智能体）手工执行。
 #
 # 退出码：0=未声明目标且采集完成，或已声明目标全部达成；
@@ -393,28 +394,6 @@ def account_facts(system, user):
 
 # ---------------------------------------------------------------- 防火墙
 
-def nft_ruleset_summary(system):
-    """nft -j list ruleset 的指导级摘要：表、input 策略、与 dport/saddr 相关的规则。"""
-    summary = {"tables": [], "input_policy": [], "rules": [], "raw_rule_count": 0}
-    js = json.loads(system.run("nft", "-j", "list", "ruleset"))
-    for item in js.get("nftables", []):
-        if "table" in item:
-            summary["tables"].append(item["table"].get("family", "?") + " " + item["table"].get("name", "?"))
-        if "chain" in item and item["chain"].get("hook") == "input":
-            summary["input_policy"].append("%s %s chain %s policy=%s" % (
-                item["chain"].get("family"), item["chain"].get("table"),
-                item["chain"].get("name"), item["chain"].get("policy", "?")))
-        if "rule" in item:
-            summary["raw_rule_count"] += 1
-            digest = rule_digest(item["rule"])
-            if digest:
-                summary["rules"].append({
-                    "location": "%s %s chain %s" % (item["rule"].get("family"), item["rule"].get("table"), item["rule"].get("chain")),
-                    **digest,
-                })
-    return summary
-
-
 def literal_values(value):
     """nft JSON 右值可能是标量、列表或 {"set": [...]}；统一为字面量列表。"""
     if isinstance(value, dict):
@@ -436,47 +415,179 @@ def literal_values(value):
 
 
 def rule_digest(rule):
+    """保留匹配约束；未知表达式不能被消去后冒充无条件规则。"""
     verdict = None
     dports, saddrs, ct_state, iifs = set(), set(), set(), set()
-    iif_negated, iif_unknown = False, False
+    protocols, versions = {"tcp", "udp", "other"}, {4, 6}
+    supported, iif_negated, iif_unknown = True, False, False
+    port_supported, seen_payloads = True, set()
     for expr in rule.get("expr", []):
-        if "accept" in expr:
-            verdict = "accept"
-        elif "drop" in expr:
-            verdict = "drop"
-        elif "reject" in expr:
-            verdict = "reject"
-        if "match" in expr or "v" in expr:
-            node = expr.get("match", expr)
-            left, right = node.get("left", {}), node.get("right", {})
-            if isinstance(left, dict) and "payload" in left:
-                payload = left["payload"]
-                field = payload.get("field")
-                values = [str(v) for v in literal_values(right)]
-                if field == "dport" and payload.get("protocol") in ("tcp", "udp"):
-                    dports.update(values)
-                if field == "saddr" and payload.get("protocol") in ("ip", "ip6"):
-                    saddrs.update(values)
-            if isinstance(left, dict) and "ct" in left and left["ct"].get("key") == "state":
-                ct_state.update(str(v) for v in literal_values(right))
-            if isinstance(left, dict) and "meta" in left and left["meta"].get("key") in ("iifname", "iif"):
-                values = literal_values(right)
-                if (left["meta"]["key"] == "iifname" and values
-                        and all(isinstance(v, str) and not v.startswith("@") for v in values)
-                        and node.get("op") in (None, "==", "!=", "in")):
+        if any(key in expr for key in ("accept", "drop", "reject")):
+            verdict = next(key for key in ("accept", "drop", "reject") if key in expr)
+            continue
+        if "counter" in expr or "log" in expr:
+            continue
+        if "match" not in expr:
+            supported = False
+            continue
+        node = expr["match"]
+        left, right, op = node.get("left", {}), node.get("right"), node.get("op", "==")
+        values = literal_values(right)
+        positive = op in ("==", "in") and bool(values)
+        if not isinstance(left, dict):
+            supported = False
+            continue
+        if "payload" in left:
+            payload = left["payload"]
+            field, proto = payload.get("field"), payload.get("protocol")
+            if (proto, field) in seen_payloads:
+                supported = False
+            seen_payloads.add((proto, field))
+            if field == "dport" and proto in ("tcp", "udp"):
+                protocols &= {proto}
+                dports.update(str(v) for v in values)
+                port_supported &= positive and all(str(v).isdigit() and 1 <= int(v) <= 65535 for v in values)
+                supported &= port_supported
+            elif field == "saddr" and proto in ("ip", "ip6"):
+                versions &= {4 if proto == "ip" else 6}
+                saddrs.update(str(v) for v in values)
+                supported &= positive
+            else:
+                supported = False
+        elif "ct" in left and left["ct"].get("key") == "state":
+            ct_state.update(str(v) for v in values)
+            supported &= positive
+        elif "meta" in left:
+            key = left["meta"].get("key")
+            if key in ("iifname", "iif"):
+                if (key == "iifname" and values and all(isinstance(v, str) and not v.startswith("@") for v in values)
+                        and op in ("==", "in", "!=")):
                     iifs.update(v.strip('"') for v in values)
                 else:
-                    # 数值索引不能证明实际入口；即使右值无法解析，也不得抹掉接口条件。
                     iif_unknown = True
                     iifs.add("unresolved:" + json.dumps(left["meta"]) + ":" + json.dumps(right))
-                if node.get("op") == "!=":
-                    iif_negated = True
-    if verdict is None and not dports and not saddrs:
-        return None
+                iif_negated |= op == "!="
+            elif key == "nfproto" and positive and all(v in ("ipv4", "ipv6") for v in values):
+                versions &= {4 if v == "ipv4" else 6 for v in values}
+            elif key == "l4proto" and positive and all(v in ("tcp", "udp", 6, 17) for v in values):
+                protocols &= {"tcp" if v in ("tcp", 6) else "udp" for v in values}
+            else:
+                supported = False
+        else:
+            supported = False
     return {"verdict": verdict, "dports": sorted(dports), "saddrs": sorted(saddrs),
             "ct_state": sorted(ct_state), "iifs": sorted(iifs), "iif_negated": iif_negated,
-            "iif_unknown": iif_unknown,
-            "loopback": "lo" in iifs}
+            "iif_unknown": iif_unknown, "loopback": "lo" in iifs,
+            "protocols": sorted(protocols), "versions": sorted(versions),
+            "conditions_supported": bool(supported), "port_supported": bool(port_supported)}
+
+
+def nft_ruleset_summary(system):
+    summary = {"tables": [], "input_policy": [], "rules": [], "chains": [], "raw_rule_count": 0}
+    js = json.loads(system.run("nft", "-j", "list", "ruleset"))
+    for item in js.get("nftables", []):
+        if "table" in item:
+            summary["tables"].append(item["table"].get("family", "?") + " " + item["table"].get("name", "?"))
+        if "chain" in item:
+            chain = item["chain"]
+            summary["chains"].append(chain)
+            if chain.get("hook") == "input":
+                summary["input_policy"].append("%s %s chain %s policy=%s" % (
+                    chain.get("family"), chain.get("table"), chain.get("name"), chain.get("policy", "?")))
+        if "rule" in item:
+            rule = item["rule"]
+            summary["raw_rule_count"] += 1
+            summary["rules"].append({
+                "location": "%s %s chain %s" % (rule.get("family"), rule.get("table"), rule.get("chain")),
+                "identity": [rule.get(key) for key in ("family", "table", "chain")],
+                "handle": rule.get("handle"), "comment": rule.get("comment"), **rule_digest(rule)})
+    return summary
+
+
+def nft_allowlist_assessment(summary, port, allows, tailnet=False):
+    """只证明受支持的 input 基链；不遍历 jump/goto，不跨链拼接放行与拒绝。"""
+    networks = [ipaddress.ip_network(item) for item in allows]
+    proven, notes = set(), []
+    saw_rules = False
+    for chain in summary.get("chains", []):
+        family = chain.get("family")
+        if (chain.get("hook") != "input" or family not in ("ip", "ip6", "inet")
+                or chain.get("type", "filter") != "filter" or chain.get("dev")):
+            continue
+        identity = [family, chain.get("table"), chain.get("name")]
+        rules = [rule for rule in summary.get("rules", []) if rule.get("identity") == identity]
+        for version in ({4, 6} if family == "inet" else {4 if family == "ip" else 6}):
+            accepted, tn_accept, closed, issues = [], False, False, []
+            for rule in rules:
+                if version not in rule.get("versions", []):
+                    continue
+                if "tcp" not in rule.get("protocols", []):
+                    continue
+                if rule["dports"] and str(port) not in rule["dports"] and rule.get("port_supported"):
+                    continue
+                saw_rules = True
+                if not rule.get("conditions_supported") or rule.get("iif_unknown"):
+                    issues.append("存在无法可靠解释的匹配/控制流条件")
+                    continue
+                states = set(rule["ct_state"])
+                if states and states <= {"established", "related"}:
+                    continue  # 已建立会话不是新连接的放行或拒绝证据。
+                if states:
+                    issues.append("连接状态限制需人工复核")
+                    continue
+                if rule["iifs"] == ["lo"] and not rule["iif_negated"]:
+                    continue
+                if rule["verdict"] == "accept":
+                    if rule["iifs"] == ["tailscale0"] and not rule["iif_negated"] and not rule["saddrs"] and tailnet:
+                        tn_accept = True
+                        continue
+                    if rule["iifs"]:
+                        issues.append("未证实全部声明来源：接口限定或否定条件")
+                        continue
+                    if not rule["saddrs"]:
+                        issues.append("accept 无来源限制")
+                    for literal in rule["saddrs"]:
+                        try:
+                            net = ipaddress.ip_network(literal)
+                        except ValueError:
+                            issues.append("无法解析来源 " + literal)
+                            continue
+                        if net.version != version:
+                            continue
+                        if any(net.version == declared.version and net.subnet_of(declared) for declared in networks):
+                            accepted.append(net)
+                        else:
+                            issues.append("来源 " + literal + " 超出声明白名单")
+                elif rule["verdict"] in ("drop", "reject"):
+                    interface_ok = not rule["iifs"] or (rule["iifs"] == ["tailscale0"]
+                        and rule["iif_negated"] and tailnet and tn_accept)
+                    if not rule["saddrs"] and interface_ok:
+                        closed = True
+                        break  # 此链后续规则不能让已被拒绝的新连接重新放行。
+                    issues.append("受限拒绝不能证明默认拒绝或后续来源可达")
+                else:
+                    issues.append("未知判决或链跳转需人工复核")
+            closed |= chain.get("policy") == "drop"
+            required = [net for net in networks if net.version == version]
+            merged = list(ipaddress.collapse_addresses(accepted))
+            missing = [str(net) for net in required if not any(net.subnet_of(item) for item in merged)]
+            if tailnet and not tn_accept:
+                missing.append("tailscale0")
+            if not issues and closed and not missing:
+                proven.add(version)
+            else:
+                if missing:
+                    issues.append("未证实全部声明来源放行（含规则顺序）：" + ", ".join(missing))
+                if not closed:
+                    issues.append("未发现默认拒绝/drop")
+                notes.extend("IPv%d %s：%s" % (version, chain.get("name"), detail) for detail in issues)
+    if proven == {4, 6}:
+        return {"status": PASS, "detail": ("tailscale0 放行；" if tailnet else "")
+                + "TCP IPv4/IPv6 均有 input 基链内的完整白名单与默认拒绝证据；新连接仍须外部验证"}
+    if not saw_rules and not proven:
+        return {"status": UNKNOWN, "detail": "未发现涉及目标端口的有效 input 基链证据；无法证实白名单"}
+    missing_versions = ", ".join("IPv%d" % version for version in sorted({4, 6} - proven))
+    return {"status": FAIL, "detail": "未证实 " + missing_versions + " 白名单：" + "；".join(notes[:6])}
 
 
 def ufw_status(system):
@@ -488,69 +599,116 @@ def ufw_status(system):
     return {"available": True, "active": active, "text": text.strip()}
 
 
+UFW_VERDICTS = {"ALLOW": "allow", "LIMIT": "allow", "DENY": "deny", "REJECT": "deny"}
+
+
+def ufw_rules(text, port):
+    """按 ufw status 的行序解析入站规则。
+
+    covers：True=规则覆盖目标端口（单端口、范围、列表、全端口均算）；False=与目标 TCP 端口无关；
+    None=无法可靠判断（应用名、目的地址限定、来源端口等）；既不能证明关闭，也不能忽略其遮挡后续放行的风险。
+    """
+    def spec_covers(spec):
+        match = re.fullmatch(r"(\d+(?::\d+)?(?:,\d+(?::\d+)?)*)(?:/(tcp|udp))?", spec)
+        if not match:
+            return None
+        if match.group(2) == "udp":
+            return False
+        for item in match.group(1).split(","):
+            low, _, high = item.partition(":")
+            if int(low) <= port <= int(high or low):
+                return True
+        return False
+
+    def is_address(value):
+        try:
+            ipaddress.ip_network(value, strict=False)
+            return True
+        except ValueError:
+            return False
+
+    rules = []
+    for raw in text.splitlines():
+        tokens = raw.split("#", 1)[0].split()
+        index = next((i for i, token in enumerate(tokens) if token in UFW_VERDICTS), None)
+        if index is None:
+            continue
+        left, right = tokens[:index], tokens[index + 1:]
+        direction = right.pop(0) if right and right[0] in ("IN", "OUT", "FWD") else None
+        if direction in ("OUT", "FWD") or "(out)" in right:
+            continue
+        family = 6 if "(v6)" in tokens else 4
+        left = [item for item in left if item != "(v6)"]
+        right = [item for item in right if item not in ("(v6)", "(log)", "(log-all)")]
+        iface, malformed = None, False
+        if "on" in left:
+            at = left.index("on")
+            malformed = at + 1 >= len(left)
+            iface = None if malformed else left[at + 1]
+            left = left[:at] + left[at + 2:]
+        source = right[0] if right else None
+        if source and ":" in source:
+            family = 6
+        if len(left) == 1 and re.fullmatch(r"Anywhere(?:/(?:tcp|udp))?", left[0]):
+            covers = left[0] != "Anywhere/udp"
+        elif len(left) == 1:
+            covers = spec_covers(left[0])
+        elif len(left) == 2 and is_address(left[0]):
+            covers = False if spec_covers(left[1]) is False else None
+        else:
+            covers = None
+        if malformed:
+            covers = None
+        rules.append({"covers": covers, "verdict": UFW_VERDICTS[tokens[index]], "iface": iface,
+                      "family": family, "source": source, "extra": source is None or len(right) > 1,
+                      "line": " ".join(tokens)})
+    return rules
+
+
 def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
     """核对全部声明来源与默认拒绝；复杂条件和拒绝后的放行不作为可达证据。"""
     if not allows and not tailnet:
         return {"status": UNKNOWN, "detail": "未声明 --allow，不判定白名单合规"}
+    if not ufw.get("active"):
+        return nft_allowlist_assessment(nft_summary, port, allows, tailnet)
     networks = [ipaddress.ip_network(item) for item in allows]
     port_s = str(port)
-    offenders, restricting_drop, saw_accept, tailnet_accept = [], False, False, False
-    accepted, stopped = [], set()
-    for rule in nft_summary.get("rules", []):
-        if port_s not in rule["dports"]:
+    offenders, saw_accept = [], False
+    accepted, closed, stopped, tailnet_accepted = [], set(), set(), set()
+    for rule in ufw_rules(ufw.get("text", ""), port):
+        if rule["covers"] is False:
             continue
-        if rule["verdict"] == "accept":
+        version, iface, literal = rule["family"], rule["iface"], rule["source"]
+        # 未知拒绝也可能先匹配，不能消去后把后续 allow 当成可达证据（BUG-063）。
+        # 保守处理所有可能涉及目标端口的未知规则，明确无关的规则已在上方排除。
+        if rule["covers"] is None or rule["extra"]:
+            action = "放行" if rule["verdict"] == "allow" else "拒绝"
+            offenders.append("ufw：无法可靠解释涉及目标端口 " + port_s + " 的" + action
+                             + "规则「" + rule["line"] + "」，需人工核对规则顺序与声明来源可达性")
+            continue
+        if rule["verdict"] == "allow":
             saw_accept = True
-            reachable = rule["location"] not in stopped
-            if tailnet and "tailscale0" in rule.get("iifs", []) and not rule.get("iif_negated") and not rule.get("iif_unknown"):
-                tailnet_accept |= reachable
+            if tailnet and iface == "tailscale0":
+                # 每族须有无来源限制的接口放行；受限来源不能代表整个 tailnet（BUG-064）。
+                unrestricted = literal in ("Anywhere", "0.0.0.0/0" if version == 4 else "::/0")
+                if unrestricted and version not in stopped:
+                    tailnet_accepted.add(version)
                 continue
-            if not rule["saddrs"]:
-                offenders.append(rule["location"] + "：accept dport " + port_s + " 无来源限制")
-            for literal in rule["saddrs"]:
+            if literal in ("Anywhere", "::/0", "0.0.0.0/0"):
+                offenders.append("ufw：规则「" + rule["line"] + "」放行目标端口 " + port_s + " 且无来源限制")
+            else:
                 try:
                     net = ipaddress.ip_network(literal)
+                    if not any(net.version == d.version and net.subnet_of(d) for d in networks):
+                        offenders.append("ufw：来源 " + literal + " 超出声明白名单")
+                    elif not iface and version not in stopped:
+                        accepted.append(net)
                 except ValueError:
-                    offenders.append(rule["location"] + "：无法解析来源 " + literal)
-                    continue
-                if not any(net.version == declared.version and net.subnet_of(declared) for declared in networks):
-                    offenders.append(rule["location"] + "：来源 " + literal + " 超出声明白名单")
-                elif reachable and not rule.get("iifs") and not rule.get("iif_negated"):
-                    accepted.append(net)
-        if rule["verdict"] in ("drop", "reject"):
-            restricting_drop |= not rule["saddrs"] and not rule.get("iif_unknown") and (not rule.get("iifs") or rule.get("iif_negated", False))
-            # 拒绝之后的放行不能作为可达证据；复杂条件保守判为待复核。
-            stopped.add(rule["location"])
-    policy_drop = any("policy=drop" in item for item in nft_summary.get("input_policy", []))
-    if ufw.get("active"):
-        ufw_stopped = set()
-        for line in ufw.get("text", "").splitlines():
-            m = re.match(r"^%s(/tcp)?(?:\s+\(v6\))?(?:\s+on\s+(\S+))?\s+(ALLOW|DENY|REJECT)(?:\s+(IN|OUT|FWD))?\s+(\S+)" % re.escape(port_s), line.strip())
-            if not m:
-                continue
-            iface, verdict, direction, literal = m.group(2), m.group(3), m.group(4), m.group(5)
-            if direction in ("OUT", "FWD"):
-                continue
-            version = 6 if "(v6)" in line or ":" in literal else 4
-            if verdict == "ALLOW":
-                saw_accept = True
-                if tailnet and iface == "tailscale0":
-                    tailnet_accept |= version not in ufw_stopped
-                    continue
-                if literal in ("Anywhere", "::/0", "0.0.0.0/0"):
-                    offenders.append("ufw：ALLOW " + port_s + " 无来源限制")
-                else:
-                    try:
-                        net = ipaddress.ip_network(literal.split()[0])
-                        if not any(net.version == d.version and net.subnet_of(d) for d in networks):
-                            offenders.append("ufw：来源 " + literal + " 超出声明白名单")
-                        elif not iface and version not in ufw_stopped:
-                            accepted.append(net)
-                    except ValueError:
-                        offenders.append("ufw：无法解析来源 " + literal)
-            else:
-                restricting_drop |= not iface and literal in ("Anywhere", "::/0", "0.0.0.0/0")
-                ufw_stopped.add(version)
+                    offenders.append("ufw：无法解析来源 " + literal)
+        else:
+            if not iface and literal in ("Anywhere", "::/0", "0.0.0.0/0"):
+                closed.add(version)
+            stopped.add(version)
     if offenders:
         return {"status": FAIL, "detail": "；".join(offenders[:4])}
     if saw_accept:
@@ -559,16 +717,18 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
             merged = ipaddress.collapse_addresses(net for net in accepted if net.version == declared.version)
             if not any(declared.subnet_of(net) for net in merged):
                 missing.append(str(declared))
-        if tailnet and not tailnet_accept:
-            missing.append("tailscale0")
+        if tailnet:
+            missing.extend("tailscale0 IPv%d 完整接口放行" % version
+                           for version in sorted({4, 6} - tailnet_accepted))
         if missing:
             return {"status": FAIL, "detail": "未证实全部声明来源放行（含规则顺序）：" + ", ".join(missing)}
-    if tailnet_accept and (restricting_drop or policy_drop):
-        return {"status": PASS, "detail": "tailscale0 放行，全部声明 CIDR 放行 + 默认拒绝；Tailscale SSH 与 sshd 仍需分开验证"}
-    if saw_accept and (restricting_drop or policy_drop):
-        return {"status": PASS, "detail": "运行规则字面量比较：目标端口仅对声明白名单放行且存在默认拒绝；集合/区间写法请人工复核证据"}
+    if saw_accept and {4, 6} <= closed:
+        if tailnet:
+            return {"status": PASS, "detail": "tailscale0 IPv4/IPv6 完整接口放行，全部声明 CIDR 放行 + IPv4/IPv6 均有拒绝规则；Tailscale SSH 与 sshd 仍需分开验证"}
+        return {"status": PASS, "detail": "运行规则按行序逐条比较（含端口范围/列表）：目标端口仅对声明白名单放行，且 IPv4/IPv6 均有拒绝规则；新连接仍须外部验证"}
     if saw_accept:
-        return {"status": FAIL, "detail": "存在放行规则但未发现默认拒绝/drop，白名单不成立"}
+        absent = ", ".join("IPv%d" % version for version in sorted({4, 6} - closed))
+        return {"status": FAIL, "detail": "存在放行规则但未发现 " + absent + " 的默认拒绝/drop 证据（UFW 需 IPV6=yes 才会同时写入 v6 规则），白名单不成立"}
     return {"status": UNKNOWN, "detail": "未发现涉及目标端口的放行规则；无法证实白名单"}
 
 
@@ -822,7 +982,7 @@ def assess(facts, options):
             add("禁止密码/键盘交互登录", FAIL, "PasswordAuthentication=%s KbdInteractiveAuthentication=%s" % (password, kbd))
         methods = first(effective, "authenticationmethods")
         pubkey = first(effective, "pubkeyauthentication")
-        if pubkey == "yes" and (methods in (None, "any") or "publickey" in (methods or "")):
+        if pubkey == "yes" and methods == "publickey":
             add("公钥认证可用", PASS, "PubkeyAuthentication yes，AuthenticationMethods %s" % (methods or "any"))
         elif pubkey is None:
             add("公钥认证可用", UNKNOWN, "无法读取有效配置（需要 sudo）")

@@ -6,6 +6,7 @@
 """
 from pathlib import Path
 import json
+import ipaddress
 import sys
 import types
 
@@ -142,8 +143,16 @@ def packet_nft(rules):
                                    "left": {"meta": {"key": "iifname"}}, "right": iif}})
         if dport is not None:
             expr.append({"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": dport}})
-        if saddr:
-            expr.append({"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "saddr"}}, "right": {"set": list(saddr)}}})
-        expr.append({verdict: None})
-        items.append({"rule": {"family": "inet", "table": "sshguard", "chain": "ssh_allow", "expr": expr}})
+        # 真实 nft 不允许把 IPv6 字面量塞进 ip saddr；混合来源须按族拆成两条规则。
+        groups = {}
+        for address in saddr or []:
+            groups.setdefault(ipaddress.ip_network(address).version, []).append(address)
+        for version, addresses in (groups.items() if groups else [(None, [])]):
+            body = list(expr)
+            if addresses:
+                body.append({"match": {"op": "==", "left": {"payload": {
+                    "protocol": "ip" if version == 4 else "ip6", "field": "saddr"}},
+                    "right": {"set": addresses}}})
+            body.append({verdict: None})
+            items.append({"rule": {"family": "inet", "table": "sshguard", "chain": "ssh_allow", "expr": body}})
     return json.dumps({"nftables": items})

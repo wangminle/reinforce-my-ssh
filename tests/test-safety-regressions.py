@@ -217,7 +217,7 @@ class TestSafetyRegressions(unittest.TestCase):
         self.assertLess(deny, delete)
         # 收口后的实际规则文本可以通过当前检查器。
         assessment = g.STAGE2.allowlist_assessment({"rules": [], "input_policy": []},
-            {"active": True, "text": "62207/tcp ALLOW 203.0.113.0/24\n62207/tcp DENY Anywhere"},
+            {"active": True, "text": "62207/tcp ALLOW 203.0.113.0/24\n62207/tcp DENY Anywhere\n62207/tcp (v6) DENY Anywhere (v6)"},
             62207, ["203.0.113.0/24"])
         self.assertEqual(assessment["status"], "pass")
 

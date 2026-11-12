@@ -6,14 +6,15 @@
 #   0. 救援通道演练确认（--rescue-confirmed，硬门槛）
 #   1. 手工全量备份（约定目录 /var/backups/ssh-hardening/）
 #   2. 建立/确认 sudo 组非 root 账户与公钥
+#   2b. 按 --tailnet 声明指导接入 Tailscale（可选，不代替 sshd 公钥会话验证）
 #   3. 开启新端口（旧端口原样保留）
 #   4. 从新端口外部公钥会话验证（硬门槛：必须从新端口会话重跑本脚本才解锁第 5 步）
 #   5. 关闭旧端口（需第 4 步已证实 + 救援通道已确认）
-# 逐步打印：当前步骤的状态确认、为什么、手工命令、验证命令与预期、手工撤销命令。
+# 默认聚焦当前步骤；--verbose 展开完整原因与手工恢复，JSON 始终保留全部步骤。
 # 所有命令由操作员本人（或其监督下的智能体）手工执行；重跑本脚本只读核对进度。
 #
-# 退出码：0=stage1 目标全部达成；1=阻断性异常（旧版残留、sshd 配置损坏、参数冲突）；
-#         2=步骤未全部完成或需要 sudo。
+# 退出码：0=stage1 目标全部达成；1=阻断性异常（旧版残留、sshd 配置损坏）；
+#         2=参数非法、步骤未全部完成或需要 sudo。
 # 设计文档：plans/DESIGN-v2.md。旧版自动执行体系已废弃，见 legacy/README.md。
 
 set -uo pipefail
@@ -507,6 +508,7 @@ def parse_args(argv):
     parser.add_argument("--tailnet-session-confirmed", action="store_true", help="已核实当前 SSH 会话确经 tailscale0 到 sshd；地址段不能代替入口证据")
     parser.add_argument("--reboot-confirmed", action="store_true", help="本次冷启动后已验证全部允许来源和拒绝来源的新连接；任何运行态变更后须重新验收")
     parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument("--verbose", action="store_true", help="展开完整清单、原因和手工恢复命令；默认只显示当前步骤")
     options = parser.parse_args(argv)
     if options.tailnet_session_confirmed and not options.tailnet:
         parser.error("--tailnet-session-confirmed 必须与 --tailnet 同用，且只声明本次实际入口")
@@ -854,6 +856,9 @@ def build_steps(system, options, ctx):
     port = options.port
     user = options.user
     old_port = ctx["old_port"]
+    # 账户修复与 tailnet 接入复用已知可用入口；none/未知旧端口不能凭空退回22。
+    entry_port = old_port if isinstance(old_port, int) else (
+        ctx["connection"]["port"] if ctx.get("connection") else port)
     sock = ctx["socket"]
     socket_activation = sock["load"] == "loaded" and sock["active"] == "active"
     restore_path = ctx["backup"].get("latest") or options.backup_dir + "/REPLACE_WITH_TIMESTAMP"
@@ -909,15 +914,15 @@ def build_steps(system, options, ctx):
     step("2-account", "sudo 组非 root 账户与公钥",
          DONE if account_ok else TODO,
          account_note,
-         "加固的终点是“只有非 root 账户 + 公钥”能登录。这一步先把新账户和公钥准备好并在旧端口上验证，之后才谈切端口。",
+         "加固的终点是“只有非 root 账户 + 公钥”能登录。这一步先把新账户和公钥准备好，在当前已知入口上验证后再继续。",
          ["# 服务器（账户不存在时）：",
           "sudo adduser --gecos '' " + user,
           "sudo usermod -aG sudo " + user,
           "# 客户端（本地机器）安装公钥，出现提示时输入该账户密码：",
-          "ssh-copy-id -i ~/.ssh/<你的公钥> -p " + (str(old_port) if isinstance(old_port, int) else "22") + " " + user + "@" + host,
+          "ssh-copy-id -i ~/.ssh/<你的公钥> -p " + str(entry_port) + " " + user + "@" + host,
           *permission_commands,
           "# 客户端验证公钥登录与 sudo（sudo 输密码属正常）：",
-          "ssh -i ~/.ssh/<你的私钥> -o PreferredAuthentications=publickey -o PasswordAuthentication=no -p " + (str(old_port) if isinstance(old_port, int) else "22") + " " + user + "@" + host + " 'sudo -v && echo SUDO_OK'"],
+          "ssh -i ~/.ssh/<你的私钥> -o PreferredAuthentications=publickey -o PasswordAuthentication=no -p " + str(entry_port) + " " + user + "@" + host + " 'sudo -v && echo SUDO_OK'"],
          ["重跑本脚本：本步骤应为“已完成”；账户权限异常会单独提示并给出 chmod/chown 命令"],
          ["sudo deluser --remove-home " + user + "  # 仅在决定放弃该账户时执行"])
 
@@ -938,7 +943,7 @@ def build_steps(system, options, ctx):
               "sudo tailscale up   # 按提示完成登录；需要验证 sshd 路径时不要加 --ssh",
               "# 管理台 Machines 页对本节点禁用 key expiry（默认 180 天后节点会被登出）",
               "# 客户端（另一台已入 tailnet 的设备）：",
-              "ssh -p " + (str(old_port) if isinstance(old_port, int) else "22") + " " + user + "@<本节点 tailnet 地址>   # 地址用 tailscale ip -4 查询；新端口在第 4 步再验证"],
+              "ssh -p " + str(entry_port) + " " + user + "@<本节点 tailnet 地址>   # 地址用 tailscale ip -4 查询；新端口在第 4 步再验证"],
              ["服务器：tailscale status 显示本节点；tailscale ip -4 返回 100.64.0.0/10 内的地址",
               "服务器：tailscale0 已启用（IFF_UP；TUN 的 operstate 可能显示 unknown）",
               "客户端：经 tailnet 用公钥登录成功（此时用当前/旧端口；新端口的公钥证明在第 4 步）"],
@@ -1164,15 +1169,19 @@ def render_text(ctx, options, steps):
               connection["local"], connection["port"], ctx["auth"] or "未证实"))
     else:
         print("当前会话：未检测到 SSH 连接（请从真实 SSH 会话运行本脚本）")
-    print("布局：%s" % ("ssh.socket 激活" if ctx["socket"]["active"] == "active" else "传统 sshd 服务"))
+    if options.verbose:
+        print("布局：%s" % ("ssh.socket 激活" if ctx["socket"]["active"] == "active" else "传统 sshd 服务"))
     tailnet = ctx.get("tailnet", {})
-    if tailnet.get("present"):
+    if options.verbose and tailnet.get("present"):
         print("tailscale0：%s（Tailscale SSH 不经过 sshd，不能作为 sshd 验证证据）" % (tailnet.get("state") or "状态不可读"))
-    elif options.tailnet:
+    elif options.tailnet and not tailnet.get("present"):
         print("tailscale0：未发现（已声明 --tailnet，请先完成 2b-tailnet）")
-    print("\n步骤清单：")
-    for item in steps:
-        print("  [%s] %s —— %s" % (STATUS_LABEL[item["status"]], item["title"], item["evidence"]))
+    completed = sum(item["status"] == DONE for item in steps)
+    print("\nstage1：已完成 %d/%d 项，剩余 %d 项。" % (completed, len(steps), len(steps) - completed))
+    if options.verbose:
+        print("\n步骤清单：")
+        for item in steps:
+            print("  [%s] %s —— %s" % (STATUS_LABEL[item["status"]], item["title"], item["evidence"]))
     current = next((item for item in steps if item["status"] != DONE), None)
     if current is None:
         print("\nstage1 目标全部达成。下一步（收紧：nft 白名单 / 禁 root / 禁密码）：")
@@ -1185,18 +1194,23 @@ def render_text(ctx, options, steps):
             print("  # " + command + " --allow REPLACE_WITH_TRUSTED_CIDR")
     else:
         print("\n当前步骤：%s（%s）" % (current["title"], STATUS_LABEL[current["status"]]))
+        print("  当前依据：" + current["evidence"])
         if current["blocked_by"]:
             print("  门槛未满足：" + "；".join(current["blocked_by"]) + " —— 先完成这些步骤再回来")
-        print("  为什么：" + current["why"])
+        if options.verbose:
+            print("  为什么：" + current["why"])
         print("  执行：")
         for line in current["do"]:
             print("    " + line if line else "")
         print("  验证：")
         for line in current["verify"]:
             print("    " + line)
-        print("  手工撤销（如需）：")
-        for line in current["undo"]:
-            print("    " + line)
+        if options.verbose:
+            print("  手工撤销（如需）：")
+            for line in current["undo"]:
+                print("    " + line)
+        else:
+            print("\n完整清单、原因和手工恢复命令：在原检查命令末尾加 --verbose（仅显示）。")
     if not ctx["sshd_valid"]:
         print("\n[阻断] sshd -t 失败：" + (ctx["sshd_error"] or ""))
     if ctx["match_blocks"]:
@@ -1205,10 +1219,12 @@ def render_text(ctx, options, steps):
         print("[信息] 旧版体系痕迹：" + "；".join(ctx["legacy_traces"][:8]))
     if ctx["legacy"]:
         print("[阻断] 旧版残留：" + "；".join(ctx["legacy"]))
-    print("\n常备纪律：")
-    print("- 每一步只做一件事，做完重跑本脚本核对，不跳步。")
-    print("- 保持当前会话不关；云安全组放行必须到云控制台人工完成。")
-    print("- 本脚本永远不会替你 reboot、reload、rollback 或安装任何东西。")
+    print("\n保持当前会话和救援控制台；只执行当前步骤，完成后建立新连接验证并重跑检查。")
+    if options.verbose:
+        print("\n常备纪律：")
+        print("- 每一步只做一件事，做完重跑本脚本核对，不跳步。")
+        print("- 保持当前会话不关；云安全组放行必须到云控制台人工完成。")
+        print("- 本脚本永远不会替你 reboot、reload、rollback 或安装任何东西。")
 
 
 def main(argv=None):

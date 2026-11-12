@@ -23,7 +23,7 @@ class TestReviewFixes(unittest.TestCase):
         for module in (g.STAGE0, g.STAGE2):
             for suffix in ("", " IN"):
                 with self.subTest(module=module.SCRIPT, direction=suffix):
-                    ufw = {"active": True, "text": "62207/tcp ALLOW%s 203.0.113.0/24\n62207/tcp DENY%s Anywhere\n" % (suffix, suffix)}
+                    ufw = {"active": True, "text": "62207/tcp ALLOW%s 203.0.113.0/24\n62207/tcp DENY%s Anywhere\n62207/tcp (v6) DENY%s Anywhere (v6)\n" % (suffix, suffix, suffix)}
                     result = module.allowlist_assessment({"rules": [], "input_policy": []}, ufw, 62207, ["203.0.113.0/24"])
                     self.assertEqual(result["status"], "pass", result)
 
@@ -36,7 +36,7 @@ class TestReviewFixes(unittest.TestCase):
                     self.assertNotEqual(result["status"], "pass")
 
     def test_ufw_tailnet_then_verbose_in_deny_closes_public(self):
-        ufw = {"active": True, "text": "62207/tcp on tailscale0 ALLOW IN Anywhere\n62207/tcp DENY IN Anywhere\n"}
+        ufw = {"active": True, "text": "62207/tcp on tailscale0 ALLOW IN Anywhere\n62207/tcp DENY IN Anywhere\n62207/tcp (v6) DENY IN Anywhere (v6)\n"}
         self.assertIs(g.STAGE2.ufw_public_verdict(ufw, 62207), False)
         for direction in ("OUT", "FWD"):
             with self.subTest(direction=direction):
