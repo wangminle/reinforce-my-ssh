@@ -640,7 +640,7 @@ class TestStage0Assessment(unittest.TestCase):
         self.assertTrue(report["read_only"])
         self.assertEqual(report["script"], "stage0-check.sh")
         self.assertIn(report["position"], {"goals-undeclared", "stage0", "stage1-progress", "stage1-done",
-                                           "hardened", "verified", "legacy-blocking"})
+                                           "hardened", "match-review", "verified", "legacy-blocking"})
         self.assertIn("next_step", report)
 
     def test_non_root_returns_2(self):

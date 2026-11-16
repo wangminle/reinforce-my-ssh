@@ -74,7 +74,7 @@ class TestTailnetEvidence(unittest.TestCase):
             for m in (g.STAGE0, g.STAGE2):
                 system = g.make_stub(m, session_source="100.64.1.9", session_port=62207,
                     listeners=[62207], disk_ports=(62207,), backup=True, auth=g.HARDENED_AUTH,
-                    allowlist_rules=g.ALLOW_RULES, hardening_mtime=999999999, tailnet=True,
+                    hardening_mtime=999999999, tailnet=True,
                     ufw_active=True, ufw_text=r.HEAD + allow + r.DENY_BOTH)
                 code, output = g.run_main(m, ["--port", "62207", "--user", "fenix", "--tailnet",
                     "--tailnet-session-confirmed", "--rescue-confirmed", "--reboot-confirmed",

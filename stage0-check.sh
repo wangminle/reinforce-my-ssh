@@ -29,6 +29,7 @@ export REINFORCE_SELF="$SELF_PATH"
 exec python3 - "$@" <<'REINFORCE_STAGE0_PY'
 """stage0-check.sh：只读现状检查与加固阶段定位；绝不修改系统。"""
 import argparse
+import fnmatch
 import ipaddress
 import json
 import os
@@ -307,12 +308,54 @@ def sshd_effective(system, config, context=None):
     return options
 
 
+def sshd_include_paths(system, pattern):
+    if not pattern.startswith("/"):
+        pattern = "/etc/ssh/" + pattern
+    if any(ch in pattern for ch in "*?["):
+        directory, _, name = pattern.rpartition("/")
+        if not directory:
+            return []
+        try:
+            names = system.list_dir(directory)
+        except EvidenceError:
+            return []
+        return [directory + "/" + item for item in names if fnmatch.fnmatch(item, name)]
+    return [pattern] if system.exists(pattern) else []
+
+
 def sshd_config_files(system):
     files = [SSHD_CONFIG]
+    seen = {SSHD_CONFIG}
     try:
-        files += [SSHD_CONFIG_D + "/" + name for name in system.list_dir(SSHD_CONFIG_D) if name.endswith(".conf")]
+        for name in system.list_dir(SSHD_CONFIG_D):
+            if name.endswith(".conf"):
+                path = SSHD_CONFIG_D + "/" + name
+                if path not in seen:
+                    files.append(path)
+                    seen.add(path)
     except EvidenceError:
         pass
+    queue = list(files)
+    depth = {path: 0 for path in files}
+    while queue:
+        current = queue.pop(0)
+        if depth[current] >= 16:
+            continue
+        try:
+            text = system.read(current)
+        except EvidenceError:
+            continue
+        for line in text.splitlines():
+            match = re.match(r"\s*Include(?:\s+|\s*=\s*)(.+)$", line, re.I)
+            if not match:
+                continue
+            for pattern in match.group(1).split("#", 1)[0].split():
+                for path in sshd_include_paths(system, pattern):
+                    if path not in seen:
+                        seen.add(path)
+                        files.append(path)
+                        depth[path] = depth[current] + 1
+                        queue.append(path)
     return files
 
 
@@ -321,7 +364,7 @@ def match_blocks(system):
     for path in sshd_config_files(system):
         try:
             for number, line in enumerate(system.read(path).splitlines(), 1):
-                if re.match(r"\s*Match\s", line):
+                if re.match(r"\s*Match(?:\s+|\s*=\s*)", line, re.I):
                     found.append("%s:%d %s" % (path, number, line.strip()))
         except EvidenceError:
             found.append(path + "（无法读取）")
@@ -333,7 +376,7 @@ def disk_port_directives(system):
     for path in sshd_config_files(system):
         try:
             for number, line in enumerate(system.read(path).splitlines(), 1):
-                m = re.match(r"\s*Port\s+(\d+)\s*(?:#.*)?$", line)
+                m = re.match(r"\s*Port(?:\s+|\s*=\s*)(\d+)\s*(?:#.*)?$", line, re.I)
                 if m:
                     ports.setdefault(int(m.group(1)), []).append("%s:%d" % (path, number))
         except EvidenceError:
@@ -394,23 +437,48 @@ def account_facts(system, user):
 
 # ---------------------------------------------------------------- 防火墙
 
-def literal_values(value):
-    """nft JSON 右值可能是标量、列表或 {"set": [...]}；统一为字面量列表。"""
+def literal_values(value, addresses=False):
+    """nft JSON 右值可能是标量、列表或 {"set": [...]}；统一为字面量列表。
+
+    集合或列表中任一元素不可解析时整体返回空，避免丢弃端口区间或未知来源后误判（BUG-074）。
+    """
     if isinstance(value, dict):
         if "prefix" in value:
             prefix = value["prefix"]
             return [str(prefix["addr"]) + "/" + str(prefix["len"])]
+        if "range" in value:
+            # nft 会把非对齐相邻网段合并为 {"range": [首, 末]}；仅来源地址场景展开为 CIDR，端口区间保持不可解释（BUG-066）。
+            if not addresses:
+                return []
+            try:
+                low, high = (ipaddress.ip_address(str(end)) for end in value["range"])
+                return [str(net) for net in ipaddress.summarize_address_range(low, high)]
+            except (ValueError, TypeError):
+                return []
         if "set" in value:
+            items = value["set"] if isinstance(value["set"], list) else [value["set"]]
+            if not items:
+                return []
             out = []
-            for item in value["set"] if isinstance(value["set"], list) else [value["set"]]:
-                out.extend(literal_values(item))
+            for item in items:
+                parts = literal_values(item, addresses)
+                if not parts:
+                    return []
+                out.extend(parts)
             return out
         return []
     if isinstance(value, list):
+        if not value:
+            return []
         out = []
         for item in value:
-            out.extend(literal_values(item))
+            parts = literal_values(item, addresses)
+            if not parts:
+                return []
+            out.extend(parts)
         return out
+    if value is None:
+        return []
     return [value]
 
 
@@ -450,8 +518,9 @@ def rule_digest(rule):
                 supported &= port_supported
             elif field == "saddr" and proto in ("ip", "ip6"):
                 versions &= {4 if proto == "ip" else 6}
-                saddrs.update(str(v) for v in values)
-                supported &= positive
+                addr_values = literal_values(right, addresses=True)
+                saddrs.update(str(v) for v in addr_values)
+                supported &= op in ("==", "in") and bool(addr_values)
             else:
                 supported = False
         elif "ct" in left and left["ct"].get("key") == "state":
@@ -504,10 +573,12 @@ def nft_ruleset_summary(system):
     return summary
 
 
-def nft_allowlist_assessment(summary, port, allows, tailnet=False):
+def nft_allowlist_assessment(summary, port, allows, tailnet=False, skip_uninterpretable=False):
     """只证明受支持的 input 基链；不遍历 jump/goto，不跨链拼接放行与拒绝。"""
-    networks = [ipaddress.ip_network(item) for item in allows]
-    proven, notes = set(), []
+    # nft 会合并相邻/重叠集合元素，声明网段同样折叠后再比较（BUG-066）。
+    networks = [net for version in (4, 6) for net in ipaddress.collapse_addresses(
+        ipaddress.ip_network(item) for item in allows if ipaddress.ip_network(item).version == version)]
+    proven, blocked, notes = set(), set(), []
     saw_rules = False
     for chain in summary.get("chains", []):
         family = chain.get("family")
@@ -518,6 +589,7 @@ def nft_allowlist_assessment(summary, port, allows, tailnet=False):
         rules = [rule for rule in summary.get("rules", []) if rule.get("identity") == identity]
         for version in ({4, 6} if family == "inet" else {4 if family == "ip" else 6}):
             accepted, tn_accept, closed, issues = [], False, False, []
+            skipped_uninterpretable, had_interpretable = False, False
             for rule in rules:
                 if version not in rule.get("versions", []):
                     continue
@@ -525,17 +597,22 @@ def nft_allowlist_assessment(summary, port, allows, tailnet=False):
                     continue
                 if rule["dports"] and str(port) not in rule["dports"] and rule.get("port_supported"):
                     continue
-                saw_rules = True
                 if not rule.get("conditions_supported") or rule.get("iif_unknown"):
+                    if skip_uninterpretable:
+                        skipped_uninterpretable = True
+                        continue
+                    saw_rules = True
                     issues.append("存在无法可靠解释的匹配/控制流条件")
                     continue
                 states = set(rule["ct_state"])
                 if states and states <= {"established", "related"}:
                     continue  # 已建立会话不是新连接的放行或拒绝证据。
+                if rule["iifs"] == ["lo"] and not rule["iif_negated"]:
+                    continue
+                saw_rules = True
+                had_interpretable = True
                 if states:
                     issues.append("连接状态限制需人工复核")
-                    continue
-                if rule["iifs"] == ["lo"] and not rule["iif_negated"]:
                     continue
                 if rule["verdict"] == "accept":
                     if rule["iifs"] == ["tailscale0"] and not rule["iif_negated"] and not rule["saddrs"] and tailnet:
@@ -567,6 +644,8 @@ def nft_allowlist_assessment(summary, port, allows, tailnet=False):
                     issues.append("受限拒绝不能证明默认拒绝或后续来源可达")
                 else:
                     issues.append("未知判决或链跳转需人工复核")
+            if skip_uninterpretable and skipped_uninterpretable and not had_interpretable:
+                continue
             closed |= chain.get("policy") == "drop"
             required = [net for net in networks if net.version == version]
             merged = list(ipaddress.collapse_addresses(accepted))
@@ -575,19 +654,24 @@ def nft_allowlist_assessment(summary, port, allows, tailnet=False):
                 missing.append("tailscale0")
             if not issues and closed and not missing:
                 proven.add(version)
+            elif not issues and not closed and not accepted and not tn_accept:
+                continue  # 与目标端口无关且默认放行的基链：不构成拦截，也不构成证明。
             else:
+                # 数据包须通过全部 input 基链：任何一条无法证实的链都可能拦截或放行过宽（BUG-065）。
+                blocked.add(version)
                 if missing:
                     issues.append("未证实全部声明来源放行（含规则顺序）：" + ", ".join(missing))
                 if not closed:
                     issues.append("未发现默认拒绝/drop")
                 notes.extend("IPv%d %s：%s" % (version, chain.get("name"), detail) for detail in issues)
-    if proven == {4, 6}:
+    if proven == {4, 6} and not blocked:
         return {"status": PASS, "detail": ("tailscale0 放行；" if tailnet else "")
                 + "TCP IPv4/IPv6 均有 input 基链内的完整白名单与默认拒绝证据；新连接仍须外部验证"}
-    if not saw_rules and not proven:
+    # blocked 非空说明已有链会拦截目标端口；不能退化成“未发现证据”的 unknown（BUG-081）。
+    if not saw_rules and not proven and not blocked:
         return {"status": UNKNOWN, "detail": "未发现涉及目标端口的有效 input 基链证据；无法证实白名单"}
-    missing_versions = ", ".join("IPv%d" % version for version in sorted({4, 6} - proven))
-    return {"status": FAIL, "detail": "未证实 " + missing_versions + " 白名单：" + "；".join(notes[:6])}
+    missing_versions = ", ".join("IPv%d" % version for version in sorted(({4, 6} - proven) | blocked))
+    return {"status": FAIL, "detail": "未证实 " + missing_versions + " 白名单（数据包须通过全部 input 基链）：" + "；".join(notes[:6])}
 
 
 def ufw_status(system):
@@ -724,8 +808,13 @@ def allowlist_assessment(nft_summary, ufw, port, allows, tailnet=False):
             return {"status": FAIL, "detail": "未证实全部声明来源放行（含规则顺序）：" + ", ".join(missing)}
     if saw_accept and {4, 6} <= closed:
         if tailnet:
-            return {"status": PASS, "detail": "tailscale0 IPv4/IPv6 完整接口放行，全部声明 CIDR 放行 + IPv4/IPv6 均有拒绝规则；Tailscale SSH 与 sshd 仍需分开验证"}
-        return {"status": PASS, "detail": "运行规则按行序逐条比较（含端口范围/列表）：目标端口仅对声明白名单放行，且 IPv4/IPv6 均有拒绝规则；新连接仍须外部验证"}
+            result = {"status": PASS, "detail": "tailscale0 IPv4/IPv6 完整接口放行，全部声明 CIDR 放行 + IPv4/IPv6 均有拒绝规则；仍须通过 tailnet 地址验证系统 OpenSSH 新连接"}
+        else:
+            result = {"status": PASS, "detail": "运行规则按行序逐条比较（含端口范围/列表）：目标端口仅对声明白名单放行，且 IPv4/IPv6 均有拒绝规则；新连接仍须外部验证"}
+        nft = nft_allowlist_assessment(nft_summary, port, allows, tailnet, skip_uninterpretable=True)
+        if nft["status"] == FAIL:
+            return {"status": FAIL, "detail": result["detail"] + "；同时存在可解释的 nft input 基链未通过：" + nft["detail"]}
+        return result
     if saw_accept:
         absent = ", ".join("IPv%d" % version for version in sorted({4, 6} - closed))
         return {"status": FAIL, "detail": "存在放行规则但未发现 " + absent + " 的默认拒绝/drop 证据（UFW 需 IPV6=yes 才会同时写入 v6 规则），白名单不成立"}
@@ -848,6 +937,10 @@ def reboot_facts(system):
     try:
         facts["btime"] = int(re.search(r"^btime (\d+)$", system.read("/proc/stat"), re.M)[1])
         facts["boot_time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(facts["btime"]))
+        try:
+            facts["boot_id"] = system.read("/proc/sys/kernel/random/boot_id").strip()
+        except EvidenceError:
+            pass
         hardened = set(sshd_config_files(system))
         for path in ("/etc/nftables.conf", "/etc/systemd/system/ssh-allowlist.service"):
             if system.exists(path):
@@ -903,7 +996,8 @@ def parse_args(argv):
     if options.user is not None and not re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", options.user):
         parser.error("--user 必须是合法账户名")
     try:
-        options.allow = sorted({str(ipaddress.ip_network(item, strict=True)) for item in options.allow})
+        options.allow = sorted(str(net) for version in (4, 6) for net in ipaddress.collapse_addresses(
+            net for net in {ipaddress.ip_network(item, strict=True) for item in options.allow} if net.version == version))
     except ValueError as exc:
         parser.error(str(exc))
     if options.host and not re.fullmatch(r"[A-Za-z0-9_.:\[\]-]+", options.host):
@@ -995,7 +1089,8 @@ def assess(facts, options):
 
     if options.allow or options.tailnet:
         wl = facts.get("allowlist", {})
-        add("来源白名单", wl.get("status", UNKNOWN), wl.get("detail", "未评估"))
+        add("来源白名单", wl.get("status", UNKNOWN),
+            wl.get("detail", "未声明 --port，无法评估指定端口白名单" if options.port is None else "未评估"))
 
     tailnet = facts.get("tailnet", {})
     if options.tailnet:
@@ -1031,8 +1126,18 @@ def assess(facts, options):
     def not_failed(value):
         return value is not False
 
-    stage1_done = user_ok is True and not_failed(port_ok) and not_failed(old_ok)
-    hardened_done = stage1_done and auth_ok is True and not_failed(allow_ok)
+    tailnet_ok = ok("Tailscale 接入") if "Tailscale 接入" in statuses else None
+    backup_ok = ok("手工备份")
+    declared = bool(options.port or options.user or options.allow or options.closed_port or options.tailnet)
+    match_blocks_found = list(facts.get("match_blocks") or [])
+    if match_blocks_found and declared:
+        add("Match 块", WARN, "存在 Match 块，有效配置随上下文变化，须逐块人工复核后才能宣告完成：" + "; ".join(match_blocks_found[:3]))
+    match_ok = not match_blocks_found
+    # Tailscale 接入与手工备份是 stage1 的成果；缺失时不能报告 stage1 已完成或已验证（BUG-069）。
+    stage1_done = (user_ok is True and not_failed(port_ok) and not_failed(old_ok)
+                   and not_failed(tailnet_ok) and backup_ok)
+    auth_allow_done = stage1_done and auth_ok is True and not_failed(allow_ok)
+    hardened_done = auth_allow_done and match_ok
 
     reboot = facts.get("reboot", {})
     reboot_ok = False
@@ -1045,12 +1150,14 @@ def assess(facts, options):
 
     if facts.get("legacy", {}).get("blocking"):
         position = "legacy-blocking"
-    elif not goals_port and not options.user:
+    elif goals_port is None or not goals_user or goals_user == "root":
         position = "goals-undeclared"
     elif hardened_done and reboot_ok:
         position = "verified"
     elif hardened_done:
         position = "hardened"
+    elif auth_allow_done:
+        position = "match-review"
     elif stage1_done:
         position = "stage1-done"
     elif user_ok is not None or port_ok is not None:
@@ -1070,6 +1177,9 @@ def assess(facts, options):
         stage1_cmd += " --host " + shlex.quote(options.host)
     if options.tailnet:
         stage1_cmd += " --tailnet"
+    for flag in ("rescue_confirmed", "tailnet_session_confirmed", "reboot_confirmed"):
+        if getattr(options, flag):
+            stage1_cmd += " --" + flag.replace("_", "-")
     stage2_cmd = "sudo bash %s --port %s --user %s" % (
         shlex.quote(entry_dir() + "/" + STAGE2),
         goals_port if goals_port is not None else "NEW_PORT",
@@ -1093,12 +1203,33 @@ def assess(facts, options):
     if position == "legacy-blocking":
         next_step = {"summary": "先处置旧版残留，再开始新流程", "commands": []}
     elif position == "goals-undeclared":
-        next_step = {"summary": "声明目标后重新检查以定位进度，例如：", "commands": [
-            "sudo bash %s/%s --port 2222 --user deploy --allow 203.0.113.0/24 --closed-port 22" % (entry_dir(), SCRIPT)]}
+        example = "sudo bash %s --port %s --user %s" % (
+            shlex.quote(entry_dir() + "/" + SCRIPT),
+            goals_port if goals_port is not None else "2222",
+            shlex.quote(goals_user) if (goals_user and goals_user != "root") else "deploy")
+        if options.allow:
+            example += "".join(" --allow " + shlex.quote(cidr) for cidr in options.allow)
+        elif not options.tailnet:
+            example += " --allow 203.0.113.0/24"
+        if options.closed_port:
+            example += "".join(" --closed-port %d" % port for port in options.closed_port)
+        elif goals_port is None:
+            example += " --closed-port 22"
+        if options.tailnet:
+            example += " --tailnet"
+        if options.host:
+            example += " --host " + shlex.quote(options.host)
+        if options.backup_dir != BACKUP_ROOT:
+            example += " --backup-dir " + shlex.quote(options.backup_dir)
+        next_step = {"summary": "声明完整目标（必须含 --port 与非 root --user）后重新检查以定位进度，例如：",
+                     "commands": [example]}
     elif position in ("stage0", "stage1-progress"):
         next_step = {"summary": "运行 stage1 指导（切端口、装公钥、验证 sudo 用户）：", "commands": [stage1_cmd]}
     elif position == "stage1-done":
         next_step = {"summary": "stage1 目标已达成；运行 stage2 指导（nft 白名单、禁 root、禁密码、最终确认）：", "commands": [stage2_cmd]}
+    elif position == "match-review":
+        next_step = {"summary": "配置已达标，但存在 Match 块使有效配置随上下文变化；先逐块人工复核（sshd -T -C 指定各上下文），再运行 stage2 做最终确认：",
+                     "commands": [stage2_cmd]}
     elif position == "hardened":
         next_step = {"summary": "配置已达标但尚未跨重启验证；运行 stage2 指导完成第 4 步（重启复验）：", "commands": [stage2_cmd]}
     else:
@@ -1113,6 +1244,7 @@ POSITION_TEXT = {
     "stage1-progress": "stage1 进行中（账户/端口未完全就绪）",
     "stage1-done": "stage1 目标已达成（认证尚未收紧）",
     "hardened": "stage2 配置已达标（待跨重启验证）",
+    "match-review": "配置已达标，但存在 Match 块（待人工复核）",
     "verified": "已完成并通过跨重启验证",
 }
 
@@ -1170,10 +1302,11 @@ def collect(system, options):
             connection = facts["session"].get("connection")
             addr = connection["source"] if connection else "192.0.2.1"
             laddr = connection["local"] if connection else ("127.0.0.1" if ipaddress.ip_address(addr).version == 4 else "::1")
-            base_context = "user=%s,host=stage0.invalid,addr=%s" % (
-                options.user or facts["session"].get("sudo_user") or "root", addr)
+            lport = connection["port"] if connection else (options.port or 22)
+            base_context = "user=%s,host=stage0.invalid,addr=%s,laddr=%s,lport=%d" % (
+                options.user or facts["session"].get("sudo_user") or "root", addr, laddr, lport)
             facts["effective"] = {"user_context": sshd_effective(system, SSHD_CONFIG, base_context)}
-            root_context = "user=root,host=stage0.invalid,addr=%s" % addr
+            root_context = "user=root,host=stage0.invalid,addr=%s,laddr=%s,lport=%d" % (addr, laddr, lport)
             facts["effective"]["root_context"] = sshd_effective(system, SSHD_CONFIG, root_context)
             keep = ("permitrootlogin", "passwordauthentication", "kbdinteractiveauthentication",
                     "authenticationmethods", "pubkeyauthentication", "authorizedkeysfile", "port")
@@ -1190,11 +1323,21 @@ def collect(system, options):
     attempt("账户采集", account)
 
     def firewall():
-        facts["nft"] = nft_ruleset_summary(system)
+        nft_error = None
+        try:
+            facts["nft"] = nft_ruleset_summary(system)
+        except (EvidenceError, ValueError) as exc:
+            # 缺少 nft 或非 root 时不能中止后续 UFW 采集与评估（BUG-068）。
+            nft_error = str(exc)
+            facts["nft"] = {"tables": [], "input_policy": [], "rules": [], "chains": [], "raw_rule_count": 0,
+                            "error": nft_error}
         facts["ufw"] = ufw_status(system)
         if (options.allow or options.tailnet) and options.port is not None:
             facts["allowlist"] = allowlist_assessment(
                 facts["nft"], facts["ufw"], options.port, options.allow, tailnet=options.tailnet)
+        if nft_error and not facts["ufw"].get("active"):
+            # 无 active UFW 时 nft 才是唯一证据来源，采集缺口必须如实报告。
+            raise EvidenceError("nft 规则集不可采集：" + nft_error)
     attempt("防火墙采集", firewall)
 
     def tailnet():
@@ -1282,10 +1425,13 @@ def render_text(facts, options, items, position, next_step):
     print("\n-- Tailscale（只读检测）--")
     tailnet = facts.get("tailnet", {})
     if tailnet.get("present"):
-        print("tailscale0：%s" % (tailnet.get("state") or "状态不可读"))
+        state = tailnet.get("state") or "状态不可读"
+        if tailnet.get("flags") is not None:
+            state = ("up" if tailnet.get("up") else "未启用") + "（接口标志；operstate=" + state + "）"
+        print("tailscale0：%s" % state)
     else:
         print("tailscale0：未发现（本机未加入 tailnet）")
-    print("说明：Tailscale SSH 由 tailscaled 终结认证、不经过 sshd；可作救援/管理通道，但不能作为 sshd 加固通过的证据。")
+    print("说明：Tailscale 提供私有网络连接；请通过本机 Tailscale 地址与配置的端口验证系统 OpenSSH。")
     print("\n-- 备份 / 旧版痕迹 / 重启 --")
     backup = facts.get("backup", {})
     if backup.get("latest"):
@@ -1356,7 +1502,9 @@ def main(argv=None):
     if facts.get("failed") or not facts.get("collected"):
         return 2
     declared = bool(options.port or options.user or options.allow or options.closed_port or options.tailnet)
-    if declared and any(item["status"] != PASS for item in items):
+    goals_user = options.user or facts["session"].get("sudo_user")
+    if declared and (options.port is None or not goals_user or goals_user == "root"
+                     or any(item["status"] != PASS for item in items)):
         return 2
     return 0
 

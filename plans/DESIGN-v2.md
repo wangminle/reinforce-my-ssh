@@ -73,11 +73,11 @@
 | 加入 tailnet | `iifname "tailscale0" accept` 加全部 `--allow` 云内网/指定公网来源 | 经 tailnet 到 **sshd** 的新端口公钥会话，并分别验证声明来源 | `1b-close-public` 拒绝白名单外来源；未声明 CIDR 时才只留 tailnet |
 | tailnet + DERP | 同上 | 同上 | 443/tcp、3478/udp 属独立规则域，不并入 SSH 白名单 |
 
-只读检测读取 `/sys/class/net/tailscale0`：存在且 `flags` 的 IFF_UP 位为 1 即视为可用（TUN 的 `operstate` 常为 `unknown`，只在读不到 flags 时回退）。地址识别同时覆盖 `100.64.0.0/10` 与 `fd7a:115c:a1e0::/48`。不调用 `tailscale` CLI，也不推断 Tailscale SSH 是否启用。接口 up 与候选地址只反映拓扑，当前会话是否真正经该接口进入由操作员核实，必要时显式声明 `--tailnet-session-confirmed`。
+只读检测读取 `/sys/class/net/tailscale0`：存在且 `flags` 的 IFF_UP 位为 1 即视为可用（TUN 的 `operstate` 常为 `unknown`，只在读不到 flags 时回退）。地址识别同时覆盖 `100.64.0.0/10` 与 `fd7a:115c:a1e0::/48`。只读检测不调用 `tailscale` CLI，聚焦网络接口状态。接口 up 与候选地址只反映拓扑，当前会话是否真正经该接口进入由操作员核实，必要时显式声明 `--tailnet-session-confirmed`。
 
 **混合白名单**：云服务商内网只保留用户明确声明的可信来源 IP/CIDR，不从私网属性或当前连接自动推导信任。`--tailnet` 与重复 `--allow` 为并集；规则生成、最终确认和重启续跑都保留该并集。每个声明来源必须有放行证据，不能仅凭 tailnet 放行即判定达标。混合模式不再提示仅绑定 tailnet，也不要求指定公网来源连接失败。
 
-**证据边界**：Tailscale SSH 由 `tailscaled` 终结认证，不经过 sshd。它可以作为救援/管理通路，但**不能**作为 sshd 加固通过的证据；stage1 在第 4 步会明确区分"经 tailnet 到 sshd"与"Tailscale SSH"。`--tailnet` 只改变指导内容，不写任何系统状态。
+**使用方式与证据边界**：Tailscale 提供私有网络，用户通过 tailnet 地址及配置端口使用服务器的系统 OpenSSH。接口启用不代表 SSH 登录已经验证；stage1 第4步仍须通过 journal 确认当前新端口公钥会话。缺少证据时只提示核对系统 SSH 日志与新连接，不猜测其它认证服务。`--tailnet` 只改变指导内容，不写任何系统状态。界面优先显示接口标志所指示的 up/未启用，同时保留原始 operstate；TUN 的 unknown 不单独作为网络故障提示。
 
 ## 6. 输出约定
 
@@ -151,3 +151,16 @@
 - `--tailnet` 使用 IPv4/IPv6 独立的完整接口放行证据；每族须有无来源限制的 `tailscale0` allow，且未被前置拒绝遮挡。受限地址、单主机或 CIDR 的接口放行不能证明整个 tailnet；后面补充有效的完整接口放行可以补齐证据。
 - 缺失证据的详情明确显示 `tailscale0 IPv4` 或 `tailscale0 IPv6`。双族拒绝要求保留；不新增隐式单栈豁免，也不把当前公钥会话当作其它入口可达的证明。
 - 默认保持保守判定：可能误拒复杂但合法的规则集，操作员应通过人工核对处理；脚本只读，不自动改防火墙或恢复服务。具体用例及验证结果见 [修复记录](checkpoints/2026-11-12-ufw-063-064-fixes.md)。
+
+## 2026-11-16 复核修复（BUG-065～073）
+
+- **nft 多基链（BUG-065）**：数据包须通过全部已挂接 input 基链，因此每条链都必须能证实目标端口行为；任一链默认 drop、显式拦截或条件无法解释即 fail，与目标端口无关且默认放行的链不构成拦截。含 `return`/jump 或由 iptables-nft 管理的附加链（如 Tailscale `ts-input`）会被保守判为未证实并需人工复核；这是有意的误拒方向，不放宽为“忽略其它链”。
+- **来源折叠与 nft 合并（BUG-066）**：三入口解析 `--allow` 时按地址族折叠重叠/相邻网段；判定前再次折叠声明网段，并把 nft 输出的超网前缀与来源 `range` 展开为 CIDR 比较；端口区间仍保持不可解释。
+- **UFW 前置插入（BUG-067）**：stage2 生成 `ufw prepend`（ufw >= 0.36）而不是数值 `insert 1`，使 IPv6/双栈放行规则位于拒绝之前。
+- **stage0 降级（BUG-068）**：nft 不可采集时仍继续 UFW 采集与判定；仅当 UFW 非 active 时记为采集缺口。无 active UFW 时 nft 仍是唯一证据来源。
+- **定位与续跑（BUG-069/070）**：stage1 完成纳入已声明的 Tailscale 接入与完整备份；Match 块使位置停在 `match-review`；stage0 续跑命令携带三个确认旗标并引用路径；stage2 回退 stage1 的命令保留全部 `--allow`、`--tailnet` 与确认旗标。
+- **OpenSSH 解析与验证提示（BUG-071/072/073）**：`Port`/`Match` 按大小写不敏感解析并允许 `keyword=value`；`Match=...` 与 `Match ...` 等价计入 Match 风险；stage1 的监听验证提示统一加 `sudo`。
+- **2026-11-17 复核补充（BUG-074～077）**：nft 集合或列表中任一元素不可解析时整体判定不可解释，避免混入端口区间（如 `{ 80, 60000-65000 }`）或未知来源元素时静默丢弃并误判 `pass`；stage0 必须具备 `--port` 与非 root 目标用户才进行阶段推进，缺 `--port` 时定位为 `goals-undeclared` 且声明其他目标时退出 2；stage2 `loader_facts` 先核对 `nftables.service` 的 `LoadState` 并用 `run_allow_fail` 区分专用加载器 `inactive`/`disabled`（`fail`）与查询异常（`unknown`）；stage0/stage2 的 `sshd -T -C` 携带 `laddr`/`lport`。
+- **2026-11-17 复核补充（BUG-078～080）**：UFW 文本通过后仍核对可解释的额外 nft input 基链（无法解释的 iptables-nft jump 链在 UFW 路径视为透明，空 nft 仍保留 UFW pass）；三入口跟随 `sshd_config` 的 `Include`/`Include=`（含 glob）以免漏检 Match/Port；stage1 监听提示改为 `sudo ss -tlnp`，不再 `grep sshd`。
+- **2026-11-17 复核补充（BUG-081）**：附加 input 基链为 `policy drop` 且没有可解释的目标端口规则（完全无规则，或仅有 established/回环放行）时，判定必须为 `fail`，不能因没有可解释规则退化为 `unknown` 而在 UFW 路径放行；默认放行且与目标端口无关的链仍为 `unknown`，不构成拦截证据。
+- **验证**：`python3 tests/run-tests.py` 247 项中 240 通过、7 项因本机缺 Linux 原生依赖跳过，0 失败；三脚本 `bash -n`、`check` 门禁与 `git diff --check` 通过。`ufw prepend`、真实多链 nft 与 `sudo ss` 仍未在真实 Linux 服务器实测，不替代整机验收。

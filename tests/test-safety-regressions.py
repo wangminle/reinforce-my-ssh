@@ -210,7 +210,7 @@ class TestSafetyRegressions(unittest.TestCase):
         _, _, _, steps = g.TestStage2Steps().build(
             session_port=62207, listeners=[62207], backup=True, ufw_active=True, ufw_text=text)
         commands = steps["1-allowlist"]["do"]
-        allow = next(i for i, x in enumerate(commands) if "insert 1 allow from" in x)
+        allow = next(i for i, x in enumerate(commands) if "prepend allow from" in x)
         deny = next(i for i, x in enumerate(commands) if "ufw deny" in x)
         delete = commands.index("sudo ufw delete allow 62207/tcp")
         self.assertLess(allow, deny)

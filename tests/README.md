@@ -54,6 +54,26 @@ python3 tests/run-tests.py
 - **socket 激活与规则顺序**：`ss` 中归属 systemd 的监听不被当作“无监听”；UFW 宽泛 ALLOW 与 tailnet→deny 的顺序按首条匹配判定；续跑命令保留 `--tailnet`。
 - **参数与输出**：非法端口/root 账户/缺失 `--allow`/端口冲突被拒；严格 CIDR 规范化；JSON 报告可序列化且退出码正确。
 
+## BUG-065~071 回归
+
+`test-review-065-071.py` 覆盖：多条 nft input 基链须全部证实（另一链默认 drop/显式拦截使白名单 fail，无关放行链不拦截）、重叠/相邻 `--allow` 折叠与 nft 超网/`range` 来源解析、stage2 UFW `prepend` 命令、缺少 `nft` 的纯 UFW 主机评估、stage0 位置对 Tailscale 接入/备份/Match 块的约束与续跑旗标、`boot_id` 采集、stage2 回退 stage1 命令保留 `--allow`/`--tailnet-session-confirmed`、`Port`/`Match` 大小写与 `sudo ss` 提示。附加 input 链若含 `return`/jump 等无法解释条件（包括 iptables-nft 管理的 Tailscale `ts-input`），按设计保守判为未证实并需人工复核，这是有意的误拒方向。
+
+## BUG-072/073 回归
+
+`test-review-072.py` 覆盖：OpenSSH 的 `Match=User ...`、`match=all` 等号写法与 `Match ...` 同样计入 Match 块风险，stage0 不得据此报告 `verified`；stage1 `3-new-port` 的 `ss -tlnp` 验证提示必须带 `sudo`。
+
+## BUG-074~077 回归
+
+`test-review-074-077.py` 覆盖：nft 集合或列表中混入端口区间（如 `tcp dport { 80, 60000-65000 }`）或未知来源元素时，`literal_values` 整体返回空而不得静默丢弃并跳过规则或放行；stage0 缺 `--port` 时定位保持 `goals-undeclared` 且返回退出码 2（不再误标 `verified`/`stage1-done`）；stage2 `loader_facts` 对 `inactive`/`disabled` 专用加载器返回 `fail`（并先以 `LoadState` 排除缺失的 `nftables.service`）；stage0/stage2 的 `sshd -T -C` 携带 `laddr`/`lport` 以兼容 `Match LocalAddress`/`LocalPort`。
+
+## BUG-078~080 回归
+
+`test-review-078-080.py` 覆盖：UFW 文本看起来完整时，额外可解释的 nft `input` 基链（默认 drop 或显式拦截目标端口）不得判白名单 `pass`，stage0/stage2 入口不得 `verified`/complete；纯 UFW 主机的空 nft 与仅含 iptables-nft jump 的链仍可通过；`Include`/`Include=` 额外文件中的 Match/Port 计入扫描，stage0 不得据此 `verified`，stage1 `5-close-old` 在磁盘仍声明旧端口时保持 todo；stage1 生成的监听提示为 `sudo ss -tlnp`，不再 `grep sshd`。
+
+## BUG-081 回归
+
+`test-review-081.py` 覆盖：双族声明来源下，额外 nft `input` 基链为 `policy drop` 且没有可解释的目标端口规则（完全无规则，或仅有 `ct state established,related` 放行）时，白名单必须为 `fail`，不得因没有“可解释规则”退化为 `unknown`；UFW 文本通过时同样不得放行，stage0 不得 `verified`（退出码 2），stage2 `1-allowlist` 保持 todo。默认放行且与目标端口无关的链仍为 `unknown`，不构成拦截证据。修复前 6 项测试含 10 个子项失败（`pass`/`done`/`verified`），修复后全部通过。
+
 ## 京东云反馈回归
 
 `test-safety-regressions.py` 覆盖非 root 的 EACCES、不可见监听、host key 权限不足、公钥认证假阳性、危险权限和错误属主、完整备份门槛、未知旧端口、主配置旧 Port 清理、定时器 active/enabled 组合、UFW/nft 过渡规则收口及自定义路径引用。生成的备份命令通过临时目录内的假命令实际执行，验证成功和失败退出；生成的混合 IPv4/IPv6/Tailscale 规则通过真实 `nft -c` 检查，运行在独立用户/网络命名空间。

@@ -31,6 +31,7 @@ export REINFORCE_SELF="$SELF_PATH"
 exec python3 - "$@" <<'REINFORCE_STAGE1_PY'
 """stage1-port-key.sh：切端口/装公钥/验证 sudo 用户的只读分步指导；绝不修改系统。"""
 import argparse
+import fnmatch
 import ipaddress
 import json
 import os
@@ -280,12 +281,54 @@ def sshd_valid(system):
         return False, str(exc)
 
 
+def sshd_include_paths(system, pattern):
+    if not pattern.startswith("/"):
+        pattern = "/etc/ssh/" + pattern
+    if any(ch in pattern for ch in "*?["):
+        directory, _, name = pattern.rpartition("/")
+        if not directory:
+            return []
+        try:
+            names = system.list_dir(directory)
+        except EvidenceError:
+            return []
+        return [directory + "/" + item for item in names if fnmatch.fnmatch(item, name)]
+    return [pattern] if system.exists(pattern) else []
+
+
 def sshd_config_files(system):
     files = [SSHD_CONFIG]
+    seen = {SSHD_CONFIG}
     try:
-        files += [SSHD_CONFIG_D + "/" + name for name in system.list_dir(SSHD_CONFIG_D) if name.endswith(".conf")]
+        for name in system.list_dir(SSHD_CONFIG_D):
+            if name.endswith(".conf"):
+                path = SSHD_CONFIG_D + "/" + name
+                if path not in seen:
+                    files.append(path)
+                    seen.add(path)
     except EvidenceError:
         pass
+    queue = list(files)
+    depth = {path: 0 for path in files}
+    while queue:
+        current = queue.pop(0)
+        if depth[current] >= 16:
+            continue
+        try:
+            text = system.read(current)
+        except EvidenceError:
+            continue
+        for line in text.splitlines():
+            match = re.match(r"\s*Include(?:\s+|\s*=\s*)(.+)$", line, re.I)
+            if not match:
+                continue
+            for pattern in match.group(1).split("#", 1)[0].split():
+                for path in sshd_include_paths(system, pattern):
+                    if path not in seen:
+                        seen.add(path)
+                        files.append(path)
+                        depth[path] = depth[current] + 1
+                        queue.append(path)
     return files
 
 
@@ -294,7 +337,7 @@ def match_blocks(system):
     for path in sshd_config_files(system):
         try:
             for number, line in enumerate(system.read(path).splitlines(), 1):
-                if re.match(r"\s*Match\s", line):
+                if re.match(r"\s*Match(?:\s+|\s*=\s*)", line, re.I):
                     found.append("%s:%d %s" % (path, number, line.strip()))
         except EvidenceError:
             found.append(path + "（无法读取）")
@@ -306,7 +349,7 @@ def disk_port_directives(system):
     for path in sshd_config_files(system):
         try:
             for number, line in enumerate(system.read(path).splitlines(), 1):
-                m = re.match(r"\s*Port\s+(\d+)\s*(?:#.*)?$", line)
+                m = re.match(r"\s*Port(?:\s+|\s*=\s*)(\d+)\s*(?:#.*)?$", line, re.I)
                 if m:
                     ports.setdefault(int(m.group(1)), []).append("%s:%d" % (path, number))
         except EvidenceError:
@@ -522,7 +565,8 @@ def parse_args(argv):
         if int(options.old_port) == options.port:
             parser.error("旧端口不能等于目标端口")
     try:
-        options.allow = sorted({str(ipaddress.ip_network(value, strict=True)) for value in options.allow})
+        options.allow = sorted(str(net) for version in (4, 6) for net in ipaddress.collapse_addresses(
+            net for net in {ipaddress.ip_network(value, strict=True) for value in options.allow} if net.version == version))
     except ValueError as exc:
         parser.error(str(exc))
     if options.host and not re.fullmatch(r"[A-Za-z0-9_.:\[\]-]+", options.host):
@@ -934,13 +978,13 @@ def build_steps(system, options, ctx):
             tn_status, tn_note = TODO, "tailscale0 存在但状态为 %s：tailscaled 未就绪" % (tn.get("state") or "不可读")
         else:
             tn_status, tn_note = TODO, "未发现 tailscale0：尚未加入 tailnet"
-        step("2b-tailnet", "接入 Tailscale tailnet（管理/救援通路）",
+        step("2b-tailnet", "接入 Tailscale 网络（访问系统 OpenSSH）",
              tn_status, tn_note,
-             "tailnet 提供一条独立于 sshd 的管理通路，可在关闭公网端口后继续管理，也是 VNC/串口之外的备份救援路径。"
-             "但它不能替代救援演练，也不能作为 sshd 加固的证据：Tailscale SSH 由 tailscaled 终结认证，不经过 sshd。",
+             "Tailscale 提供加密的私有网络，让客户端通过 tailnet 地址连接服务器的系统 OpenSSH。"
+             "接入网络后仍需验证配置端口、公钥登录及 sudo；保留已演练的 VNC/串口救援通道。",
              ["# 服务器（Ubuntu/Debian，安装方式以官方当前说明为准）：",
               "sudo apt-get update && sudo apt-get install -y tailscale",
-              "sudo tailscale up   # 按提示完成登录；需要验证 sshd 路径时不要加 --ssh",
+              "sudo tailscale up   # 按提示加入网络，随后通过 tailnet 地址连接系统 OpenSSH",
               "# 管理台 Machines 页对本节点禁用 key expiry（默认 180 天后节点会被登出）",
               "# 客户端（另一台已入 tailnet 的设备）：",
               "ssh -p " + str(entry_port) + " " + user + "@<本节点 tailnet 地址>   # 地址用 tailscale ip -4 查询；新端口在第 4 步再验证"],
@@ -971,7 +1015,7 @@ def build_steps(system, options, ctx):
                 "ListenStream=" + str(port),
                 "EOF",
                 *socket_switch_commands(),
-                "ss -tlnp | grep sshd",
+                "sudo ss -tlnp",
             ]
         else:
             new_commands = [
@@ -983,7 +1027,7 @@ def build_steps(system, options, ctx):
                 "Port " + str(port),
                 "EOF",
                 "sudo sshd -t && sudo systemctl reload ssh.service",
-                "ss -tlnp | grep sshd",
+                "sudo ss -tlnp",
             ]
         new_commands += ["", "# 本机防火墙（按实际检测结果选择；云安全组放行新端口需到云控制台人工完成）："]
         fw = ctx["firewall"]
@@ -1014,7 +1058,7 @@ def build_steps(system, options, ctx):
          new_status, new_note,
          "新入口必须先被证明可用，旧入口才能关闭。这里只新增监听与放行，不动旧入口。",
          new_commands,
-         ["服务器：ss -tlnp 应同时看到 " + str(port) + ((" 与 " + str(old_port)) if isinstance(old_port, int) else "") + " 在 sshd 进程下监听",
+         ["服务器：sudo ss -tlnp 应同时看到 " + str(port) + ((" 与 " + str(old_port)) if isinstance(old_port, int) else "") + " 在 sshd 进程下监听",
           "服务器：sudo sshd -t 通过；socket 激活时 systemctl show ssh.socket -p Listen 含新端口",
           "客户端：ssh -o PreferredAuthentications=publickey -p " + str(port) + " " + user + "@" + host + " true"],
          new_undo,
@@ -1028,8 +1072,8 @@ def build_steps(system, options, ctx):
     elif session and session["port"] == port and auth is None:
         if options.tailnet_session_confirmed:
             verify_status, verify_note = UNKNOWN, ("当前会话来自 tailnet 且在新端口 %d 上，但 journal 没有 sshd 公钥认证记录："
-                                                    "可能是 Tailscale SSH（由 tailscaled 终结，不经过 sshd），不能作为 sshd 路径的验证证据；"
-                                                    "请改用该账户公钥登录 sshd 后重跑" % port)
+                                                    "尚无法确认系统 OpenSSH 的公钥登录，请核对 sshd 日志，"
+                                                    "重新建立该账户到配置端口的公钥连接后重跑" % port)
         else:
             verify_status, verify_note = UNKNOWN, "当前会话在新端口 %d 上，但认证方式无法从 journal 证实；请核对 journal 或重试" % port
     else:
@@ -1081,7 +1125,7 @@ def build_steps(system, options, ctx):
                             "ListenStream=" + str(port),
                             "EOF",
                             *socket_switch_commands(),
-                            "ss -tlnp | grep sshd",
+                            "sudo ss -tlnp",
                             "",
                             "# 防火墙与云安全组同步收口旧端口：",
                             "sudo ufw delete allow " + old_text + "/tcp 2>/dev/null || true",
@@ -1095,7 +1139,7 @@ def build_steps(system, options, ctx):
                             "Port " + str(port),
                             "EOF",
                             "sudo sshd -t && sudo systemctl reload ssh.service",
-                            "ss -tlnp | grep sshd",
+                            "sudo ss -tlnp",
                             "sudo ufw delete allow " + old_text + "/tcp 2>/dev/null || true",
                             "# 云控制台：删除旧端口 " + old_text + " 的放行规则"]
         old_close_verify = ["sudo ss -H -ltn 'sport = :" + old_text + "'  # 命令成功且无输出才代表无 TCP 监听；失败不算通过",
@@ -1173,7 +1217,10 @@ def render_text(ctx, options, steps):
         print("布局：%s" % ("ssh.socket 激活" if ctx["socket"]["active"] == "active" else "传统 sshd 服务"))
     tailnet = ctx.get("tailnet", {})
     if options.verbose and tailnet.get("present"):
-        print("tailscale0：%s（Tailscale SSH 不经过 sshd，不能作为 sshd 验证证据）" % (tailnet.get("state") or "状态不可读"))
+        state = tailnet.get("state") or "状态不可读"
+        if tailnet.get("flags") is not None:
+            state = ("up" if tailnet.get("up") else "未启用") + "（接口标志；operstate=" + state + "）"
+        print("tailscale0：%s（通过 tailnet 地址连接系统 OpenSSH）" % state)
     elif options.tailnet and not tailnet.get("present"):
         print("tailscale0：未发现（已声明 --tailnet，请先完成 2b-tailnet）")
     completed = sum(item["status"] == DONE for item in steps)
