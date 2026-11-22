@@ -234,20 +234,75 @@ def endpoint_port(text):
     return int(value)
 
 
+def openssh_include_patterns(raw):
+    """按 OpenSSH argv_split 语义切分 Include：仅双引号特殊，单引号是合法文件名字符。"""
+    text = raw.split("#", 1)[0].strip()
+    patterns, current, in_quote = [], [], False
+    for ch in text:
+        if in_quote:
+            if ch == '"':
+                in_quote = False
+            else:
+                current.append(ch)
+        elif ch == '"':
+            in_quote = True
+        elif ch.isspace():
+            if current:
+                patterns.append("".join(current))
+                current = []
+        else:
+            current.append(ch)
+    if current:
+        patterns.append("".join(current))
+    return patterns
+
+
 def sshd_include_paths(system, pattern):
     if not pattern.startswith("/"):
         pattern = "/etc/ssh/" + pattern
-    if any(ch in pattern for ch in "*?["):
-        directory, _, name = pattern.rpartition("/")
-        if not directory:
-            return []
+    if not any(ch in pattern for ch in "*?["):
         try:
-            names = system.list_dir(directory)
+            return [pattern] if system.exists(pattern) else []
         except EvidenceError:
             return []
-        return [directory + "/" + item for item in names if fnmatch.fnmatch(item, name)]
-    return [pattern] if system.exists(pattern) else []
-
+    segments = [part for part in pattern.split("/") if part != ""]
+    currents = ["/"]
+    for index, segment in enumerate(segments):
+        nxt, last = [], index == len(segments) - 1
+        wild = any(ch in segment for ch in "*?[")
+        for cur in currents:
+            parent = cur if cur != "/" else "/"
+            if wild:
+                try:
+                    names = system.list_dir(parent)
+                except EvidenceError:
+                    continue
+                for name in names:
+                    if not fnmatch.fnmatch(name, segment):
+                        continue
+                    child = parent.rstrip("/") + "/" + name
+                    if last:
+                        nxt.append(child)
+                    else:
+                        try:
+                            if system.is_dir(child):
+                                nxt.append(child)
+                        except EvidenceError:
+                            continue
+            else:
+                child = parent.rstrip("/") + "/" + segment
+                nxt.append(child)
+        currents = nxt
+        if not currents:
+            return []
+    found = []
+    for path in currents:
+        try:
+            if system.exists(path):
+                found.append(path)
+        except EvidenceError:
+            continue
+    return found
 
 def sshd_config_files(system):
     files = [SSHD_CONFIG]
@@ -275,7 +330,7 @@ def sshd_config_files(system):
             match = re.match(r"\s*Include(?:\s+|\s*=\s*)(.+)$", line, re.I)
             if not match:
                 continue
-            for pattern in match.group(1).split("#", 1)[0].split():
+            for pattern in openssh_include_patterns(match.group(1)):
                 for path in sshd_include_paths(system, pattern):
                     if path not in seen:
                         seen.add(path)
@@ -341,7 +396,11 @@ def account_facts(system, user):
             for label, path in attrs:
                 st = system.stat(path)
                 facts[label + "_mode"] = oct(st.st_mode & 0o777)
-                facts[label + "_owner_ok"] = st.st_uid in (0, facts["uid"])
+                # OpenSSH 以目标用户身份读取 .ssh 与 authorized_keys；root 属主会导致公钥登录失败。
+                if label == "home":
+                    facts[label + "_owner_ok"] = st.st_uid in (0, facts["uid"])
+                else:
+                    facts[label + "_owner_ok"] = st.st_uid == facts["uid"]
             facts["permissions_safe"] = all(
                 facts[label + "_owner_ok"] and not (int(facts[label + "_mode"], 8) & 0o022)
                 for label, _ in attrs)
@@ -439,13 +498,17 @@ def rule_digest(rule):
     verdict = None
     dports, saddrs, ct_state, iifs = set(), set(), set(), set()
     protocols, versions = {"tcp", "udp", "other"}, {4, 6}
-    supported, iif_negated, iif_unknown = True, False, False
+    supported, iif_negated, iif_unknown, has_jump = True, False, False, False
     port_supported, seen_payloads = True, set()
     for expr in rule.get("expr", []):
         if any(key in expr for key in ("accept", "drop", "reject")):
             verdict = next(key for key in ("accept", "drop", "reject") if key in expr)
             continue
         if "counter" in expr or "log" in expr:
+            continue
+        if "jump" in expr or "goto" in expr:
+            has_jump = True
+            supported = False
             continue
         if "match" not in expr:
             supported = False
@@ -498,7 +561,7 @@ def rule_digest(rule):
             supported = False
     return {"verdict": verdict, "dports": sorted(dports), "saddrs": sorted(saddrs),
             "ct_state": sorted(ct_state), "iifs": sorted(iifs), "iif_negated": iif_negated,
-            "iif_unknown": iif_unknown, "loopback": "lo" in iifs,
+            "iif_unknown": iif_unknown, "has_jump": bool(has_jump), "loopback": "lo" in iifs,
             "protocols": sorted(protocols), "versions": sorted(versions),
             "conditions_supported": bool(supported), "port_supported": bool(port_supported)}
 
@@ -550,7 +613,9 @@ def nft_allowlist_assessment(summary, port, allows, tailnet=False, skip_uninterp
                 if rule["dports"] and str(port) not in rule["dports"] and rule.get("port_supported"):
                     continue
                 if not rule.get("conditions_supported") or rule.get("iif_unknown"):
-                    if skip_uninterpretable:
+                    # UFW 路径仅对 iptables-nft 的 ip/ip6 jump/goto 透明；inet 原生链即使含 jump 也要判定（BUG-096）。
+                    if (skip_uninterpretable and family in ("ip", "ip6")
+                            and rule.get("has_jump") and not rule.get("iif_unknown")):
                         skipped_uninterpretable = True
                         continue
                     saw_rules = True
@@ -816,11 +881,12 @@ def reboot_facts(system):
         facts["btime"] = int(re.search(r"^btime (\d+)$", system.read("/proc/stat"), re.M)[1])
         facts["boot_time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(facts["btime"]))
         hardened = set(sshd_config_files(system))
-        for path in ("/etc/nftables.conf", "/etc/systemd/system/ssh-allowlist.service"):
+        for path in ("/etc/nftables.conf", "/etc/systemd/system/ssh-allowlist.service",
+                     "/etc/default/ufw"):
             if system.exists(path):
                 hardened.add(path)
         for directory in (SSHD_CONFIG_D, SOCKET_DROPIN_DIR, "/etc/nftables.d",
-                          "/etc/systemd/system/ssh-allowlist.service.d"):
+                          "/etc/systemd/system/ssh-allowlist.service.d", "/etc/ufw"):
             if system.is_dir(directory):
                 for name in system.list_dir(directory):
                     path = directory + "/" + name
@@ -883,23 +949,43 @@ def is_tailnet_network(value):
 def sshd_bindings(system):
     """SSH 监听地址与端口；socket 激活时监听由 systemd 持有，必须一并计入。"""
     found = []
+    seen = set()
     _, socket_active, socket_endpoints = socket_listen_endpoints(system)
+
+    def add(address, number, process):
+        normalized = "*" if address in ("*", "::", "0.0.0.0", "") else address
+        key = (normalized, number)
+        if key in seen:
+            return
+        seen.add(key)
+        if address == "::" or (normalized == "*" and address == "::"):
+            display = "::"
+        elif normalized == "*":
+            display = "0.0.0.0"
+        else:
+            display = address
+        found.append({"address": display, "port": number, "process": process})
+
     for line in system.run("ss", "-tlnpH").splitlines():
         words = line.split()
-        match = re.search(r'"([a-zA-Z0-9_.-]+)"', line)
-        process = match.group(1) if match else ""
-        if len(words) >= 4 and process in ("sshd", "sshd-session", "systemd"):
+        processes = re.findall(r'"([a-zA-Z0-9_.-]+)"', line)
+        process = next((name for name in processes if name in ("sshd", "sshd-session", "systemd")), "")
+        if len(words) >= 4 and process:
             host, _, port = words[3].rpartition(":")
             try:
                 number = int(port)
             except ValueError:
                 continue
-            if 1 <= number <= 65535:
-                address = host.strip("[]")
-                normalized = "*" if address in ("*", "::", "0.0.0.0") else address
-                if process == "systemd" and (socket_active != "active" or (normalized, number) not in socket_endpoints):
-                    continue
-                found.append({"address": host.strip("[]"), "port": number, "process": process})
+            if not 1 <= number <= 65535:
+                continue
+            address = host.strip("[]")
+            normalized = "*" if address in ("*", "::", "0.0.0.0") else address
+            if process == "systemd" and (socket_active != "active" or (normalized, number) not in socket_endpoints):
+                continue
+            add(address, number, process)
+    if socket_active == "active":
+        for address, number in socket_endpoints:
+            add(address, number, "systemd")
     return found
 
 
@@ -1334,8 +1420,22 @@ def build_steps(system, options, ctx):
     steps = []
 
     def step(sid, title, status, evidence, why, do, verify, undo, blocked_by=None):
+        blocked_by = list(blocked_by or [])
+        if status == DONE:
+            blocked_by = []
+        elif blocked_by:
+            status = BLOCKED
+            rewritten = ["# 门槛未满足：" + "；".join(blocked_by) + " —— 先完成这些步骤再回来；下列命令暂不可执行。"]
+            for line in do:
+                parts = line.splitlines() or [line]
+                for part in parts:
+                    if not part.strip() or part.lstrip().startswith("#"):
+                        rewritten.append(part)
+                    else:
+                        rewritten.append("# " + part)
+            do = rewritten
         steps.append({"id": sid, "title": title, "status": status, "evidence": evidence,
-                      "why": why, "do": do, "verify": verify, "undo": undo, "blocked_by": blocked_by or []})
+                      "why": why, "do": do, "verify": verify, "undo": undo, "blocked_by": blocked_by})
 
     session = ctx["connection"]
     listen_ok = ctx["listeners"] == [port]
@@ -1457,7 +1557,14 @@ def build_steps(system, options, ctx):
     if options.tailnet:
         exposed = public_exposure(ctx["bindings"], port)
         verdict = public_entry_verdict(ctx["nft"], ctx["ufw"], port) if not options.allow else None
-        if not exposed:
+        has_binding = any(item.get("port") == port for item in ctx["bindings"])
+        if not has_binding:
+            close_status = UNKNOWN
+            if port in ctx["listeners"]:
+                close_note = "端口 %d 在监听列表中，但缺少可归属的绑定地址证据；不能证明公网入口已关闭" % port
+            else:
+                close_note = "目标端口 %d 尚未证实有监听绑定；不能证明公网入口已关闭" % port
+        elif not exposed:
             close_status = DONE
             close_note = "SSH 只监听回环/tailnet 地址，公网接口上没有该端口的监听"
         elif verdict is False:
@@ -1516,19 +1623,26 @@ def build_steps(system, options, ctx):
 
     # 2. 禁 root / 禁密码 / 禁键盘交互
     auth = ctx["auth_facts"]
-    root_ok = auth.get("permitrootlogin") == "no"
+    # 采集失败得到 {} 时不得回退普通用户上下文（BUG-092）；仅缺键（手工 stub）才回退。
+    if "root_auth_facts" not in ctx:
+        root_auth = {}
+        root_ok = auth.get("permitrootlogin") == "no"
+    else:
+        root_auth = ctx.get("root_auth_facts") or {}
+        root_ok = (auth.get("permitrootlogin") == "no"
+                   and root_auth.get("permitrootlogin") == "no")
     pass_ok = auth.get("passwordauthentication") == "no"
     kbd_ok = auth.get("kbdinteractiveauthentication") in (None, "no")
     methods = auth.get("authenticationmethods")
     methods_ok = methods == "publickey"
     pubkey_ok = auth.get("pubkeyauthentication") == "yes"
     if root_ok and pass_ok and kbd_ok and methods_ok and pubkey_ok:
-        auth_status, auth_note = DONE, "PermitRootLogin=%s PasswordAuthentication=%s KbdInteractive=%s AuthenticationMethods=%s" % (
-            auth.get("permitrootlogin"), auth.get("passwordauthentication"),
+        auth_status, auth_note = DONE, "PermitRootLogin=%s (root上下文=%s) PasswordAuthentication=%s KbdInteractive=%s AuthenticationMethods=%s" % (
+            auth.get("permitrootlogin"), root_auth.get("permitrootlogin"), auth.get("passwordauthentication"),
             auth.get("kbdinteractiveauthentication"), methods or "any")
     else:
-        auth_status, auth_note = TODO, "PermitRootLogin=%s PasswordAuthentication=%s KbdInteractive=%s AuthenticationMethods=%s" % (
-            auth.get("permitrootlogin"), auth.get("passwordauthentication"),
+        auth_status, auth_note = TODO, "PermitRootLogin=%s (root上下文=%s) PasswordAuthentication=%s KbdInteractive=%s AuthenticationMethods=%s" % (
+            auth.get("permitrootlogin"), root_auth.get("permitrootlogin"), auth.get("passwordauthentication"),
             auth.get("kbdinteractiveauthentication"), methods or "any")
     auth_note += " PubkeyAuthentication=%s" % auth.get("pubkeyauthentication")
     if source_in_allow is False:
@@ -1562,7 +1676,8 @@ def build_steps(system, options, ctx):
     checks.append(("账户与公钥", PASS if account_ok else FAIL, "uid=%s sudo=%s keys=%s" % (
         account.get("uid"), account.get("sudo"), account.get("authorized_keys_count"))))
     checks.append(("来源白名单", assessment["status"], assessment["detail"]))
-    checks.append(("禁 root", PASS if root_ok else FAIL, "PermitRootLogin=%s" % auth.get("permitrootlogin")))
+    checks.append(("禁 root", PASS if root_ok else FAIL,
+                   "PermitRootLogin=%s root上下文=%s" % (auth.get("permitrootlogin"), root_auth.get("permitrootlogin"))))
     checks.append(("禁密码/键盘交互", PASS if (pass_ok and kbd_ok) else FAIL, "Password=%s Kbd=%s" % (
         auth.get("passwordauthentication"), auth.get("kbdinteractiveauthentication"))))
     checks.append(("公钥认证生效", PASS if (methods_ok and pubkey_ok) else FAIL, "PubkeyAuthentication=%s AuthenticationMethods=%s" % (auth.get("pubkeyauthentication"), methods or "any")))
@@ -1637,13 +1752,15 @@ def loader_facts(system):
         for line in ("ExecStart=/usr/sbin/nft -f /etc/nftables.d/ssh-allowlist.nft",
                      "ExecReload=/usr/sbin/nft -f /etc/nftables.d/ssh-allowlist.nft"):
             if line not in text.splitlines():
-                return {"status": UNKNOWN, "detail": "加载器不是已知的专用事务配置，需人工核对实际加载路径"}
+                # 第三方自定义加载器：必须阻断，禁止 tee 覆盖（BUG-082）。
+                return {"status": FAIL, "detail": "加载器不是已知的专用事务配置，需人工核对实际加载路径；禁止直接覆盖"}
         for sub, want in (("is-active", "active"), ("is-enabled", "enabled")):
             state_lines = (system.run_allow_fail("systemctl", sub, "ssh-allowlist.service").stdout or "").strip().splitlines()
             if not state_lines:
                 return {"status": UNKNOWN, "detail": "无法读取专用加载器 " + sub + " 状态"}
             if state_lines[0] != want:
-                return {"status": FAIL, "detail": "专用加载器未 active/enabled（%s=%s）" % (sub, state_lines[0])}
+                # 标准加载器尚未 enable/restart：不阻断 1-allowlist 命令生成（BUG-082）。
+                return {"status": UNKNOWN, "detail": "专用加载器未 active/enabled（%s=%s）；继续生成 enable/restart 命令" % (sub, state_lines[0])}
         return {"status": PASS, "detail": "专用加载器 active/enabled；仍需核对其它加载器顺序并做冷启动验证"}
     except EvidenceError as exc:
         return {"status": UNKNOWN, "detail": str(exc)}
@@ -1681,6 +1798,11 @@ def resolve_context(system, options):
             system, "user=%s,host=stage2.invalid,addr=%s,laddr=%s,lport=%d" % (options.user, addr, laddr, lport), keep)
     except EvidenceError:
         ctx["auth_facts"] = {}
+    try:
+        ctx["root_auth_facts"] = sshd_effective(
+            system, "user=root,host=stage2.invalid,addr=%s,laddr=%s,lport=%d" % (addr, laddr, lport), keep)
+    except EvidenceError:
+        ctx["root_auth_facts"] = {}
     return ctx
 
 
@@ -1766,8 +1888,20 @@ def main(argv=None):
         print("需要完整读取权限。请运行：")
         print("  sudo bash " + shlex.quote(os.environ.get("REINFORCE_SELF", SCRIPT)) + " " + " ".join(shlex.quote(a) for a in (argv if argv is not None else sys.argv[1:])))
         return 2
-    ctx = resolve_context(system, options)
-    steps = build_steps(system, options, ctx)
+    try:
+        ctx = resolve_context(system, options)
+        steps = build_steps(system, options, ctx)
+    except EvidenceError as exc:
+        report = {
+            "schema": 1, "script": SCRIPT, "read_only": True,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "error": str(exc), "complete": False, "next_step": None,
+        }
+        if options.format == "json":
+            print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+        else:
+            print("采集失败（证据不足）：" + str(exc))
+        return 2
     complete = all(item["status"] == DONE for item in steps)
     report = {
         "schema": 1, "script": SCRIPT, "read_only": True,

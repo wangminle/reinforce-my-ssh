@@ -143,7 +143,8 @@ class TestBug076Stage2LoaderFacts(unittest.TestCase):
         system.canned = {prefix: types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)}
         system.canned.update(rest)
 
-    def test_inactive_or_disabled_loader_returns_fail_not_unknown(self):
+    def test_inactive_or_disabled_standard_loader_is_unknown_not_fail(self):
+        # BUG-076：不再因 run() 抛错落入 unknown；BUG-082：标准加载器未激活不得用 fail 阻断命令生成。
         for sub, value, rc in (("is-active", "inactive", 3), ("is-enabled", "disabled", 1)):
             with self.subTest(sub=sub, value=value):
                 system = g.make_stub(g.STAGE2)
@@ -155,8 +156,9 @@ class TestBug076Stage2LoaderFacts(unittest.TestCase):
                 self.prepend_can(system, "systemctl " + sub + " ssh-allowlist.service",
                                  stdout=value + "\n", returncode=rc)
                 result = g.STAGE2.loader_facts(system)
-                self.assertEqual(result["status"], "fail", result)
+                self.assertEqual(result["status"], "unknown", result)
                 self.assertIn(value, result["detail"])
+                self.assertNotIn("禁止直接覆盖", result["detail"])
 
     def test_missing_nftables_service_does_not_block_when_load_state_is_not_found(self):
         system = g.make_stub(g.STAGE2)

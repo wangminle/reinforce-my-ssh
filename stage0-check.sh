@@ -308,20 +308,75 @@ def sshd_effective(system, config, context=None):
     return options
 
 
+def openssh_include_patterns(raw):
+    """按 OpenSSH argv_split 语义切分 Include：仅双引号特殊，单引号是合法文件名字符。"""
+    text = raw.split("#", 1)[0].strip()
+    patterns, current, in_quote = [], [], False
+    for ch in text:
+        if in_quote:
+            if ch == '"':
+                in_quote = False
+            else:
+                current.append(ch)
+        elif ch == '"':
+            in_quote = True
+        elif ch.isspace():
+            if current:
+                patterns.append("".join(current))
+                current = []
+        else:
+            current.append(ch)
+    if current:
+        patterns.append("".join(current))
+    return patterns
+
+
 def sshd_include_paths(system, pattern):
     if not pattern.startswith("/"):
         pattern = "/etc/ssh/" + pattern
-    if any(ch in pattern for ch in "*?["):
-        directory, _, name = pattern.rpartition("/")
-        if not directory:
-            return []
+    if not any(ch in pattern for ch in "*?["):
         try:
-            names = system.list_dir(directory)
+            return [pattern] if system.exists(pattern) else []
         except EvidenceError:
             return []
-        return [directory + "/" + item for item in names if fnmatch.fnmatch(item, name)]
-    return [pattern] if system.exists(pattern) else []
-
+    segments = [part for part in pattern.split("/") if part != ""]
+    currents = ["/"]
+    for index, segment in enumerate(segments):
+        nxt, last = [], index == len(segments) - 1
+        wild = any(ch in segment for ch in "*?[")
+        for cur in currents:
+            parent = cur if cur != "/" else "/"
+            if wild:
+                try:
+                    names = system.list_dir(parent)
+                except EvidenceError:
+                    continue
+                for name in names:
+                    if not fnmatch.fnmatch(name, segment):
+                        continue
+                    child = parent.rstrip("/") + "/" + name
+                    if last:
+                        nxt.append(child)
+                    else:
+                        try:
+                            if system.is_dir(child):
+                                nxt.append(child)
+                        except EvidenceError:
+                            continue
+            else:
+                child = parent.rstrip("/") + "/" + segment
+                nxt.append(child)
+        currents = nxt
+        if not currents:
+            return []
+    found = []
+    for path in currents:
+        try:
+            if system.exists(path):
+                found.append(path)
+        except EvidenceError:
+            continue
+    return found
 
 def sshd_config_files(system):
     files = [SSHD_CONFIG]
@@ -349,7 +404,7 @@ def sshd_config_files(system):
             match = re.match(r"\s*Include(?:\s+|\s*=\s*)(.+)$", line, re.I)
             if not match:
                 continue
-            for pattern in match.group(1).split("#", 1)[0].split():
+            for pattern in openssh_include_patterns(match.group(1)):
                 for path in sshd_include_paths(system, pattern):
                     if path not in seen:
                         seen.add(path)
@@ -371,30 +426,50 @@ def match_blocks(system):
     return found
 
 
-def disk_port_directives(system):
+def disk_port_directives(system, source="all"):
+    """source: all|sshd|socket。socket 激活时只认 ListenStream；传统模式只认 sshd Port。"""
     ports = {}
-    for path in sshd_config_files(system):
-        try:
-            for number, line in enumerate(system.read(path).splitlines(), 1):
-                m = re.match(r"\s*Port(?:\s+|\s*=\s*)(\d+)\s*(?:#.*)?$", line, re.I)
-                if m:
-                    ports.setdefault(int(m.group(1)), []).append("%s:%d" % (path, number))
-        except EvidenceError:
-            continue
-    try:
-        for name in system.list_dir(SOCKET_DROPIN_DIR):
-            if not name.endswith(".conf"):
+    if source in ("all", "sshd"):
+        for path in sshd_config_files(system):
+            try:
+                for number, line in enumerate(system.read(path).splitlines(), 1):
+                    m = re.match(r"\s*Port(?:\s+|\s*=\s*)(\d+)\s*(?:#.*)?$", line, re.I)
+                    if m:
+                        value = int(m.group(1))
+                        if 1 <= value <= 65535:
+                            ports.setdefault(value, []).append("%s:%d" % (path, number))
+            except EvidenceError:
                 continue
-            path = SOCKET_DROPIN_DIR + "/" + name
-            for number, line in enumerate(system.read(path).splitlines(), 1):
-                m = re.match(r"\s*ListenStream\s*=\s*(\S+)\s*$", line)
-                if m:
+    if source in ("all", "socket"):
+        active = {}
+        try:
+            for name in sorted(system.list_dir(SOCKET_DROPIN_DIR)):
+                if not name.endswith(".conf"):
+                    continue
+                path = SOCKET_DROPIN_DIR + "/" + name
+                try:
+                    lines = system.read(path).splitlines()
+                except EvidenceError:
+                    continue
+                for number, line in enumerate(lines, 1):
+                    m = re.match(r"\s*ListenStream\s*=\s*(.*)$", line)
+                    if not m:
+                        continue
+                    raw = m.group(1).split("#", 1)[0].strip()
+                    if raw == "":
+                        active.clear()
+                        continue
                     try:
-                        ports.setdefault((int(m.group(1)) if m.group(1).isdigit() else endpoint_port(m.group(1))), []).append("%s:%d" % (path, number))
+                        value = int(raw) if raw.isdigit() else endpoint_port(raw)
                     except ValueError:
                         continue
-    except EvidenceError:
-        pass
+                    if not 1 <= value <= 65535:
+                        continue
+                    active.setdefault(value, []).append("%s:%d" % (path, number))
+        except EvidenceError:
+            pass
+        for value, where in active.items():
+            ports.setdefault(value, []).extend(where)
     return ports
 
 
@@ -425,7 +500,11 @@ def account_facts(system, user):
             for label, path in attrs:
                 st = system.stat(path)
                 facts[label + "_mode"] = oct(st.st_mode & 0o777)
-                facts[label + "_owner_ok"] = st.st_uid in (0, facts["uid"])
+                # OpenSSH 以目标用户身份读取 .ssh 与 authorized_keys；root 属主会导致公钥登录失败。
+                if label == "home":
+                    facts[label + "_owner_ok"] = st.st_uid in (0, facts["uid"])
+                else:
+                    facts[label + "_owner_ok"] = st.st_uid == facts["uid"]
             facts["permissions_safe"] = all(
                 facts[label + "_owner_ok"] and not (int(facts[label + "_mode"], 8) & 0o022)
                 for label, _ in attrs)
@@ -487,13 +566,17 @@ def rule_digest(rule):
     verdict = None
     dports, saddrs, ct_state, iifs = set(), set(), set(), set()
     protocols, versions = {"tcp", "udp", "other"}, {4, 6}
-    supported, iif_negated, iif_unknown = True, False, False
+    supported, iif_negated, iif_unknown, has_jump = True, False, False, False
     port_supported, seen_payloads = True, set()
     for expr in rule.get("expr", []):
         if any(key in expr for key in ("accept", "drop", "reject")):
             verdict = next(key for key in ("accept", "drop", "reject") if key in expr)
             continue
         if "counter" in expr or "log" in expr:
+            continue
+        if "jump" in expr or "goto" in expr:
+            has_jump = True
+            supported = False
             continue
         if "match" not in expr:
             supported = False
@@ -546,7 +629,7 @@ def rule_digest(rule):
             supported = False
     return {"verdict": verdict, "dports": sorted(dports), "saddrs": sorted(saddrs),
             "ct_state": sorted(ct_state), "iifs": sorted(iifs), "iif_negated": iif_negated,
-            "iif_unknown": iif_unknown, "loopback": "lo" in iifs,
+            "iif_unknown": iif_unknown, "has_jump": bool(has_jump), "loopback": "lo" in iifs,
             "protocols": sorted(protocols), "versions": sorted(versions),
             "conditions_supported": bool(supported), "port_supported": bool(port_supported)}
 
@@ -598,7 +681,9 @@ def nft_allowlist_assessment(summary, port, allows, tailnet=False, skip_uninterp
                 if rule["dports"] and str(port) not in rule["dports"] and rule.get("port_supported"):
                     continue
                 if not rule.get("conditions_supported") or rule.get("iif_unknown"):
-                    if skip_uninterpretable:
+                    # UFW 路径仅对 iptables-nft 的 ip/ip6 jump/goto 透明；inet 原生链即使含 jump 也要判定（BUG-096）。
+                    if (skip_uninterpretable and family in ("ip", "ip6")
+                            and rule.get("has_jump") and not rule.get("iif_unknown")):
                         skipped_uninterpretable = True
                         continue
                     saw_rules = True
@@ -942,11 +1027,12 @@ def reboot_facts(system):
         except EvidenceError:
             pass
         hardened = set(sshd_config_files(system))
-        for path in ("/etc/nftables.conf", "/etc/systemd/system/ssh-allowlist.service"):
+        for path in ("/etc/nftables.conf", "/etc/systemd/system/ssh-allowlist.service",
+                     "/etc/default/ufw"):
             if system.exists(path):
                 hardened.add(path)
         for directory in (SSHD_CONFIG_D, SOCKET_DROPIN_DIR, "/etc/nftables.d",
-                          "/etc/systemd/system/ssh-allowlist.service.d"):
+                          "/etc/systemd/system/ssh-allowlist.service.d", "/etc/ufw"):
             if system.is_dir(directory):
                 for name in system.list_dir(directory):
                     path = directory + "/" + name
@@ -1296,7 +1382,9 @@ def collect(system, options):
                 facts["sshd_config_error"] = str(exc)
         else:
             facts["sshd_config_error"] = "需要 sudo 检查配置及 host keys；未执行 sshd -t"
-        facts["disk_ports"] = {str(port): where for port, where in disk_port_directives(system).items()}
+        socket_on = (facts.get("socket") or {}).get("active") == "active"
+        facts["disk_ports"] = {str(port): where for port, where in disk_port_directives(
+            system, source="socket" if socket_on else "sshd").items()}
         facts["match_blocks"] = match_blocks(system)
         if is_root():
             connection = facts["session"].get("connection")

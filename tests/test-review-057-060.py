@@ -169,8 +169,11 @@ class TestSocketAndAccountPort(unittest.TestCase):
 
     def test_same_port_other_address_is_not_an_ssh_socket_binding(self):
         system = g.make_stub(g.STAGE2, session_port=62207, listeners=[62207], listener_process="systemd")
+        # ss 上的 0.0.0.0/systemd 不在 ssh.socket Listen 内，不得计入；socket Listen 自身仍合并。
         system.can("systemctl show ssh.socket", "LoadState=loaded\nActiveState=active\nListen=127.0.0.1:62207 (Stream)\n")
-        self.assertEqual(g.STAGE2.sshd_bindings(system), [])
+        bindings = g.STAGE2.sshd_bindings(system)
+        self.assertEqual(bindings, [{"address": "127.0.0.1", "port": 62207, "process": "systemd"}])
+        self.assertFalse(any(item["address"] in ("0.0.0.0", "*") for item in bindings))
 
     def test_account_without_session_uses_declared_port_not_22(self):
         _, options, ctx, _ = g.TestStage1Steps().steps(account=False, extra=["--old-port", "none"])

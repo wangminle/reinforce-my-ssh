@@ -54,7 +54,7 @@ def make_stub(module, *, session_port=22, session_source="203.0.113.9", journal_
         system.set_read("/sys/class/net/tailscale0/flags", "0x%x\n" % tailnet_flags)
 
     if socket_active:
-        listen_lines = "".join("0.0.0.0:%d (Stream)\n" % p for p in listen_ports)
+        listen_lines = "".join("%s:%d (Stream)\n" % (bind_address, p) for p in listen_ports)
         system.can("systemctl show ssh.socket",
                    "LoadState=loaded\nActiveState=active\nAccept=no\n" + "".join("Listen=" + line for line in listen_lines.splitlines(True)))
     else:
@@ -106,7 +106,12 @@ def make_stub(module, *, session_port=22, session_source="203.0.113.9", journal_
     system.set_read("/etc/ssh/sshd_config.d/10-newport.conf", "".join("Port %s\n" % p for p in disk_ports))
     system.touch_dir("/etc/ssh/sshd_config.d", ["10-newport.conf"] if disk_ports else [])
     system.touch_dir("/etc/systemd/system", ["reinforce-my-ssh-old.timer"] if timer_active else [])
-    system.touch_dir("/etc/systemd/system/ssh.socket.d", [])
+    if disk_ports and socket_active:
+        system.touch_dir("/etc/systemd/system/ssh.socket.d", ["10-newport.conf"])
+        system.set_read("/etc/systemd/system/ssh.socket.d/10-newport.conf",
+                        "".join("ListenStream=%s\n" % p for p in disk_ports))
+    else:
+        system.touch_dir("/etc/systemd/system/ssh.socket.d", [])
     system.touch_dir("/etc/nftables.d", [])
     if allowlist_rules:
         system.touch_dir("/etc/nftables.d", ["ssh-allowlist.nft"])
@@ -123,8 +128,13 @@ def make_stub(module, *, session_port=22, session_source="203.0.113.9", journal_
             system.touch_file("/var/backups/ssh-hardening/20261027-160000/" + name)
     if hardening_mtime is not None:
         for path in ("/etc/ssh/sshd_config", "/etc/systemd/system/ssh-allowlist.service",
-                     "/etc/ssh/sshd_config.d/10-newport.conf", "/etc/nftables.d/ssh-allowlist.nft"):
+                     "/etc/ssh/sshd_config.d/10-newport.conf", "/etc/nftables.d/ssh-allowlist.nft",
+                     "/etc/systemd/system/ssh.socket.d/10-newport.conf"):
             system.mtimes[path] = hardening_mtime
+        for path in list(system.files):
+            if path.startswith(("/etc/ssh/", "/etc/systemd/system/ssh", "/etc/nftables",
+                                "/etc/ufw/", "/etc/default/ufw")):
+                system.mtimes[path] = hardening_mtime
     if legacy_pending:
         system.touch_file("/var/lib/reinforce-my-ssh/state.conf")
         system.set_read("/var/lib/reinforce-my-ssh/state.conf",
@@ -286,13 +296,16 @@ class TestStage1Steps(unittest.TestCase):
         ctx = STAGE1.resolve_context(system, options)
         return system, options, ctx, {step["id"]: step for step in STAGE1.build_steps(system, options, ctx)}
 
-    def test_early_state_all_todo_with_gates(self):
+    def test_early_state_gated_steps_are_blocked(self):
         _, _, ctx, steps = self.steps(account=False)
         self.assertEqual(ctx["old_port"], 22)
-        for step in steps.values():
-            self.assertEqual(step["status"], "todo")
+        for sid in ("0-rescue", "1-backup", "2-account"):
+            self.assertEqual(steps[sid]["status"], "todo", sid)
+        self.assertEqual(steps["3-new-port"]["status"], "blocked")
         self.assertEqual(steps["3-new-port"]["blocked_by"], ["1-backup", "2-account"])
+        self.assertEqual(steps["5-close-old"]["status"], "blocked")
         self.assertEqual(steps["5-close-old"]["blocked_by"], ["0-rescue", "4-verify-new", "1-backup", "2-account"])
+        self.assertTrue(any("门槛未满足" in line for line in steps["5-close-old"]["do"]))
 
     def test_existing_account_counts_as_done(self):
         _, _, _, steps = self.steps()
@@ -330,29 +343,30 @@ class TestStage1Steps(unittest.TestCase):
         self.assertEqual(declared["2b-tailnet"]["status"], "done")
 
     def test_tailnet_step_reports_missing_interface(self):
-        _, _, _, steps = self.steps(extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=False)
+        _, _, _, steps = self.steps(backup=True, extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=False)
         self.assertEqual(steps["2b-tailnet"]["status"], "todo")
         self.assertIn("未发现 tailscale0", steps["2b-tailnet"]["evidence"])
 
     def test_tailnet_operstate_unknown_with_flags_up(self):
-        _, _, _, steps = self.steps(extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=True,
+        _, _, _, steps = self.steps(backup=True, extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=True,
                                     tailnet_state="unknown", tailnet_flags=0x1003)
         self.assertEqual(steps["2b-tailnet"]["status"], "done")
 
     def test_tailnet_flags_down_is_not_ready(self):
-        _, _, _, steps = self.steps(extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=True,
+        _, _, _, steps = self.steps(backup=True, extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=True,
                                     tailnet_state="up", tailnet_flags=0x1002)
         self.assertEqual(steps["2b-tailnet"]["status"], "todo")
 
     def test_tailnet_step_verifies_via_current_port(self):
-        _, _, _, steps = self.steps(extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=True)
+        _, _, _, steps = self.steps(backup=True, extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=True)
         joined = "\n".join(steps["2b-tailnet"]["do"] + steps["2b-tailnet"]["verify"])
         self.assertIn("-p 22", joined)
         self.assertNotIn("62207", joined)
         self.assertIn("第 4 步", joined)
 
     def test_verify_resume_command_keeps_tailnet(self):
-        _, _, _, steps = self.steps(session_port=22, extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=True)
+        _, _, _, steps = self.steps(session_port=22, backup=True,
+                                    extra=["--tailnet", "--tailnet-session-confirmed"], tailnet=True)
         joined = "\n".join(steps["4-verify-new"]["do"])
         self.assertIn("--tailnet", joined)
 
@@ -408,14 +422,15 @@ class TestStage2Steps(unittest.TestCase):
                                     extra=["--tailnet", "--tailnet-session-confirmed"])
         self.assertNotEqual(steps["1-allowlist"]["status"], "blocked")
         self.assertTrue(any('iifname "tailscale0"' in line for line in steps["1-allowlist"]["do"]))
-        self.assertEqual(steps["1b-close-public"]["status"], "unknown")
+        # 白名单未完成时 1b 被门槛阻塞，但暴露面判定仍写在 evidence。
+        self.assertEqual(steps["1b-close-public"]["status"], "blocked")
         self.assertIn("0.0.0.0", steps["1b-close-public"]["evidence"])
 
     def test_socket_activated_listener_is_not_mistaken_for_closed(self):
         _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
                                     session_port=62207, listeners=[62207], backup=True,
                                     listener_process="systemd", extra=["--tailnet", "--tailnet-session-confirmed"])
-        self.assertEqual(steps["1b-close-public"]["status"], "unknown")
+        self.assertEqual(steps["1b-close-public"]["status"], "blocked")
         self.assertIn("0.0.0.0", steps["1b-close-public"]["evidence"])
 
     def test_ufw_broad_allow_keeps_public_open(self):
@@ -426,7 +441,7 @@ class TestStage2Steps(unittest.TestCase):
         _, _, _, steps = self.build(session_source="100.64.1.9", tailnet=True, allow=[],
                                     session_port=62207, listeners=[62207], backup=True,
                                     ufw_active=True, ufw_text=text, extra=["--tailnet", "--tailnet-session-confirmed"])
-        self.assertEqual(steps["1b-close-public"]["status"], "todo")
+        self.assertEqual(steps["1b-close-public"]["status"], "blocked")
         self.assertIn("公网仍可进入", steps["1b-close-public"]["evidence"])
 
     def test_ufw_tailnet_then_deny_closes_public(self):

@@ -281,20 +281,75 @@ def sshd_valid(system):
         return False, str(exc)
 
 
+def openssh_include_patterns(raw):
+    """按 OpenSSH argv_split 语义切分 Include：仅双引号特殊，单引号是合法文件名字符。"""
+    text = raw.split("#", 1)[0].strip()
+    patterns, current, in_quote = [], [], False
+    for ch in text:
+        if in_quote:
+            if ch == '"':
+                in_quote = False
+            else:
+                current.append(ch)
+        elif ch == '"':
+            in_quote = True
+        elif ch.isspace():
+            if current:
+                patterns.append("".join(current))
+                current = []
+        else:
+            current.append(ch)
+    if current:
+        patterns.append("".join(current))
+    return patterns
+
+
 def sshd_include_paths(system, pattern):
     if not pattern.startswith("/"):
         pattern = "/etc/ssh/" + pattern
-    if any(ch in pattern for ch in "*?["):
-        directory, _, name = pattern.rpartition("/")
-        if not directory:
-            return []
+    if not any(ch in pattern for ch in "*?["):
         try:
-            names = system.list_dir(directory)
+            return [pattern] if system.exists(pattern) else []
         except EvidenceError:
             return []
-        return [directory + "/" + item for item in names if fnmatch.fnmatch(item, name)]
-    return [pattern] if system.exists(pattern) else []
-
+    segments = [part for part in pattern.split("/") if part != ""]
+    currents = ["/"]
+    for index, segment in enumerate(segments):
+        nxt, last = [], index == len(segments) - 1
+        wild = any(ch in segment for ch in "*?[")
+        for cur in currents:
+            parent = cur if cur != "/" else "/"
+            if wild:
+                try:
+                    names = system.list_dir(parent)
+                except EvidenceError:
+                    continue
+                for name in names:
+                    if not fnmatch.fnmatch(name, segment):
+                        continue
+                    child = parent.rstrip("/") + "/" + name
+                    if last:
+                        nxt.append(child)
+                    else:
+                        try:
+                            if system.is_dir(child):
+                                nxt.append(child)
+                        except EvidenceError:
+                            continue
+            else:
+                child = parent.rstrip("/") + "/" + segment
+                nxt.append(child)
+        currents = nxt
+        if not currents:
+            return []
+    found = []
+    for path in currents:
+        try:
+            if system.exists(path):
+                found.append(path)
+        except EvidenceError:
+            continue
+    return found
 
 def sshd_config_files(system):
     files = [SSHD_CONFIG]
@@ -322,7 +377,7 @@ def sshd_config_files(system):
             match = re.match(r"\s*Include(?:\s+|\s*=\s*)(.+)$", line, re.I)
             if not match:
                 continue
-            for pattern in match.group(1).split("#", 1)[0].split():
+            for pattern in openssh_include_patterns(match.group(1)):
                 for path in sshd_include_paths(system, pattern):
                     if path not in seen:
                         seen.add(path)
@@ -344,30 +399,50 @@ def match_blocks(system):
     return found
 
 
-def disk_port_directives(system):
+def disk_port_directives(system, source="all"):
+    """source: all|sshd|socket。socket 激活时只认 ListenStream；传统模式只认 sshd Port。"""
     ports = {}
-    for path in sshd_config_files(system):
-        try:
-            for number, line in enumerate(system.read(path).splitlines(), 1):
-                m = re.match(r"\s*Port(?:\s+|\s*=\s*)(\d+)\s*(?:#.*)?$", line, re.I)
-                if m:
-                    ports.setdefault(int(m.group(1)), []).append("%s:%d" % (path, number))
-        except EvidenceError:
-            continue
-    try:
-        for name in system.list_dir(SOCKET_DROPIN_DIR):
-            if not name.endswith(".conf"):
+    if source in ("all", "sshd"):
+        for path in sshd_config_files(system):
+            try:
+                for number, line in enumerate(system.read(path).splitlines(), 1):
+                    m = re.match(r"\s*Port(?:\s+|\s*=\s*)(\d+)\s*(?:#.*)?$", line, re.I)
+                    if m:
+                        value = int(m.group(1))
+                        if 1 <= value <= 65535:
+                            ports.setdefault(value, []).append("%s:%d" % (path, number))
+            except EvidenceError:
                 continue
-            path = SOCKET_DROPIN_DIR + "/" + name
-            for number, line in enumerate(system.read(path).splitlines(), 1):
-                m = re.match(r"\s*ListenStream\s*=\s*(\S+)\s*$", line)
-                if m:
+    if source in ("all", "socket"):
+        active = {}
+        try:
+            for name in sorted(system.list_dir(SOCKET_DROPIN_DIR)):
+                if not name.endswith(".conf"):
+                    continue
+                path = SOCKET_DROPIN_DIR + "/" + name
+                try:
+                    lines = system.read(path).splitlines()
+                except EvidenceError:
+                    continue
+                for number, line in enumerate(lines, 1):
+                    m = re.match(r"\s*ListenStream\s*=\s*(.*)$", line)
+                    if not m:
+                        continue
+                    raw = m.group(1).split("#", 1)[0].strip()
+                    if raw == "":
+                        active.clear()
+                        continue
                     try:
-                        ports.setdefault((int(m.group(1)) if m.group(1).isdigit() else endpoint_port(m.group(1))), []).append("%s:%d" % (path, number))
+                        value = int(raw) if raw.isdigit() else endpoint_port(raw)
                     except ValueError:
                         continue
-    except EvidenceError:
-        pass
+                    if not 1 <= value <= 65535:
+                        continue
+                    active.setdefault(value, []).append("%s:%d" % (path, number))
+        except EvidenceError:
+            pass
+        for value, where in active.items():
+            ports.setdefault(value, []).extend(where)
     return ports
 
 
@@ -398,7 +473,11 @@ def account_facts(system, user):
             for label, path in attrs:
                 st = system.stat(path)
                 facts[label + "_mode"] = oct(st.st_mode & 0o777)
-                facts[label + "_owner_ok"] = st.st_uid in (0, facts["uid"])
+                # OpenSSH 以目标用户身份读取 .ssh 与 authorized_keys；root 属主会导致公钥登录失败。
+                if label == "home":
+                    facts[label + "_owner_ok"] = st.st_uid in (0, facts["uid"])
+                else:
+                    facts[label + "_owner_ok"] = st.st_uid == facts["uid"]
             facts["permissions_safe"] = all(
                 facts[label + "_owner_ok"] and not (int(facts[label + "_mode"], 8) & 0o022)
                 for label, _ in attrs)
@@ -909,8 +988,22 @@ def build_steps(system, options, ctx):
     steps = []
 
     def step(sid, title, status, evidence, why, do, verify, undo, blocked_by=None):
+        blocked_by = list(blocked_by or [])
+        if status == DONE:
+            blocked_by = []
+        elif blocked_by:
+            status = BLOCKED
+            rewritten = ["# 门槛未满足：" + "；".join(blocked_by) + " —— 先完成这些步骤再回来；下列命令暂不可执行。"]
+            for line in do:
+                parts = line.splitlines() or [line]
+                for part in parts:
+                    if not part.strip() or part.lstrip().startswith("#"):
+                        rewritten.append(part)
+                    else:
+                        rewritten.append("# " + part)
+            do = rewritten
         steps.append({"id": sid, "title": title, "status": status, "evidence": evidence,
-                      "why": why, "do": do, "verify": verify, "undo": undo, "blocked_by": blocked_by or []})
+                      "why": why, "do": do, "verify": verify, "undo": undo, "blocked_by": blocked_by})
 
     rescue = options.rescue_confirmed
     step("0-rescue", "救援通道演练确认",
@@ -1152,11 +1245,11 @@ def build_steps(system, options, ctx):
             blocked.append("0-rescue")
         if verify_status != DONE:
             blocked.append("4-verify-new")
-    if old_port != "none":
-        if not backup_ok:
-            blocked.append("1-backup")
-        if not account_ok:
-            blocked.append("2-account")
+        if old_port != "none":
+            if not backup_ok:
+                blocked.append("1-backup")
+            if not account_ok:
+                blocked.append("2-account")
     step("5-close-old", "关闭旧端口",
          old_close_status, old_close_note,
          old_close_why,
@@ -1177,7 +1270,8 @@ def resolve_context(system, options):
         # socket 激活时监听由 systemd 持有，ss 里没有 sshd 进程归属
         ports.update(ctx["socket"]["listen_ports"])
     ctx["listeners"] = sorted(ports)
-    ctx["disk_ports"] = disk_port_directives(system)
+    socket_on = ctx["socket"]["load"] == "loaded" and ctx["socket"]["active"] == "active"
+    ctx["disk_ports"] = disk_port_directives(system, source="socket" if socket_on else "sshd")
     ctx["account"] = account_facts(system, options.user)
     ctx["backup"] = backup_facts(system, options.backup_dir)
     ctx["firewall"] = firewall_summary(system)
@@ -1281,8 +1375,20 @@ def main(argv=None):
         print("需要完整读取权限。请运行：")
         print("  sudo bash " + shlex.quote(os.environ.get("REINFORCE_SELF", SCRIPT)) + " " + " ".join(shlex.quote(a) for a in (argv if argv is not None else sys.argv[1:])))
         return 2
-    ctx = resolve_context(system, options)
-    steps = build_steps(system, options, ctx)
+    try:
+        ctx = resolve_context(system, options)
+        steps = build_steps(system, options, ctx)
+    except EvidenceError as exc:
+        report = {
+            "schema": 1, "script": SCRIPT, "read_only": True,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "error": str(exc), "complete": False, "next_step": None,
+        }
+        if options.format == "json":
+            print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+        else:
+            print("采集失败（证据不足）：" + str(exc))
+        return 2
     complete = all(item["status"] == DONE for item in steps)
     report = {
         "schema": 1, "script": SCRIPT, "read_only": True,
